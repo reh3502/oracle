@@ -13,10 +13,38 @@ struct Probe(Mutex<BTreeMap<GuildId, EffectiveConfiguration>>);
 #[async_trait]
 impl Module for Probe {
     fn manifest(&self) -> ModuleManifest {
-        serde_json::from_str(include_str!("../manifest.json")).unwrap()
+        serde_json::from_str(if cfg!(feature = "events") {
+            include_str!("../manifest-events.json")
+        } else {
+            include_str!("../manifest.json")
+        })
+        .unwrap()
     }
-    async fn invoke(&self, _: CallContext, _: &str, _: Value) -> Result<Value> {
+    async fn invoke(&self, context: CallContext, operation: &str, _: Value) -> Result<Value> {
+        if cfg!(feature = "events") && operation == "status" {
+            return Ok(serde_json::json!({"epoch":context.epoch()}));
+        }
         Err(RpcError::Remote("no operations".into()))
+    }
+    #[cfg(feature = "events")]
+    async fn event(
+        &self,
+        context: CallContext,
+        event: oracle_contracts::GuildEvent,
+    ) -> Result<Value> {
+        let configuration = self
+            .0
+            .lock()
+            .unwrap()
+            .get(context.guild())
+            .cloned()
+            .ok_or_else(|| RpcError::Remote("not configured".into()))?;
+        let destination = configuration.values["destination"]
+            .as_str()
+            .ok_or_else(|| RpcError::Remote("destination".into()))?;
+        context
+            .notify(&event.id, destination, &format!("event {}", event.id))
+            .await
     }
     async fn prepare_configuration(&self, _: GuildContext, _: u64, values: Value) -> Result<()> {
         if let Some(wait) = values["wait_ms"].as_u64() {

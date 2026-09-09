@@ -10,3 +10,6 @@ oracle-contracts = {path="../../../crates/oracle-contracts"}
 async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[features]
+events = []

@@ -11,3 +11,9 @@ pub use manager::{
 };
 mod effects;
 pub use effects::{DispatchPermit, EchoTransport, Observation, SendTransport};
+
+pub use manager::{
+    EventDispatch, EventHealth, NotificationCheck, NotificationRequest, NotificationTransport,
+};
+
+pub use manager::ModuleCatalogEntry;

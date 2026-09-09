@@ -5,8 +5,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use oracle_core::{
-    DocumentWrite, Error, ErrorCode, GuildId, InstalledModule, ModuleId, ModuleManifest,
-    ModuleRepository, PolicyContext, Result,
+    DocumentWrite, Error, ErrorCode, GuildEvent, GuildId, InstalledModule, ModuleId,
+    ModuleManifest, ModuleRepository, PolicyContext, Result,
 };
 use oracle_process::{ModuleProcess, ProcessRuntime, RuntimeError, StopReport};
 use oracle_rpc::{RpcError, RpcHandler, RpcPeer};
@@ -30,6 +30,18 @@ pub(crate) struct Activation {
 }
 #[async_trait]
 pub(crate) trait ContractRouter: Send + Sync {
+    #[allow(clippy::too_many_arguments)] // Explicit scope, lease and notification body cross one trusted boundary.
+    async fn notify(
+        &self,
+        module: &ModuleId,
+        purpose: String,
+        destination: String,
+        text: String,
+        authority: Authority,
+        permit: crate::DispatchPermit,
+        cancel: CancellationToken,
+    ) -> Result<Value>;
+
     async fn echo(
         &self,
         module: &ModuleId,
@@ -234,6 +246,7 @@ impl Generation {
         let activation = activations.get(guild).ok_or_else(unavailable)?;
         self.gate.activate(guild.clone(), activation.epoch)
     }
+    #[allow(clippy::too_many_arguments)] // Pin both configuration and activation revisions at admission.
     pub async fn invoke(
         &self,
         actor: PolicyContext,
@@ -241,6 +254,8 @@ impl Generation {
         operation: &str,
         input: Value,
         parent: Option<Authority>,
+        configuration_revision: Option<u64>,
+        expected_epoch: Option<u64>,
     ) -> Result<Value> {
         if !self.normal || !self.process().is_alive() {
             return Err(unavailable());
@@ -264,6 +279,9 @@ impl Generation {
             .get(guild)
             .cloned()
             .ok_or_else(unavailable)?;
+        if expected_epoch.is_some_and(|epoch| epoch != active.epoch) {
+            return Err(unavailable());
+        }
         let mut capabilities: BTreeSet<String> = operation.capabilities.iter().cloned().collect();
         if !capabilities.is_subset(&active.grants) {
             return Err(error(ErrorCode::ForbiddenPermission));
@@ -275,6 +293,7 @@ impl Generation {
             capabilities: BTreeSet::new(),
             deadline: Instant::now() + Duration::from_millis(operation.timeout_ms),
             depth: 0,
+            configuration_revision,
             cancel: CancellationToken::new(),
         };
         if let Some(parent) = parent {
@@ -302,6 +321,60 @@ impl Generation {
         self.gate.authority(&lease.handle)?;
         validate_output(operation, &result)?;
         Ok(result)
+    }
+    pub async fn event(
+        &self,
+        guild: &GuildId,
+        event: GuildEvent,
+        configuration_revision: u64,
+        cancel: CancellationToken,
+    ) -> Result<Value> {
+        if !self.normal
+            || !self.process().is_alive()
+            || !self
+                .installed
+                .package
+                .manifest
+                .subscriptions
+                .contains(&event.kind)
+        {
+            return Err(unavailable());
+        }
+        let active = self
+            .activations
+            .lock()
+            .unwrap()
+            .get(guild)
+            .cloned()
+            .ok_or_else(unavailable)?;
+        if !active.grants.contains("events.guild") || !active.grants.contains("config.own") {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        let authority = Authority {
+            guild: guild.clone(),
+            epoch: active.epoch,
+            actor: PolicyContext::LocalOperator,
+            capabilities: self
+                .installed
+                .package
+                .manifest
+                .capabilities
+                .iter()
+                .filter(|c| active.grants.contains(*c))
+                .cloned()
+                .collect(),
+            deadline: Instant::now() + Duration::from_secs(30),
+            depth: 0,
+            configuration_revision: Some(configuration_revision),
+            cancel,
+        };
+        let lease = self.gate.admit(authority)?;
+        let value = self.process().call_with_cancel("event.deliver", json!({
+            "invocation":lease.handle,"session":self.session,"generation":self.number,"guild":guild,"epoch":active.epoch,
+            "operation":"event.deliver","input":event
+        }), Duration::from_secs(30), lease.authority.cancel.clone()).await.map_err(runtime_error)?;
+        self.gate.authority(&lease.handle)?;
+        Ok(value)
     }
     /// Quiescing closes new admission while existing callbacks retain their leases.
     pub async fn quiesce(&self, guild: Option<&GuildId>, grace: Duration) -> Result<bool> {
@@ -443,6 +516,35 @@ impl Generation {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         match method {
+            "host.notify" => {
+                let request: Notification = decode(params)?;
+                let authority = self.gate.authority(&request.invocation)?;
+                if !authority.capabilities.contains("discord.notify") {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                if request.purpose.is_empty()
+                    || request.purpose.len() > 128
+                    || request.purpose.chars().any(char::is_control)
+                    || request.destination.is_empty()
+                    || request.destination.len() > 32
+                    || !request.destination.bytes().all(|b| b.is_ascii_digit())
+                    || request.text.is_empty()
+                    || request.text.chars().count() > 1800
+                {
+                    return Err(error(ErrorCode::InvalidInput));
+                }
+                self.router
+                    .notify(
+                        &self.installed.package.manifest.id,
+                        request.purpose,
+                        request.destination,
+                        request.text,
+                        authority,
+                        crate::DispatchPermit::new(self.gate.clone(), request.invocation),
+                        cancel,
+                    )
+                    .await
+            }
             "host.echo" => {
                 let request: Echo = decode(params)?;
                 let authority = self.gate.authority(&request.invocation)?;
@@ -612,6 +714,14 @@ struct Contract {
     invocation: String,
     contract: String,
     input: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Notification {
+    invocation: String,
+    purpose: String,
+    destination: String,
+    text: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

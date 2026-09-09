@@ -48,7 +48,12 @@ fn unique<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
 fn allowed_capability(value: &str) -> bool {
     matches!(
         value,
-        "storage.own" | "contracts.invoke" | "host.echo" | "config.own"
+        "storage.own"
+            | "contracts.invoke"
+            | "host.echo"
+            | "config.own"
+            | "events.guild"
+            | "discord.notify"
     )
 }
 
@@ -132,7 +137,10 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     if manifest.capabilities.len() > 16
         || !unique(manifest.capabilities.iter().map(String::as_str))
         || manifest.capabilities.iter().any(|c| !allowed_capability(c))
-        || manifest.required_intents.iter().any(|v| v != "guilds")
+        || manifest
+            .required_intents
+            .iter()
+            .any(|v| !matches!(v.as_str(), "guilds" | "guild_members" | "guild_moderation"))
         || !unique(manifest.required_intents.iter().map(String::as_str))
     {
         return Err(err(ErrorCode::Compatibility));
@@ -189,6 +197,35 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                 return Err(err(ErrorCode::InvalidInput));
             }
         }
+    }
+    if !manifest.subscriptions.is_empty()
+        && (manifest.subscriptions.len() > 16
+            || manifest.subscriptions.iter().collect::<BTreeSet<_>>().len()
+                != manifest.subscriptions.len()
+            || manifest
+                .subscriptions
+                .contains(&oracle_core::GuildEventKind::Unknown)
+            || !manifest.capabilities.iter().any(|c| c == "events.guild")
+            || manifest.configuration.is_none())
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
+    for subscription in &manifest.subscriptions {
+        use oracle_core::GuildEventKind::*;
+        let required = match subscription {
+            ModerationAudit | Ban | Unban => Some("guild_moderation"),
+            MemberRolesChanged | MemberJoined | MemberLeft => Some("guild_members"),
+            ChannelChanged | RoleAccessChanged => Some("guilds"),
+            Maintenance | Unknown => None,
+        };
+        if required.is_some_and(|intent| !manifest.required_intents.iter().any(|v| v == intent)) {
+            return Err(err(ErrorCode::Compatibility));
+        }
+    }
+    if manifest.capabilities.iter().any(|c| c == "discord.notify")
+        && manifest.configuration.is_none()
+    {
+        return Err(err(ErrorCode::InvalidInput));
     }
     for operation in &manifest.operations {
         if !name(&operation.name)
@@ -701,6 +738,33 @@ mod tests {
             store.verify(&installed).unwrap_err().code,
             ErrorCode::ArtifactChanged
         );
+    }
+    #[test]
+    fn event_descriptors_require_config_grants_and_matching_intents() {
+        let manifest: ModuleManifest = serde_json::from_str(include_str!(
+            "../../../examples/modules/configuration-probe/manifest-events.json"
+        ))
+        .unwrap();
+        validate_manifest(&manifest).unwrap();
+        let mut missing_intent = manifest.clone();
+        missing_intent
+            .required_intents
+            .retain(|v| v != "guild_members");
+        assert_eq!(
+            validate_manifest(&missing_intent).unwrap_err().code,
+            ErrorCode::Compatibility
+        );
+        let mut unknown = manifest.clone();
+        unknown
+            .subscriptions
+            .push(oracle_core::GuildEventKind::Unknown);
+        assert!(validate_manifest(&unknown).is_err());
+        let mut grant = manifest.clone();
+        grant.capabilities.retain(|v| v != "events.guild");
+        assert!(validate_manifest(&grant).is_err());
+        let mut config = manifest;
+        config.configuration = None;
+        assert!(validate_manifest(&config).is_err());
     }
     #[test]
     fn scripts_are_rejected_without_running_install_hooks() {

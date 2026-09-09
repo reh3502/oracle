@@ -24,10 +24,26 @@ mod configuration;
 pub use configuration::{
     ConfigurationPlan, ConfigurationPolicy, ConfigurationReceipt, ConfigurationStatus,
 };
+#[path = "events.rs"]
+mod events;
+pub use events::{
+    EventDispatch, EventHealth, NotificationCheck, NotificationRequest, NotificationTransport,
+};
 mod recovery;
 mod upgrade;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModuleCatalogEntry {
+    pub module: ModuleId,
+    pub session: String,
+    pub generation: u64,
+    pub epoch: u64,
+    pub operations: Vec<ModuleOperation>,
+}
 pub struct ModuleManager {
+    event_services: RwLock<Option<events::EventServices>>,
+    event_queues: std::sync::Mutex<BTreeMap<(ModuleId, GuildId), events::EventQueue>>,
+    event_tasks: tasks::HostTasks,
     configuration_services: RwLock<Option<configuration::ConfigurationServices>>,
     configuration_plans: std::sync::Mutex<BTreeMap<String, configuration::BoundPlan>>,
     repository: Arc<dyn ModuleRepository>,
@@ -81,6 +97,32 @@ impl Drop for RetainStopping<'_> {
 struct Router(Weak<ModuleManager>);
 #[async_trait]
 impl ContractRouter for Router {
+    async fn notify(
+        &self,
+        module: &ModuleId,
+        purpose: String,
+        destination: String,
+        text: String,
+        authority: Authority,
+        permit: crate::DispatchPermit,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Value> {
+        let manager = self.0.upgrade().ok_or_else(unavailable)?;
+        let request = NotificationRequest {
+            actor: authority.actor.clone(),
+            guild: authority.guild.clone(),
+            module: module.clone(),
+            configuration_revision: authority
+                .configuration_revision
+                .ok_or_else(|| Error::new(ErrorCode::ForbiddenPermission))?,
+            destination,
+            text,
+        };
+        manager
+            .notify(request, purpose, authority, permit, cancel)
+            .await
+    }
+
     async fn echo(
         &self,
         module: &ModuleId,
@@ -146,6 +188,27 @@ impl ContractRouter for Router {
             .iter()
             .find(|p| p.name == contract)
             .ok_or_else(|| Error::new(ErrorCode::DependencyUnavailable))?;
+        let configuration_revision =
+            if generation
+                .installed
+                .package
+                .manifest
+                .operations
+                .iter()
+                .any(|op| {
+                    op.name == provided.operation
+                        && op.capabilities.iter().any(|c| c == "discord.notify")
+                })
+            {
+                Some(
+                    manager
+                        .configuration_ready(&authority.actor, &authority.guild, &generation)
+                        .await?
+                        .revision,
+                )
+            } else {
+                None
+            };
         generation
             .invoke(
                 authority.actor.clone(),
@@ -153,6 +216,8 @@ impl ContractRouter for Router {
                 &provided.operation,
                 input,
                 Some(authority),
+                configuration_revision,
+                None,
             )
             .await
     }
@@ -173,6 +238,9 @@ impl ModuleManager {
         transport: Arc<dyn crate::SendTransport>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
+            event_services: RwLock::new(None),
+            event_queues: std::sync::Mutex::new(BTreeMap::new()),
+            event_tasks: tasks::HostTasks::new(),
             configuration_services: RwLock::new(None),
             configuration_plans: std::sync::Mutex::new(BTreeMap::new()),
             effect_tasks: tasks::HostTasks::new(),
@@ -189,6 +257,7 @@ impl ModuleManager {
         }))
     }
     fn publish_counts(&self) {
+        self.prune_event_queues();
         let inventory = self
             .registry
             .read()
@@ -363,6 +432,9 @@ impl ModuleManager {
             }
             let generation = self.get(&desired.module)?;
             let manifest = &generation.installed.package.manifest;
+            if !manifest.subscriptions.is_empty() {
+                self.require_event_intents(&generation)?;
+            }
             let grants: BTreeSet<_> = desired.grants.iter().cloned().collect();
             if grants.iter().any(|c| !manifest.capabilities.contains(c)) {
                 return Err(Error::new(ErrorCode::ForbiddenPermission));
@@ -435,8 +507,120 @@ impl ModuleManager {
         self.core.authorize_module(context, guild).await?;
         let generation = self.get(module)?;
         self.validate_dependencies(&generation, guild)?;
+        let configuration_revision = if generation
+            .installed
+            .package
+            .manifest
+            .operations
+            .iter()
+            .any(|op| op.name == operation && op.capabilities.iter().any(|c| c == "discord.notify"))
+        {
+            Some(
+                self.configuration_ready(context, guild, &generation)
+                    .await?
+                    .revision,
+            )
+        } else {
+            None
+        };
         generation
-            .invoke(context.clone(), guild, operation, input, None)
+            .invoke(
+                context.clone(),
+                guild,
+                operation,
+                input,
+                None,
+                configuration_revision,
+                None,
+            )
+            .await
+    }
+    pub async fn catalog(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+    ) -> Result<Vec<ModuleCatalogEntry>> {
+        self.core.authorize_module(actor, guild).await?;
+        let generations: Vec<_> = self.registry.read().unwrap().values().cloned().collect();
+        let mut catalog = Vec::new();
+        for generation in generations {
+            if !generation.process().is_alive()
+                || self.validate_dependencies(&generation, guild).is_err()
+            {
+                continue;
+            }
+            let active = generation.activations.lock().unwrap().get(guild).cloned();
+            let Some(active) = active else {
+                continue;
+            };
+            if !generation.gate.is_active(guild, active.epoch) {
+                continue;
+            }
+            let operations = generation
+                .installed
+                .package
+                .manifest
+                .operations
+                .iter()
+                .filter(|op| op.capabilities.iter().all(|c| active.grants.contains(c)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !operations.is_empty() {
+                catalog.push(ModuleCatalogEntry {
+                    module: generation.installed.package.manifest.id.clone(),
+                    session: generation.session.clone(),
+                    generation: generation.number,
+                    epoch: active.epoch,
+                    operations,
+                });
+            }
+        }
+        Ok(catalog)
+    }
+    #[allow(clippy::too_many_arguments)] // Persisted command identity and invocation share one pinned generation.
+    pub async fn invoke_bound(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        module: &ModuleId,
+        operation: &str,
+        input: Value,
+        session: &str,
+        expected_generation: u64,
+        epoch: u64,
+    ) -> Result<Value> {
+        self.core.authorize_module(actor, guild).await?;
+        let generation = self.get(module)?;
+        if generation.session != session || generation.number != expected_generation {
+            return Err(unavailable());
+        }
+        self.validate_dependencies(&generation, guild)?;
+        let configuration_revision = if generation
+            .installed
+            .package
+            .manifest
+            .operations
+            .iter()
+            .any(|op| op.name == operation && op.capabilities.iter().any(|c| c == "discord.notify"))
+        {
+            Some(
+                self.configuration_ready(actor, guild, &generation)
+                    .await?
+                    .revision,
+            )
+        } else {
+            None
+        };
+        generation
+            .invoke(
+                actor.clone(),
+                guild,
+                operation,
+                input,
+                None,
+                configuration_revision,
+                Some(epoch),
+            )
             .await
     }
     fn validate_dependencies(&self, generation: &Generation, guild: &GuildId) -> Result<()> {
@@ -665,12 +849,13 @@ impl ModuleManager {
         }
         self.registry.write().unwrap().clear();
         self.publish_counts();
+        let events = self.event_tasks.shutdown(Duration::from_secs(5)).await;
         let effects = self.effect_tasks.shutdown(Duration::from_secs(10)).await;
         self.runtime
             .shutdown()
             .await
             .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-        if effects.forced {
+        if effects.forced || events.forced {
             return Err(Error::new(ErrorCode::UnknownOutcome));
         }
         Ok(())

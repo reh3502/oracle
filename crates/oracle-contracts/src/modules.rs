@@ -31,6 +31,8 @@ pub struct ModuleManifest {
     pub migrations: Vec<ModuleMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<ModuleConfiguration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<GuildEventKind>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -144,4 +146,39 @@ pub struct ModuleConfiguration {
 pub struct EffectiveConfiguration {
     pub revision: u64,
     pub values: Value,
+}
+
+/// Host-normalized metadata only. No message body, attachment, audit reason, or
+/// arbitrary Gateway payload crosses this contract.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GuildEventKind {
+    ModerationAudit,
+    ChannelChanged,
+    RoleAccessChanged,
+    MemberRolesChanged,
+    Ban,
+    Unban,
+    MemberJoined,
+    MemberLeft,
+    Maintenance,
+    #[serde(other)]
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuildEventOrigin {
+    External,
+    Oracle,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GuildEvent {
+    pub id: String,
+    pub kind: GuildEventKind,
+    pub occurred_at_ms: u64,
+    pub origin: GuildEventOrigin,
+    pub subject_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub related_id: Option<String>,
 }

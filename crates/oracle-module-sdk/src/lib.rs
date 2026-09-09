@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 use async_trait::async_trait;
 use oracle_contracts::{
-    DocumentWrite, EffectiveConfiguration, GuildId, ModuleDocument, ModuleManifest,
+    DocumentWrite, EffectiveConfiguration, GuildEvent, GuildId, ModuleDocument, ModuleManifest,
 };
 pub use oracle_rpc::RpcError;
 use oracle_rpc::{RpcHandler, RpcPeer};
@@ -141,6 +141,15 @@ impl CallContext {
         self.host("host.echo", json!({"purpose":purpose,"body":body}))
             .await
     }
+    /// A narrow host-owned Discord notification. The host verifies the configured
+    /// destination, current policy, lifecycle lease, and durable effect outcome.
+    pub async fn notify(&self, purpose: &str, destination: &str, text: &str) -> Result<Value> {
+        self.host(
+            "host.notify",
+            json!({"purpose":purpose,"destination":destination,"text":text}),
+        )
+        .await
+    }
     pub async fn contract_invoke(&self, contract: &str, input: Value) -> Result<Value> {
         self.host(
             "host.contract_invoke",
@@ -162,6 +171,10 @@ pub trait Module: Send + Sync + 'static {
         Ok(())
     }
     async fn invoke(&self, context: CallContext, operation: &str, input: Value) -> Result<Value>;
+    /// Host-only event delivery; absent from the public operation catalog.
+    async fn event(&self, _context: CallContext, _event: GuildEvent) -> Result<Value> {
+        Err(denied())
+    }
     /// Pure validation/preparation. No ordinary host-call authority is supplied.
     async fn prepare_configuration(
         &self,
@@ -326,7 +339,7 @@ impl<M: Module> RpcHandler for Driver<M> {
         params: Value,
         cancel: CancellationToken,
     ) -> Result<Value> {
-        if method == "operation.invoke" {
+        if method == "operation.invoke" || method == "event.deliver" {
             let request: Invocation = decode(params)?;
             let guild_cancel = {
                 let state = self.state.lock().unwrap();
@@ -352,6 +365,15 @@ impl<M: Module> RpcHandler for Driver<M> {
                 cancel: cancel.clone(),
                 guild_cancel: guild_cancel.clone(),
             };
+            if method == "event.deliver" {
+                let event: GuildEvent = decode(request.input)?;
+                if request.operation != "event.deliver"
+                    || !self.module.manifest().subscriptions.contains(&event.kind)
+                {
+                    return Err(denied());
+                }
+                return tokio::select! {biased;_=guild_cancel.cancelled()=>Err(RpcError::Cancelled),_=cancel.cancelled()=>Err(RpcError::Cancelled),value=self.module.event(context,event)=>value};
+            }
             return tokio::select! {biased;_=guild_cancel.cancelled()=>Err(RpcError::Cancelled),_=cancel.cancelled()=>Err(RpcError::Cancelled),value=self.module.invoke(context,&request.operation,request.input)=>value};
         }
         // Hooks serialize state changes, but never hold the state mutex over module code.

@@ -9,6 +9,7 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 /// Opaque host-issued permit. Modules cannot construct a permit or replace its handle.
+#[derive(Clone)]
 pub struct DispatchPermit {
     gate: Arc<Admission>,
     handle: String,
@@ -145,6 +146,7 @@ mod tests {
                 capabilities: BTreeSet::new(),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 depth: 0,
+                configuration_revision: None,
                 cancel: CancellationToken::new(),
             })
             .unwrap();

@@ -168,6 +168,7 @@ mod tests {
     fn module(id: &str) -> ModuleManifest {
         ModuleManifest {
             configuration: None,
+            subscriptions: vec![],
             manifest_version: 1,
             id: ModuleId::new(id).unwrap(),
             version: "1.0.0".into(),

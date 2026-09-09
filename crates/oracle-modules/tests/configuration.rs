@@ -223,6 +223,20 @@ async fn run(case: &'static str) {
                             &ACTOR,
                             &guild,
                             &module,
+                            None,
+                            json!({"note":"x".repeat(25*1024)}),
+                            TTL
+                        )
+                        .await
+                        .is_err(),
+                    "a config plan must fit desired and candidate in the bounded workflow record"
+                );
+                assert!(
+                    manager
+                        .configuration_plan(
+                            &ACTOR,
+                            &guild,
+                            &module,
                             Some("unknown/v1"),
                             json!({}),
                             TTL

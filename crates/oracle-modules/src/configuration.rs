@@ -74,6 +74,7 @@ struct Candidate {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Saved {
+    effective_session: Option<String>,
     schema_version: Option<u32>,
     revision: u64,
     values: Option<Value>,
@@ -150,6 +151,15 @@ impl ModuleManager {
     ) -> Result<(Arc<Generation>, u64)> {
         let generation = self.get(module)?;
         self.validate_dependencies(&generation, guild)?;
+        if !generation
+            .installed
+            .package
+            .manifest
+            .subscriptions
+            .is_empty()
+        {
+            self.require_event_intents(&generation)?;
+        }
         let epoch = generation
             .activations
             .lock()
@@ -216,10 +226,12 @@ impl ModuleManager {
         crate::package::schema_validator(&descriptor.schema)?
             .validate(&values)
             .map_err(|_| err(ErrorCode::SchemaInvalid))?;
+        // The 64 KiB workflow row holds both prior desired values and a new
+        // candidate plus receipt metadata. Bound each object before planning.
         if serde_json::to_vec(&values)
             .map_err(|_| err(ErrorCode::InvalidInput))?
             .len()
-            > 65536
+            > 24 * 1024
         {
             return Err(err(ErrorCode::QuotaExceeded));
         }
@@ -371,6 +383,15 @@ impl ModuleManager {
         mut record: Option<WorkflowRecord>,
         mut saved: Saved,
     ) -> Result<ConfigurationReceipt> {
+        if !generation
+            .installed
+            .package
+            .manifest
+            .subscriptions
+            .is_empty()
+        {
+            self.require_event_intents(generation)?;
+        }
         let candidate = saved
             .candidate
             .clone()
@@ -443,7 +464,17 @@ impl ModuleManager {
             if now() >= candidate.expires_at {
                 return Err(err(ErrorCode::ForbiddenScope));
             }
+            if !generation
+                .installed
+                .package
+                .manifest
+                .subscriptions
+                .is_empty()
+            {
+                self.require_event_intents(generation)?;
+            }
             // Desired values and receipt share a single durable CAS record.
+            saved.effective_session = None;
             saved.schema_version = Some(candidate.schema_version);
             saved.revision = candidate.revision;
             saved.values = Some(candidate.values.clone());
@@ -460,6 +491,15 @@ impl ModuleManager {
             .policy
             .validate(actor, guild, module, &candidate.values)
             .await?;
+        if !generation
+            .installed
+            .package
+            .manifest
+            .subscriptions
+            .is_empty()
+        {
+            self.require_event_intents(generation)?;
+        }
         let applied = generation
             .configuration(
                 guild,
@@ -481,6 +521,7 @@ impl ModuleManager {
             {
                 if effective.revision == candidate.revision && effective.values == candidate.values
                 {
+                    saved.effective_session = Some(generation.session.clone());
                     receipt.state = "effective".into();
                     receipt.effective_revision = Some(effective.revision);
                     receipt.problem = None;
@@ -518,6 +559,54 @@ impl ModuleManager {
         }
         self.config_resume(actor, guild, module, &services, &generation, record, saved)
             .await
+    }
+    /// Last independently verified config bound to this executable session. This
+    /// path intentionally does not call back into a module waiting on host.notify.
+    pub(super) async fn configuration_verified(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        generation: &Generation,
+    ) -> Result<EffectiveConfiguration> {
+        self.core.authorize_module(actor, guild).await?;
+        let services = self.config_services()?;
+        let module = &generation.installed.package.manifest.id;
+        let record = services
+            .repository
+            .workflow_get(guild, WorkflowKind::Configuration, module.as_str())
+            .await?;
+        let saved = decode(record.as_ref())?;
+        if saved.effective_session.as_deref() != Some(generation.session.as_str()) {
+            return Err(unavailable());
+        }
+        let values = saved.values.ok_or_else(unavailable)?;
+        services
+            .policy
+            .validate(actor, guild, module, &values)
+            .await?;
+        Ok(EffectiveConfiguration {
+            revision: saved.revision,
+            values,
+        })
+    }
+    pub(super) async fn configuration_ready(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        generation: &Generation,
+    ) -> Result<EffectiveConfiguration> {
+        let expected = self
+            .configuration_verified(actor, guild, generation)
+            .await?;
+        let value = generation
+            .configuration(guild, "configuration.effective", 0, Value::Null)
+            .await?;
+        let actual = serde_json::from_value::<Option<EffectiveConfiguration>>(value)
+            .map_err(|_| unavailable())?;
+        if actual.as_ref() != Some(&expected) {
+            return Err(unavailable());
+        }
+        Ok(expected)
     }
     pub async fn configuration_inspect(
         &self,

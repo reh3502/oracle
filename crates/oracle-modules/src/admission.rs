@@ -17,6 +17,7 @@ pub(crate) struct Authority {
     pub capabilities: BTreeSet<String>,
     pub deadline: Instant,
     pub depth: u8,
+    pub configuration_revision: Option<u64>,
     pub cancel: CancellationToken,
 }
 struct Activation {
@@ -190,6 +191,7 @@ mod tests {
             capabilities: BTreeSet::new(),
             deadline: Instant::now() + Duration::from_secs(5),
             depth: 0,
+            configuration_revision: None,
             cancel: CancellationToken::new(),
         }
     }

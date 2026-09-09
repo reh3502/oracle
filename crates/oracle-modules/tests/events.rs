@@ -1,0 +1,456 @@
+//! Real subprocess event admission with controlled host transport readiness.
+use oracle_core::*;
+use oracle_modules::{
+    ConfigurationPolicy, DispatchPermit, ModuleManager, NotificationCheck, NotificationRequest,
+    NotificationTransport,
+};
+use oracle_storage::{DatabaseConfig, Storage};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::{Notify, Semaphore};
+use tokio_util::sync::CancellationToken;
+struct Policy;
+#[async_trait::async_trait]
+impl ConfigurationPolicy for Policy {
+    async fn validate(
+        &self,
+        _: &PolicyContext,
+        _: &GuildId,
+        _: &ModuleId,
+        values: &Value,
+    ) -> Result<()> {
+        if values["destination"] == "456" {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorCode::ForbiddenPermission))
+        }
+    }
+}
+struct Transport {
+    entered: Notify,
+    ready: Semaphore,
+    sent: Mutex<Vec<String>>,
+}
+#[async_trait::async_trait]
+impl NotificationTransport for Transport {
+    async fn send(
+        &self,
+        request: &NotificationRequest,
+        permit: &DispatchPermit,
+        check: &dyn NotificationCheck,
+        cancel: CancellationToken,
+    ) -> Result<Value> {
+        self.entered.notify_one();
+        tokio::select! {biased;_=cancel.cancelled()=>return Err(Error::new(ErrorCode::Cancelled)),ready=self.ready.acquire()=>ready.unwrap().forget()}
+        check.validate().await?;
+        permit.dispatch(|| self.sent.lock().unwrap().push(request.text.clone()))?;
+        Ok(json!({"id":self.sent.lock().unwrap().len(),"destination":request.destination}))
+    }
+}
+const ACTOR: PolicyContext = PolicyContext::LocalOperator;
+fn intents() -> BTreeSet<String> {
+    BTreeSet::from(["guilds".into(), "guild_members".into()])
+}
+fn event(id: &str) -> GuildEvent {
+    GuildEvent {
+        id: id.into(),
+        kind: GuildEventKind::ChannelChanged,
+        occurred_at_ms: 1000,
+        origin: GuildEventOrigin::External,
+        subject_id: Some("789".into()),
+        actor_id: None,
+        related_id: None,
+    }
+}
+#[tokio::test]
+#[ignore = "requires ORACLE_EVENT_PROBE built with configuration-probe --features events"]
+async fn event_queue_is_bounded_and_unload_fences_waiting_notification() {
+    run("fence").await;
+}
+#[tokio::test]
+#[ignore = "requires ORACLE_EVENT_PROBE built with configuration-probe --features events"]
+async fn event_notification_rechecks_configuration_revision_after_readiness() {
+    run("configuration").await;
+}
+#[tokio::test]
+#[ignore = "requires ORACLE_EVENT_PROBE built with configuration-probe --features events"]
+async fn event_notification_rechecks_intents_after_readiness() {
+    run("intents").await;
+}
+#[tokio::test]
+#[ignore = "requires ORACLE_EVENT_PROBE built with configuration-probe --features events"]
+async fn event_routes_require_configuration_and_reuse_verified_effect_receipts() {
+    run("routing").await;
+}
+async fn run(case: &'static str) {
+    let scratch = std::env::temp_dir().join(format!("oracle-event-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&scratch).unwrap();
+    let storage = Arc::new(
+        Storage::open(DatabaseConfig::Sqlite {
+            path: scratch.join("state.sqlite"),
+        })
+        .await
+        .unwrap(),
+    );
+    let guild: GuildId = "123".parse().unwrap();
+    storage
+        .initialize_guilds(std::slice::from_ref(&guild))
+        .await
+        .unwrap();
+    let core = Arc::new(CoreService::new(
+        storage.clone(),
+        vec![GuildPolicy {
+            guild: guild.clone(),
+            operators: vec![],
+        }],
+    ));
+    let manager = ModuleManager::new(storage.clone(), core, scratch.join("artifacts")).unwrap();
+    manager
+        .set_configuration_services(storage.clone(), Arc::new(Policy))
+        .unwrap();
+    let transport = Arc::new(Transport {
+        entered: Notify::new(),
+        ready: Semaphore::new(0),
+        sent: Mutex::new(vec![]),
+    });
+    manager
+        .set_event_services(BTreeSet::new(), transport.clone())
+        .unwrap();
+    let binary =
+        PathBuf::from(std::env::var_os("ORACLE_EVENT_PROBE").expect("set ORACLE_EVENT_PROBE"));
+    let bytes = std::fs::read(binary).unwrap();
+    let source = scratch.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("module"), &bytes).unwrap();
+    let package = ModulePackage {
+        manifest: serde_json::from_str(include_str!(
+            "../../../examples/modules/configuration-probe/manifest-events.json"
+        ))
+        .unwrap(),
+        entrypoint: "module".into(),
+        files: BTreeMap::from([("module".into(), format!("{:x}", Sha256::digest(bytes)))]),
+        source_revision: "event-fixture".into(),
+        toolchain: "separate feature artifact".into(),
+        license: "test-only".into(),
+    };
+    std::fs::write(
+        source.join("package.json"),
+        serde_json::to_vec(&package).unwrap(),
+    )
+    .unwrap();
+    let installed = manager.install(&source, true).await.unwrap();
+    let module = installed.package.manifest.id;
+    manager.load(&installed.digest).await.unwrap();
+    let desired = DesiredActivation {
+        module: module.clone(),
+        guild: guild.clone(),
+        active: true,
+        grants: vec![
+            "config.own".into(),
+            "events.guild".into(),
+            "discord.notify".into(),
+        ],
+        bindings: BTreeMap::new(),
+    };
+    assert!(manager.activate(&ACTOR, desired.clone()).await.is_err());
+    manager.set_event_intents(intents()).unwrap();
+    manager.activate(&ACTOR, desired).await.unwrap();
+    let task_manager = manager.clone();
+    let task = tokio::spawn(async move {
+        let manager = task_manager;
+        if case == "routing" {
+            assert_eq!(
+                manager
+                    .deliver_event(&guild, event("unconfigured"))
+                    .await
+                    .unwrap()
+                    .accepted,
+                1
+            );
+            wait_health(&manager, |delivered, dropped| {
+                delivered == 0 && dropped == 1
+            })
+            .await;
+            assert!(transport.sent.lock().unwrap().is_empty());
+        }
+        let plan = manager
+            .configuration_plan(
+                &ACTOR,
+                &guild,
+                &module,
+                Some("moderate/v1"),
+                json!({"destination":"456"}),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .configuration_apply(&ACTOR, &guild, &module, &plan.id)
+                .await
+                .unwrap()
+                .state,
+            "effective"
+        );
+        assert!(
+            manager
+                .invoke(&ACTOR, &module, &guild, "event.deliver", json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .deliver_event(&guild, event("first"))
+                .await
+                .unwrap()
+                .accepted,
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(5), transport.entered.notified())
+            .await
+            .unwrap();
+        match case {
+            "fence" => {
+                let mut accepted = 0;
+                let mut dropped = 0;
+                for n in 0..129 {
+                    let out = manager
+                        .deliver_event(&guild, event(&format!("queued-{n}")))
+                        .await
+                        .unwrap();
+                    accepted += out.accepted;
+                    dropped += out.dropped;
+                }
+                assert_eq!(accepted, 128);
+                assert_eq!(dropped, 1);
+                assert_eq!(manager.event_health()[0].queued, 128);
+                manager.unload(&module, Duration::ZERO).await.unwrap();
+                transport.ready.add_permits(1);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(transport.sent.lock().unwrap().is_empty());
+                assert_eq!(
+                    manager
+                        .deliver_event(&guild, event("after-unload"))
+                        .await
+                        .unwrap()
+                        .accepted,
+                    0
+                );
+            }
+            "configuration" => {
+                let change = manager
+                    .configuration_plan(
+                        &ACTOR,
+                        &guild,
+                        &module,
+                        None,
+                        json!({"level":9}),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    manager
+                        .configuration_apply(&ACTOR, &guild, &module, &change.id)
+                        .await
+                        .unwrap()
+                        .stored_revision,
+                    2
+                );
+                transport.ready.add_permits(1);
+                wait_health(&manager, |_, dropped| dropped == 1).await;
+                assert!(transport.sent.lock().unwrap().is_empty());
+                transport.ready.add_permits(1);
+                manager
+                    .deliver_event(&guild, event("new-config"))
+                    .await
+                    .unwrap();
+                wait_health(&manager, |delivered, _| delivered == 1).await;
+                assert_eq!(
+                    transport.sent.lock().unwrap().as_slice(),
+                    ["event new-config"]
+                );
+            }
+            "intents" => {
+                manager.set_event_intents(BTreeSet::new()).unwrap();
+                transport.ready.add_permits(1);
+                wait_health(&manager, |_, dropped| dropped == 1).await;
+                assert!(transport.sent.lock().unwrap().is_empty());
+                assert_eq!(
+                    manager
+                        .deliver_event(&guild, event("missing"))
+                        .await
+                        .unwrap()
+                        .unavailable,
+                    1
+                );
+                assert!(!manager.event_health()[0].missing_intents.is_empty());
+            }
+            "routing" => {
+                transport.ready.add_permits(1);
+                wait_health(&manager, |delivered, _| delivered == 1).await;
+                manager.deliver_event(&guild, event("first")).await.unwrap();
+                wait_health(&manager, |delivered, _| delivered == 2).await;
+                assert_eq!(transport.sent.lock().unwrap().as_slice(), ["event first"]);
+                let catalog = manager.catalog(&ACTOR, &guild).await.unwrap();
+                assert_eq!(catalog.len(), 1);
+                let binding = &catalog[0];
+                assert_eq!(
+                    binding
+                        .operations
+                        .iter()
+                        .map(|op| op.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["status"]
+                );
+                assert_eq!(
+                    manager
+                        .invoke_bound(
+                            &ACTOR,
+                            &guild,
+                            &module,
+                            "status",
+                            json!({}),
+                            &binding.session,
+                            binding.generation,
+                            binding.epoch
+                        )
+                        .await
+                        .unwrap()["epoch"],
+                    binding.epoch
+                );
+                assert!(
+                    manager
+                        .invoke_bound(
+                            &ACTOR,
+                            &guild,
+                            &module,
+                            "status",
+                            json!({}),
+                            &binding.session,
+                            binding.generation,
+                            binding.epoch + 1
+                        )
+                        .await
+                        .is_err()
+                );
+                manager
+                    .deactivate(&ACTOR, &module, &guild, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                manager
+                    .activate(
+                        &ACTOR,
+                        DesiredActivation {
+                            module: module.clone(),
+                            guild: guild.clone(),
+                            active: true,
+                            grants: vec![
+                                "config.own".into(),
+                                "events.guild".into(),
+                                "discord.notify".into(),
+                            ],
+                            bindings: BTreeMap::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    manager
+                        .invoke_bound(
+                            &ACTOR,
+                            &guild,
+                            &module,
+                            "status",
+                            json!({}),
+                            &binding.session,
+                            binding.generation,
+                            binding.epoch
+                        )
+                        .await
+                        .is_err()
+                );
+                let current = manager.catalog(&ACTOR, &guild).await.unwrap();
+                assert_eq!(current[0].generation, binding.generation);
+                assert_ne!(current[0].epoch, binding.epoch);
+                manager
+                    .unload(&module, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                manager.load(&installed.digest).await.unwrap();
+                assert!(
+                    manager
+                        .invoke_bound(
+                            &ACTOR,
+                            &guild,
+                            &module,
+                            "status",
+                            json!({}),
+                            &current[0].session,
+                            current[0].generation,
+                            current[0].epoch
+                        )
+                        .await
+                        .is_err()
+                );
+
+                let mut invalid = event("invalid");
+                invalid.subject_id = Some("message body should never become metadata".into());
+                assert!(manager.deliver_event(&guild, invalid).await.is_err());
+                let foreign: GuildId = "999".parse().unwrap();
+                assert!(
+                    manager
+                        .deliver_event(&foreign, event("foreign"))
+                        .await
+                        .is_err()
+                );
+            }
+            _ => unreachable!(),
+        }
+    })
+    .await;
+    let stopped = manager.shutdown().await;
+    let closed = storage.close().await;
+    remove_tree(&scratch);
+    if let Err(error) = task {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    stopped.unwrap();
+    closed.unwrap();
+}
+async fn wait_health(manager: &ModuleManager, done: impl Fn(usize, usize) -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if manager
+                .event_health()
+                .first()
+                .is_some_and(|h| done(h.delivered, h.dropped))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+fn remove_tree(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if path.is_dir() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                remove_tree(&entry.path());
+            }
+        }
+        let _ = std::fs::remove_dir(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
