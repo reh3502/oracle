@@ -87,6 +87,41 @@ pub fn canonical_definition(value: &Value) -> Result<Value> {
     fn normalize(value: &mut Value) {
         match value {
             Value::Object(map) => {
+                // Discord's localized display fields are derived from the localization maps.
+                map.remove("name_localized");
+                map.remove("description_localized");
+                for field in [
+                    "min_value",
+                    "max_value",
+                    "min_length",
+                    "max_length",
+                    "handler",
+                    "dm_permission",
+                ] {
+                    if map.get(field).is_some_and(Value::is_null) {
+                        map.remove(field);
+                    }
+                }
+                for field in ["required", "autocomplete"] {
+                    if map.get(field).and_then(Value::as_bool) == Some(false) {
+                        map.remove(field);
+                    }
+                }
+                for field in [
+                    "options",
+                    "choices",
+                    "channel_types",
+                    "file_types",
+                    "integration_types",
+                ] {
+                    if map
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                    {
+                        map.remove(field);
+                    }
+                }
                 for field in ["name_localizations", "description_localizations"] {
                     if map
                         .get(field)
@@ -178,6 +213,66 @@ impl CommandReconciler {
             backend,
             locks: Mutex::new(BTreeMap::new()),
         }
+    }
+    /// Adopt only an exact supported bootstrap definition already present remotely.
+    /// This never mutates Discord and never replaces an existing ownership or recovery record.
+    pub async fn adopt_known(
+        &self,
+        guild: &GuildId,
+        owner: &ModuleId,
+        known_definitions: &[Value],
+    ) -> Result<bool> {
+        if known_definitions.is_empty() || known_definitions.len() > 8 {
+            return Err(error(ErrorCode::InvalidInput));
+        }
+        let known = known_definitions
+            .iter()
+            .map(canonical_definition)
+            .collect::<Result<Vec<_>>>()?;
+        if known
+            .iter()
+            .any(|definition| command_key(definition).ok().as_deref() != Some("1:oracle"))
+        {
+            return Err(error(ErrorCode::InvalidInput));
+        }
+        let lock = self
+            .locks
+            .lock()
+            .unwrap()
+            .entry(guild.clone())
+            .or_default()
+            .clone();
+        let _lock = lock.lock().await;
+        if let Some((_, binding)) = self.records(guild).await?.get("1:oracle") {
+            return if &binding.owner == owner {
+                Ok(false)
+            } else {
+                Err(error(ErrorCode::Conflict))
+            };
+        }
+        let observed = self.observed(guild).await?;
+        let Some(actual) = observed.get("1:oracle") else {
+            return Ok(false);
+        };
+        if !known.contains(&actual.definition) {
+            return Err(error(ErrorCode::Conflict));
+        }
+        self.save(
+            guild,
+            "1:oracle",
+            None,
+            &CommandBinding {
+                owner: owner.clone(),
+                id: Some(actual.id.clone()),
+                definition: actual.definition.clone(),
+                route: None,
+                pending: None,
+                target: None,
+                deleted: false,
+            },
+        )
+        .await?;
+        Ok(true)
     }
     async fn records(&self, guild: &GuildId) -> Result<BTreeMap<String, (u64, CommandBinding)>> {
         let mut result = BTreeMap::new();

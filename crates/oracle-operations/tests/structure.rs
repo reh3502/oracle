@@ -149,7 +149,16 @@ async fn saved_plan_survives_restart_and_repeated_setup_is_a_noop() {
     let executor = service(&store, world.clone());
     let guild = GuildId::new("100").unwrap();
     let context = PolicyContext::LocalOperator;
-    let plan = executor.plan(&context, &guild, &request()).await.unwrap();
+    let mut setup = request();
+    setup.channels.push(DesiredChannel {
+        key: "minecraft.voice".into(),
+        name: "Minecraft Voice".into(),
+        kind: ChannelKind::Voice,
+        parent: Some("minecraft.category".into()),
+        existing_id: None,
+        overwrites: None,
+    });
+    let plan = executor.plan(&context, &guild, &setup).await.unwrap();
     drop(executor);
     store.close().await.unwrap();
     drop(store);
@@ -160,16 +169,16 @@ async fn saved_plan_survives_restart_and_repeated_setup_is_a_noop() {
         .await
         .unwrap();
     assert!(matches!(done.state, PlanState::Complete));
-    assert_eq!(done.receipts.len(), 2);
-    assert_eq!(world.writes.load(Ordering::SeqCst), 2);
-    let repeated = executor.plan(&context, &guild, &request()).await.unwrap();
+    assert_eq!(done.receipts.len(), 3);
+    assert_eq!(world.writes.load(Ordering::SeqCst), 3);
+    let repeated = executor.plan(&context, &guild, &setup).await.unwrap();
     assert!(repeated.steps.iter().all(|s| s.change == Change::Reuse));
     let done = executor
         .apply(&context, &guild, &repeated.id, &CancellationToken::new())
         .await
         .unwrap();
     assert!(matches!(done.state, PlanState::Complete));
-    assert_eq!(world.writes.load(Ordering::SeqCst), 2);
+    assert_eq!(world.writes.load(Ordering::SeqCst), 3);
     store.close().await.unwrap();
 }
 #[tokio::test]
