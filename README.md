@@ -131,6 +131,8 @@ Keep backup files private, copy them to separate storage, and periodically repea
 
 ## Development and qualification
 
+Start with the [contributor guide](CONTRIBUTING.md) for the crate map, architecture rules, and everyday checks. Run `python3 scripts/check.py` for the local developer gate. Python 3.11 or newer is required for the check scripts.
+
 Production crates separate value contracts, policy/orchestration, SQL repositories, Discord presentation and the executable composition root. The pinned Serenity upstream revision and minimal patch are reproduced by `scripts/prepare-serenity.py`; unexpected local fork edits are preserved and rejected for review.
 
 ```sh
