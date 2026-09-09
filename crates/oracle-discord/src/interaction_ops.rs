@@ -16,6 +16,9 @@ pub(super) fn parse(
     interaction: &discord::CommandInteraction,
 ) -> Result<(PolicyContext, GuildId, OperationRequest)> {
     let (context, guild) = authenticated_identity(interaction)?;
+    if interaction.data.name.as_str() != "oracle" {
+        return Ok((context, guild, parse_published(interaction)?));
+    }
     let [group] = interaction.data.options.as_ref() else {
         return Err(Error::InvalidInteraction);
     };
@@ -94,6 +97,50 @@ pub(super) fn parse(
     }
     Ok((context, guild, request))
 }
+fn parse_published(interaction: &discord::CommandInteraction) -> Result<OperationRequest> {
+    fn name(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 32
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+    }
+    let command_id = interaction.data.id.to_string();
+    UserId::new(&command_id).map_err(|_| Error::InvalidInteraction)?;
+    let command_name = interaction.data.name.to_string();
+    if !name(&command_name) {
+        return Err(Error::InvalidInteraction);
+    }
+    let [command] = interaction.data.options.as_ref() else {
+        return Err(Error::InvalidInteraction);
+    };
+    let discord::CommandDataOptionValue::SubCommand(options) = &command.value else {
+        return Err(Error::InvalidInteraction);
+    };
+    if !name(command.name.as_str()) {
+        return Err(Error::InvalidInteraction);
+    }
+    let input = match options.as_ref() {
+        [] => serde_json::json!({}),
+        [option] if option.name.as_str() == "input" => {
+            let discord::CommandDataOptionValue::String(value) = &option.value else {
+                return Err(Error::InvalidInteraction);
+            };
+            if value.len() > 16 * 1024 {
+                return Err(Error::InvalidInteraction);
+            }
+            serde_json::from_str(value).map_err(|_| Error::InvalidInteraction)?
+        }
+        _ => return Err(Error::InvalidInteraction),
+    };
+    Ok(OperationRequest::InvokePublished {
+        command_id,
+        command_name,
+        route: command.name.to_string(),
+        input,
+    })
+}
+
 pub(super) enum ExactResponse {
     Text(String),
     Attachment {

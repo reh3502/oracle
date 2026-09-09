@@ -1,6 +1,7 @@
 //! Host composition root. Feature modules enter only through runtime installation.
 #![forbid(unsafe_code)]
 mod cli_ops;
+mod command_runtime;
 mod config;
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -244,6 +245,7 @@ enum Action {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    PublishCommands,
     Operation {
         guild: GuildId,
         request: OperationRequest,
@@ -282,6 +284,7 @@ fn present_result<'de, D: serde::Deserializer<'de>>(
 struct Host {
     operations: std::sync::OnceLock<Arc<oracle_operations::executor::StructureExecutor>>,
     command_sync: std::sync::OnceLock<Arc<oracle_operations::commands::CommandReconciler>>,
+    command_status: std::sync::Mutex<BTreeMap<GuildId, serde_json::Value>>,
     operation_tasks: HostTasks,
     storage: Arc<Storage>,
     core: Arc<CoreService>,
@@ -339,6 +342,7 @@ impl Host {
         Ok(Self {
             operations: std::sync::OnceLock::new(),
             command_sync: std::sync::OnceLock::new(),
+            command_status: std::sync::Mutex::new(BTreeMap::new()),
             operation_tasks: HostTasks::new(),
             storage,
             core,
@@ -355,6 +359,7 @@ impl Host {
     }
     async fn handle(&self, request: Request) -> Result<serde_json::Value> {
         match request {
+            Request::PublishCommands => command_runtime::publish_once(self).await,
             Request::Operation { guild, request } => {
                 self.execute(
                     &PolicyContext::LocalOperator,
@@ -470,6 +475,15 @@ impl Host {
                     .as_object_mut()
                     .ok_or_else(|| Error::new(ErrorCode::Integrity))?;
                 object.insert("module_events".into(), value(events)?);
+                let commands: BTreeMap<_, _> = self
+                    .command_status
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(id, _)| guild.as_ref().is_none_or(|guild| guild == *id))
+                    .map(|(id, status)| (id.clone(), status.clone()))
+                    .collect();
+                object.insert("module_commands".into(), value(commands)?);
                 object.insert(
                     "available_event_intents".into(),
                     value(self.modules.event_intents())?,
@@ -572,7 +586,12 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
             output(restored.status(None).await?)
         }
-        Command::PublishCommands => publish(&config).await,
+        Command::PublishCommands => {
+            let stream = UnixStream::connect(config.socket())
+                .await
+                .map_err(|_| Error::new(ErrorCode::ModuleUnavailable))?;
+            output(remote(stream, Request::PublishCommands).await?)
+        }
         Command::Structure(args) => {
             let request = args.request()?;
             let stream = UnixStream::connect(config.socket())
@@ -778,6 +797,14 @@ async fn serve(config: Config, tools: PgTools) -> Result<()> {
         } else {None};
         let restored = host.modules.restore_desired().await?;
         for (module, error) in &restored { tracing::warn!(module = %module, error = ?error, "module desired state was not restored"); }
+        if gateway.is_some() {
+            let command_host = host.clone();
+            let command_stop = stop.clone();
+            let command_guilds = config.guilds.iter().map(|p|p.guild.clone()).collect();
+            tasks.spawn("module_command_publication", async move {
+                command_runtime::run(command_host, command_guilds, command_stop).await.map_err(|_|TaskError)
+            }).map_err(|_| Error::new(ErrorCode::Cancelled))?;
+        }
         let maintenance_modules = host.modules.clone();
         let maintenance_stop = stop.clone();
         let maintenance_guilds: Vec<_> = config.guilds.iter().map(|p| p.guild.clone()).collect();
@@ -857,44 +884,6 @@ async fn serve(config: Config, tools: PgTools) -> Result<()> {
     }
     result.and(closed)
 }
-async fn publish(config: &Config) -> Result<()> {
-    let discord = config
-        .discord
-        .as_ref()
-        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
-    let token = oracle_discord::Token::from_str(&config::secret_env(&discord.token_env)?)
-        .map_err(|_| Error::new(ErrorCode::InvalidInput))?;
-    let http = serenity::all::Http::new(token);
-    let application =
-        tokio::time::timeout(Duration::from_secs(15), http.get_current_application_info())
-            .await
-            .map_err(|_| Error::new(ErrorCode::Cancelled))?
-            .map_err(|_| Error::new(ErrorCode::Io))?;
-    http.set_application_id(application.id);
-    for policy in &config.guilds {
-        let guild = serenity::all::GuildId::new(
-            policy
-                .guild
-                .as_str()
-                .parse()
-                .map_err(|_| Error::new(ErrorCode::InvalidInput))?,
-        );
-        let receipt = oracle_discord::publish_guild_command(&http, guild)
-            .await
-            .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-        if let Err(error) = oracle_discord::verify_published_command(&http, &receipt).await {
-            oracle_discord::cleanup_published_command(&http, &receipt)
-                .await
-                .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-            return Err(Error::with_source(ErrorCode::Io, error));
-        }
-        output(
-            serde_json::json!({"guild":policy.guild,"command_id":receipt.id().to_string(),"created":receipt.created()}),
-        )?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod module_cli_tests {
     use super::*;

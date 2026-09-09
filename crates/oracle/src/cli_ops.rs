@@ -108,6 +108,7 @@ impl HumanOperations for Host {
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value> {
         let structure = self.operations.get().cloned();
+        let commands = self.command_sync.get().cloned();
         let modules = self.modules.clone();
         let context = context.clone();
         let guild = guild.clone();
@@ -117,7 +118,15 @@ impl HumanOperations for Host {
         let (send, receive) = tokio::sync::oneshot::channel();
         self.operation_tasks
             .spawn("human_operation", async move {
-                let work = dispatch(structure, modules, &context, &guild, request, &work_cancel);
+                let work = dispatch(
+                    structure,
+                    commands,
+                    modules,
+                    &context,
+                    &guild,
+                    request,
+                    &work_cancel,
+                );
                 tokio::pin!(work);
                 let result = tokio::select! {biased;
                  _=root.cancelled()=>{work_cancel.cancel();work.await},
@@ -135,6 +144,7 @@ impl HumanOperations for Host {
 }
 async fn dispatch(
     structure: Option<Arc<StructureExecutor>>,
+    commands: Option<Arc<oracle_operations::commands::CommandReconciler>>,
     modules: Arc<ModuleManager>,
     context: &PolicyContext,
     guild: &GuildId,
@@ -150,6 +160,13 @@ async fn dispatch(
             .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))
     };
     match request {
+        request @ OperationRequest::InvokePublished { .. } => {
+            let commands = commands.ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+            tokio::select! { biased;
+                _ = cancel.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+                result = command_runtime::invoke_published(&modules, &commands, context, guild, request) => result,
+            }
+        }
         OperationRequest::Inspect => value(service()?.inspect(context, guild).await?),
         OperationRequest::Plan { request } => {
             value(service()?.plan(context, guild, &request).await?)

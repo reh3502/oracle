@@ -1621,6 +1621,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

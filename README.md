@@ -42,19 +42,34 @@ Edit the initialized config to add the guilds and specific users permitted to pa
 Set the referenced bot token in the host environment. Oracle does not automatically source `.env` or a text document. Configure `discord: null` for an entirely offline host. Provider credentials are not read by the host, and no secrets are stored in the database or sent to a module.
 
 ```sh
-./target/debug/oracle --config deployment/oracle.json publish-commands
 ./target/debug/oracle --config deployment/oracle.json serve
+# In another terminal, while the host is running:
+./target/debug/oracle --config deployment/oracle.json publish-commands
 ./target/debug/oracle --config deployment/oracle.json status --guild 123456789012345678
 ./target/debug/oracle --config deployment/oracle.json control --guild 123456789012345678 pause
 ./target/debug/oracle --config deployment/oracle.json control --guild 123456789012345678 resume --expected-revision 2
 ./target/debug/oracle --config deployment/oracle.json recovery --guild 123456789012345678
 ```
 
-`publish-commands` explicitly creates `/oracle status` and `/oracle control action:pause|resume` in configured guilds. It verifies the command definition and refuses conflicting existing `/oracle` definitions. Starting the Gateway does not publish commands. Discord controls require both the configured operator allowlist and Manage Server/Administrator permission. Replies are ephemeral; commands cannot select another guild or obtain credentials. Discord's default command permission is Manage Server.
+The running host reconciles `/oracle` and explicitly declared commands from active modules. `/oracle` includes status, pause/resume, structure operations, and module configuration. `publish-commands` requests an immediate reconciliation through the running host. The exact earlier status/control definition is upgraded in place; unrelated or changed definitions are conflicts. Unchanged commands keep their IDs. Discord controls require both the configured operator allowlist and Manage Server/Administrator permission. Replies are ephemeral; commands cannot select another guild or obtain credentials. Discord's default command permission is Manage Server.
 
-Local control authenticates through the OS user's private Unix socket and can operate while the host is running. Without a running host, commands acquire exclusive deployment ownership themselves. Keep one config/state directory per deployment; restart to apply config changes. The local OS operator is trusted to administer all configured guilds.
+Local control authenticates through the OS user's private Unix socket and can operate while the host is running. Module management, structure/configuration operations, and command publication require a running host. Basic status, control, recovery inspection, and backup can acquire exclusive deployment ownership when the host is stopped. Keep one config/state directory per deployment; restart to apply config changes. The local OS operator is trusted to administer all configured guilds.
 
-An effect is recorded as `sent` before reaching its adapter. Cancellation, transport ambiguity and restart retain recovery state; an uncertain effect is never automatically resent. Stage 1 exposes bounded recovery inspection. Domain-specific Discord operations and reconciliation arrive in Stage 3.
+An effect is recorded as `sent` before reaching its adapter. Cancellation, transport ambiguity and restart retain recovery state; an uncertain effect is never automatically resent. Recovery inspection is bounded. Structure plans retain partial outcomes and logical resource reservations; uncertain creates cannot be repeated blindly.
+
+## Server structure and module configuration
+
+Structure changes use saved plans. For example, this plans a Minecraft category with text and voice channels:
+
+```sh
+./target/debug/oracle --config deployment/oracle.json structure --guild 123456789012345678 plan --input '{"channels":[{"key":"minecraft.category","name":"Minecraft","kind":"category"},{"key":"minecraft.chat","name":"minecraft-chat","kind":"text","parent":"minecraft.category"},{"key":"minecraft.voice","name":"Minecraft Voice","kind":"voice","parent":"minecraft.category"}]}'
+```
+
+Review the returned plan and its permission changes. Use `structure --guild GUILD show --plan PLAN_ID` to retrieve it. If approval is required, use `approve --plan PLAN_ID --hash EXACT_HASH`; then use `apply --plan PLAN_ID`. These subcommands follow the same `structure --guild GUILD` prefix. Plans expire, bind to their author and deployment, and reject changed server facts. Repeating a completed setup reuses the saved resource IDs. Partial or uncertain outcomes remain recorded for inspection.
+
+Discord exposes the same executor through `/oracle structure` and `/oracle module-config`. Large results arrive as ephemeral JSON attachments. Module configuration uses `inspect`, `plan`, `apply`, and `recover`; stored settings are verified against the running module's effective revision.
+
+Modules explicitly declare their slash routes. Activation publishes only routes whose capabilities were granted. Deactivation and reload revoke the old runtime identity immediately, even while Discord still displays an old command. `status` reports command publication and event delivery state. See the separately installed [activity logging example](examples/modules/activity-log/README.md) for configuration and delivery checks.
 
 ## Runtime modules
 

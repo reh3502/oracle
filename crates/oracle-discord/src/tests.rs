@@ -674,3 +674,132 @@ async fn gateway_coverage_is_unavailable_until_ready_and_clears_on_disconnect_an
     storage.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn published_interaction(id: &str, args: Value) -> discord::CommandInteraction {
+    let mut value = serde_json::to_value(interaction("101", "303", "32", None)).unwrap();
+    value["data"] = json!({"id":id,"name":"activity-log","type":1,"options":[{"name":"probe","type":1,"options":args}]});
+    serde_json::from_str(&value.to_string()).unwrap()
+}
+#[tokio::test]
+async fn published_command_uses_authenticated_actor_and_exact_remote_id() {
+    let expected = json!({"verified":true});
+    let (bootstrap, operations, responder) = operations_setup(expected.clone(), false);
+    let command = published_interaction(
+        "999999999999999999",
+        json!([{"name":"input","type":3,"value":"{\"actor\":\"attacker\",\"guild\":\"999\"}"}]),
+    );
+    assert!(
+        bootstrap
+            .handle_command(&command, &responder)
+            .await
+            .unwrap()
+    );
+    let requests = operations.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        matches!(&requests[0].0,PolicyContext::Discord{guild,user,manage_guild:true} if guild.as_str()=="101" && user.as_str()=="303")
+    );
+    assert_eq!(requests[0].1.as_str(), "101");
+    assert!(
+        matches!(&requests[0].2,oracle_operations::ingress::OperationRequest::InvokePublished{command_id,command_name,route,input} if command_id=="999999999999999999" && command_name=="activity-log" && route=="probe" && input==&json!({"actor":"attacker","guild":"999"}))
+    );
+    assert_eq!(responder.result.lock().unwrap().as_ref(), Some(&expected));
+}
+#[tokio::test]
+async fn published_command_default_input_and_stale_id_are_preserved_for_registry_validation() {
+    let (bootstrap, operations, responder) = operations_setup(json!({}), false);
+    bootstrap
+        .handle_command(&published_interaction("404", json!([])), &responder)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&operations.requests.lock().unwrap()[0].2,oracle_operations::ingress::OperationRequest::InvokePublished{command_id,input,..} if command_id=="404" && input==&json!({}))
+    );
+}
+#[tokio::test]
+async fn malformed_published_commands_never_reach_operations() {
+    for args in [
+        json!([{"name":"module","type":3,"value":"other-module"}]),
+        json!([{"name":"input","type":3,"value":"not-json"}]),
+        json!([{"name":"input","type":3,"value":"{}"},{"name":"input","type":3,"value":"{}"}]),
+        json!([{"name":"input","type":4,"value":1}]),
+    ] {
+        let (bootstrap, operations, responder) = operations_setup(json!({}), false);
+        assert!(
+            bootstrap
+                .handle_command(&published_interaction("404", args), &responder)
+                .await
+                .unwrap()
+        );
+        assert!(operations.requests.lock().unwrap().is_empty());
+        assert!(responder.events.lock().unwrap()[0].starts_with("reject:"));
+    }
+    let (bootstrap, operations, responder) = operations_setup(json!({}), false);
+    let mut command = published_interaction("404", json!([]));
+    command.member.as_mut().unwrap().user.id = discord::UserId::new(999);
+    bootstrap
+        .handle_command(&command, &responder)
+        .await
+        .unwrap();
+    assert!(operations.requests.lock().unwrap().is_empty());
+    assert!(responder.events.lock().unwrap()[0].starts_with("reject:"));
+}
+#[tokio::test]
+async fn unrelated_published_commands_without_operations_are_not_claimed() {
+    let (bootstrap, _) = setup();
+    let (_, _, responder) = operations_setup(json!({}), false);
+    assert!(
+        !bootstrap
+            .handle_command(&published_interaction("404", json!([])), &responder)
+            .await
+            .unwrap()
+    );
+    assert!(responder.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn published_commands_require_exactly_one_subcommand_and_share_cancellation() {
+    for options in [
+        json!([]),
+        json!([{"name":"probe","type":1,"options":[]},{"name":"status","type":1,"options":[]}]),
+        json!([{"name":"group","type":2,"options":[{"name":"probe","type":1,"options":[]}]}]),
+    ] {
+        let (bootstrap, operations, responder) = operations_setup(json!({}), false);
+        let mut raw = serde_json::to_value(published_interaction("404", json!([]))).unwrap();
+        raw["data"]["options"] = options;
+        let command = serde_json::from_str(&raw.to_string()).unwrap();
+        bootstrap
+            .handle_command(&command, &responder)
+            .await
+            .unwrap();
+        assert!(operations.requests.lock().unwrap().is_empty());
+        assert!(responder.events.lock().unwrap()[0].starts_with("reject:"));
+    }
+    let (bootstrap, operations, responder) = operations_setup(json!({}), true);
+    bootstrap
+        .handle_operation(
+            &published_interaction("404", json!([])),
+            &responder,
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+    assert!(
+        operations
+            .token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
+    assert!(
+        responder
+            .events
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("timed out")
+    );
+}

@@ -256,7 +256,7 @@ impl DiscordBootstrap {
         .map_err(|_| Error::Transport)?
     }
 
-    /// Handles only `/oracle`; authorization stays in CoreService before repository access.
+    /// Handles bootstrap and published module commands through the shared policy service.
     /// Actor, guild and permission facts come solely from the authenticated Gateway interaction.
     pub async fn handle_command(
         &self,
@@ -264,7 +264,13 @@ impl DiscordBootstrap {
         responder: &dyn InteractionResponder,
     ) -> Result<bool> {
         if interaction.data.name.as_str() != "oracle" {
-            return Ok(false);
+            if self.operations.is_none() || interaction.data.kind != discord::CommandType::ChatInput
+            {
+                return Ok(false);
+            }
+            return self
+                .handle_operation(interaction, responder, Duration::from_secs(30))
+                .await;
         }
         if interaction_ops::is_operation(interaction) {
             return self
@@ -679,3 +685,5 @@ pub mod operations;
 pub mod transport;
 
 mod gateway_events;
+
+pub mod bootstrap_commands;

@@ -9,15 +9,41 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationRequest {
+    InvokePublished {
+        command_id: String,
+        command_name: String,
+        route: String,
+        input: Value,
+    },
     Inspect,
-    Plan { request: StructureRequest },
-    Show { plan: String },
-    Approve { plan: String, hash: String },
-    Apply { plan: String },
-    ConfigurationInspect { module: ModuleId },
-    ConfigurationPlan { module: ModuleId, preset: Option<String>, values: Value },
-    ConfigurationApply { module: ModuleId, plan: String },
-    ConfigurationRecover { module: ModuleId },
+    Plan {
+        request: StructureRequest,
+    },
+    Show {
+        plan: String,
+    },
+    Approve {
+        plan: String,
+        hash: String,
+    },
+    Apply {
+        plan: String,
+    },
+    ConfigurationInspect {
+        module: ModuleId,
+    },
+    ConfigurationPlan {
+        module: ModuleId,
+        preset: Option<String>,
+        values: Value,
+    },
+    ConfigurationApply {
+        module: ModuleId,
+        plan: String,
+    },
+    ConfigurationRecover {
+        module: ModuleId,
+    },
 }
 
 #[async_trait]
