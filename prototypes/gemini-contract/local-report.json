@@ -1,0 +1,53 @@
+{
+  "date": "2026-09-08",
+  "gate": "P5",
+  "status": "passed_for_beta_3_8",
+  "offline_tests": {
+    "passed": 13,
+    "failed": 0
+  },
+  "checks": {
+    "cargo_test_locked": 0,
+    "cargo_clippy_warnings_denied": 0,
+    "cargo_fmt_check": 0
+  },
+  "live": {
+    "attempted": true,
+    "verified": true,
+    "profile": "beta-3.8",
+    "record": "live-success.json",
+    "prior_429_failures_preserved": true
+  },
+  "profile": {
+    "api_version": "v1",
+    "endpoint": "https://generativelanguage.googleapis.com/v1/interactions",
+    "model": "gemini-3.7-flash"
+  },
+  "artifacts": {
+    "Cargo.toml": "c649c936f75f46d475822b4477a1631041ae85a9520a6741e8c33a32c46e2aed",
+    "Cargo.lock": "009d187717246cc4aabbedf8af0350ed5faf8aa4f986fd62c606122fd3e44b42",
+    "src/lib.rs": "197c685e247742c79a5738b2e084b73b4bc5ae480991b5e0bd2df69bb90e17d9",
+    "src/bin/live.rs": "c209ad9cb3dfc0f1171c79764bd513620db05cf172e3582ab6b1ca8cb7ac2665",
+    "tests/contract.rs": "f9e95230fdd9a2c96e190dac31592591c9350e94725b69b78bb08187b67d2de2",
+    "fixtures/completed.json": "b6fc46153874b3465519b1a455bf3de47622cd5970ab4442a5fdf0409e882e21",
+    "fixtures/incomplete.json": "cb60ca61de0fdc7170b0ccd42a138dbfdaa70dd8665bfdcbb77ccc207726e071",
+    "fixtures/interactions-v1.openapi.json": "3c25941e544ff0d96125faf65983b36152f91e0e6e2c4dc88b051fd687ca3f52",
+    "fixtures/interactions-v1beta.openapi.json": "c3993507e6928c16dca47817038d32a8ef853c1e1c049f154d101c8b0c9b1d21",
+    "fixtures/refusal-prose.json": "13391f561b037a9d0548435a6625d1a1cec2852b4dff1896d0028789c131ab93",
+    "fixtures/round1.json": "0d4fb3c8a21734e2841c2b06abfe71ad40b9503d77302107d18b470bac911576",
+    "fixtures/round2.json": "3387c01d99ae07b7b4aa3d4b44906497e545f0d51b3664462ec9a7245510d8d1"
+  },
+  "profiles": [
+    {
+      "name": "stable-v1-3.7",
+      "api_version": "v1",
+      "model": "gemini-3.7-flash"
+    },
+    {
+      "name": "beta-3.8",
+      "api_version": "v1beta",
+      "model": "gemini-3.8-flash",
+      "provenance": "explicit user endpoint/model instruction"
+    }
+  ]
+}

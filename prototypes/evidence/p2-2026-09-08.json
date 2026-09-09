@@ -1,0 +1,65 @@
+{
+  "recorded_at_utc": "2026-09-08T20:54:10.944457+00:00",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)\nrelease: 1.98.1\ncommit-hash: 797e8a9bca276c1c9f9f738d2a20f484fa4eea9d\ncommit-date: 2026-08-05\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 26.4.0 (resolute) [64-bit]",
+  "platform": [
+    "Linux",
+    "lyra-x570",
+    "7.0.0-31-generic",
+    "#31-Ubuntu SMP PREEMPT_DYNAMIC Sat Aug  1 04:26:38 UTC 2026",
+    "x86_64",
+    ""
+  ],
+  "source_sha256": {
+    "prototypes/drain-boundary/src/lib.rs": "4f750cd632028e50ad556fe6a70c8849bcc71d6b8658e805159cae9cddf21b73",
+    "prototypes/drain-boundary/src/main.rs": "3ef5e30d849851ec2454ef1ab8f46740f6a43e22a89e85a78e11e37a9980ff72",
+    "prototypes/drain-boundary/Cargo.toml": "ad23a2490b297c4d848cf220adfa9f0599e0fb9d003d159ca0f36f37eb274589",
+    "prototypes/drain-boundary/Cargo.lock": "3456e8cf9bf48c2082683428f117a77faedd577a6459bf94005609734ab61f6a",
+    "scripts/check-p2-p6.sh": "c7c11b42bf5d18205d2b8dcee408b1fac2effe5ee7c155565e1c6d565af53ffd",
+    "prototypes/process-runtime/src/lib.rs": "951b9d38e832a5ed00ff943da8b50027a9bcb8f690356f1bc2a3f0fae2e3af64",
+    "prototypes/process-runtime/src/runtime.rs": "47bfc344ea36100d3d20c262b370f71899776667eae0c4382a9e680e09b15b6f",
+    "prototypes/process-runtime/src/rpc.rs": "767bfc93bf7f25aecedf21d3eeac21c90d4ac6b45d8eed71c6824d464699d829",
+    "prototypes/process-runtime/src/harness.rs": "5a7b5589431bc44fe9d4264f080a66c9af52e56ec8c88cef9ca37f31edf318b4",
+    "prototypes/process-runtime/src/bin/p1.rs": "c06f448b42d951b64e7cc7a5331fcfe6510d0bc4c139543261243fc258402503",
+    "prototypes/fixtures/common.rs": "cc8a76a0eba1354b77203f80dff0b7f21998831fe225db632774d05b721cd242",
+    "prototypes/fixtures/alpha/src/main.rs": "a703fe941c59aac6c2282c90f4bed67de3f9d11e8ed4ec087c66c8400aa962c7",
+    "prototypes/fixtures/beta/src/main.rs": "2b282dce5ac72667970d7b79f60ca5ec0eabe0ec05e3d2626766c15420a64489",
+    "Cargo.toml": "2579eb30e259327fd350b8786705b0da278036571a7ba3672ea17b3c54e80b05",
+    "prototypes/process-runtime/Cargo.toml": "66f7c9f0960794533c7c062203ae6067d79e267efc25bd47eead6265a454e1d3"
+  },
+  "binary_sha256": "e4958ccf3d0457687ddf3ad656e1420292bebec98c880ffab19058f0f2c3719f",
+  "alpha_fixture_sha256": "8d87af29fe112d258dfc5f544f3490b3a7d3689bb0e4283510c3187aa9a2e76f",
+  "checks": {
+    "format": "passed",
+    "clippy_deny_warnings": "passed",
+    "release_build": "passed",
+    "acceptance_exit_code": 0
+  },
+  "acceptance": {
+    "checks": [
+      "AI/command/job admission closes at quiesce; stalled writes cannot send after fence",
+      "existing leases drain and unaffected guild continues",
+      "429 retry rechecks after its own rate wait; no second send after fencing",
+      "already-sent lost response stays durable unknown across reopen and cannot blindly retry",
+      "torn final journal append preserves earlier fsynced unknown outcome",
+      "concurrent same-effect calls share one dispatch and cannot overwrite each other's outcome",
+      "current authorization, completion and expiry checked at send",
+      "one-guild forced restart reports both interrupted guilds and fences old generation",
+      "shared native process restart reaps old PID, fences old handle and restores other guild on new generation",
+      "100 concurrent entry/quiesce/fence rounds with zero post-fence requests"
+    ],
+    "disruption": {
+      "deactivated_guild": "guild-a",
+      "interrupted_guilds": [
+        "guild-a",
+        "guild-b"
+      ],
+      "new_generation": 2,
+      "old_generation": 1
+    },
+    "prototype": "P2",
+    "race_rounds": 100,
+    "status": "passed",
+    "transport": "host-owned loopback HTTP; no live Discord/TLS verification"
+  }
+}

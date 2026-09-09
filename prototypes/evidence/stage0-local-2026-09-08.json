@@ -1,0 +1,95 @@
+{
+  "recorded_at_utc": "2026-09-08T21:03:25.998387+00:00",
+  "local_passed": true,
+  "stage0_passed": true,
+  "commands": [
+    {
+      "gate": "P1",
+      "command": [
+        "./scripts/check-p1.sh"
+      ],
+      "exit_code": 0,
+      "log": "P1.log"
+    },
+    {
+      "gate": "P2_P6",
+      "command": [
+        "./scripts/check-p2-p6.sh"
+      ],
+      "exit_code": 0,
+      "log": "P2_P6.log"
+    },
+    {
+      "gate": "P3",
+      "command": [
+        "python3",
+        "prototypes/serenity-baseline/check.py"
+      ],
+      "exit_code": 0,
+      "log": "P3.log"
+    },
+    {
+      "gate": "P4",
+      "command": [
+        "./prototypes/storage-fit/scripts/run.sh"
+      ],
+      "exit_code": 0,
+      "log": "P4.log"
+    },
+    {
+      "gate": "P5_tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "prototypes/gemini-contract/Cargo.toml"
+      ],
+      "exit_code": 0,
+      "log": "P5_tests.log"
+    },
+    {
+      "gate": "P5_lint",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--manifest-path",
+        "prototypes/gemini-contract/Cargo.toml",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "P5_lint.log"
+    },
+    {
+      "gate": "P5_fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "prototypes/gemini-contract/Cargo.toml",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "P5_fmt.log"
+    },
+    {
+      "gate": "P7",
+      "command": [
+        "python3",
+        "prototypes/scenario-b/verify.py"
+      ],
+      "exit_code": 0,
+      "log": "P7.log"
+    }
+  ],
+  "live_evidence": {
+    "P3": true,
+    "P5": true
+  },
+  "P8": "optional comparison; not required for trusted-process Stage 0",
+  "note": "Live requests are separately authorized and are never replayed by this script."
+}

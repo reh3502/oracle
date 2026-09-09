@@ -1,0 +1,89 @@
+diff --git a/src/gateway/sharding/mod.rs b/src/gateway/sharding/mod.rs
+index fb312cf0..e82b5886 100644
+--- a/src/gateway/sharding/mod.rs
++++ b/src/gateway/sharding/mod.rs
+@@ -274,14 +274,7 @@ impl Shard {
+ 
+         self.seq = seq;
+ 
+-        let event = match event {
+-            DeserializedEvent::Success(event) => event,
+-            DeserializedEvent::Unknown(event) => {
+-                debug!("Failed to deserialize event data: {}", event.err);
+-                debug!("Raw event data: {}", event.data);
+-                return None;
+-            },
+-        };
++        let event = event.into_event();
+ 
+         match &*event {
+             Event::Ready(ready) => {
+diff --git a/src/model/event/full_event.rs b/src/model/event/full_event.rs
+index e4797f5d..6a17f29a 100644
+--- a/src/model/event/full_event.rs
++++ b/src/model/event/full_event.rs
+@@ -34,6 +34,8 @@ macro_rules! full_event {
+ }
+ 
+ full_event! {
++    /// An unsupported dispatch retained as untrusted raw data for adapter recovery.
++    Unknown { event: UnknownEvent };
+     /// Dispatched when the permissions of an application command was updated.
+     ///
+     /// Provides said permission's data.
+@@ -426,6 +428,7 @@ impl FullEvent {
+         #[cfg(feature = "cache")] cache: &Cache,
+     ) -> Self {
+         match *event {
++            Event::Unknown(event) => Self::Unknown { event },
+             Event::CommandPermissionsUpdate(event) => Self::CommandPermissionsUpdate {
+                 permission: event.permission,
+             },
+diff --git a/src/model/event/mod.rs b/src/model/event/mod.rs
+index 80ddd19b..21d17470 100644
+--- a/src/model/event/mod.rs
++++ b/src/model/event/mod.rs
+@@ -1070,6 +1070,17 @@ pub enum DeserializedEvent {
+     Unknown(UnknownEvent),
+ }
+ 
++impl DeserializedEvent {
++    /// Preserve unsupported dispatches instead of discarding information needed by adapters.
++    /// Raw data is untrusted and must be validated before acting on it.
++    pub fn into_event(self) -> Box<Event> {
++        match self {
++            Self::Success(event) => event,
++            Self::Unknown(event) => Box::new(Event::Unknown(event)),
++        }
++    }
++}
++
+ #[cfg_attr(feature = "typesize", derive(typesize::derive::TypeSize))]
+ #[derive(Clone, Debug)]
+ #[non_exhaustive]
+@@ -1116,7 +1127,14 @@ impl<'de> Deserialize<'de> for GatewayEvent {
+ 
+                 Self::Dispatch {
+                     seq: raw.seq.ok_or_else(|| DeError::missing_field("s"))?,
+-                    event: match Deserialize::deserialize(raw_data) {
++                    // Adjacent-tag deserialization buffers d if it precedes t. That
++                    // loses RawValue support inside interactions. Preserve raw payload
++                    // bytes and canonicalize only the outer tag order.
++                    event: match serde_json::from_str(&format!(
++                        "{{\"t\":{},\"d\":{}}}",
++                        serde_json::to_string(&raw.ty).map_err(DeError::custom)?,
++                        raw.data.get(),
++                    )) {
+                         Ok(event) => DeserializedEvent::Success(event),
+                         Err(e) => DeserializedEvent::Unknown(UnknownEvent {
+                             data: Deserialize::deserialize(raw_data).map_err(DeError::custom)?,
+@@ -1156,6 +1174,9 @@ impl<'de> Deserialize<'de> for GatewayEvent {
+ #[serde(tag = "t", content = "d")]
+ #[non_exhaustive]
+ pub enum Event {
++    /// An unknown or malformed dispatch preserved for adapter-level recovery.
++    #[serde(skip_deserializing)]
++    Unknown(UnknownEvent),
+     /// The permissions of an [`Command`] was changed.
+     #[serde(rename = "APPLICATION_COMMAND_PERMISSIONS_UPDATE")]
+     CommandPermissionsUpdate(CommandPermissionsUpdateEvent),

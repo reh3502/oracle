@@ -1,0 +1,21 @@
+[package]
+name = "oracle-scenario-b"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace]
+
+[dependencies]
+oracle-process-prototype = { path = "../process-runtime" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,20 @@
+[package]
+name = "oracle-serenity-baseline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace]
+
+[dependencies]
+serenity = { git = "https://github.com/serenity-rs/serenity.git", rev = "98ec74223b0ff77fc4e8085d25569ea59e09a36f", default-features = false, features = ["gateway", "model", "cache", "rustls_backend"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false }
+
+[patch."https://github.com/serenity-rs/serenity.git"]
+serenity = { path = "target/serenity-fork" }

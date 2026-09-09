@@ -1,0 +1,65 @@
+{
+  "gate": "P7",
+  "scope": "real trusted subprocess plus deterministic local delivery/subscription fixtures",
+  "passed": true,
+  "recorded_at": "2026-09-08T21:03:25.926397+00:00",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "tests_passed": [
+    "missing_intent_unknown_preset_unsafe_destination_and_scope_are_denied",
+    "delivery_failure_and_unhealthy_subscriptions_are_partial",
+    "dynamic_load_exact_preset_and_independent_readback",
+    "stale_generation_and_cas_conflict_cannot_overwrite_human_change",
+    "crash_before_ack_preserves_desired_and_recovers_after_restart"
+  ],
+  "commands": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running unittests src/lib.rs (target/debug/deps/oracle_scenario_b-42faf320cf1cf9bd)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running unittests src/bin/activity-log.rs (target/debug/deps/activity_log-b07569920d3801d3)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests/scenario.rs (target/debug/deps/scenario-6190e71e959b7abb)\n\nrunning 5 tests\ntest missing_intent_unknown_preset_unsafe_destination_and_scope_are_denied ... ok\ntest delivery_failure_and_unhealthy_subscriptions_are_partial ... ok\ntest dynamic_load_exact_preset_and_independent_readback ... ok\ntest stale_generation_and_cas_conflict_cannot_overwrite_human_change ... ok\ntest crash_before_ack_preserves_desired_and_recovers_after_restart ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s\n\n   Doc-tests oracle_scenario_b\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "output": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "output": ""
+    }
+  ],
+  "artifacts_sha256": {
+    "Cargo.toml": "9e67f99c7b0e929f2cf7b6bc4c7298f53cb93832bd2b8fa338725bc58600998e",
+    "Cargo.lock": "5e8b6553a515cee0ee1ce5446dff0c6c92073e0604703984ccde671d86a0373a",
+    "src/lib.rs": "55bad6006b888c871a366fd242d914163893d50184966f22e93c49e794f27fb0",
+    "src/bin/activity-log.rs": "18e5cb22d284ce0d300c7d5ea44ba2ad8bf649b50c7d452e43824511f45fb468",
+    "tests/scenario.rs": "30936be44de319a138d2865606a3a2c784c338500b70058e7a11ae03ac815be0",
+    "target/debug/activity-log": "10629dee3572cbc456afe361eae82482445ce4a7f2809089fa7ff8ca26957439",
+    "../process-runtime/src/lib.rs": "951b9d38e832a5ed00ff943da8b50027a9bcb8f690356f1bc2a3f0fae2e3af64",
+    "../process-runtime/src/rpc.rs": "767bfc93bf7f25aecedf21d3eeac21c90d4ac6b45d8eed71c6824d464699d829",
+    "../process-runtime/src/runtime.rs": "47bfc344ea36100d3d20c262b370f71899776667eae0c4382a9e680e09b15b6f"
+  },
+  "live_discord_requests": 0,
+  "limitations": [
+    "No real Discord event subscription or delivery verified.",
+    "Preset queue/retention settings are metadata; full logging data plane is outside P7.",
+    "Delivery deduplication fixture persists only within a harness host; crash-before-ack test crashes before sending."
+  ]
+}

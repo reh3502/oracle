@@ -1,0 +1,1 @@
+{"d":{"id":"707","application_id":"505","type":2,"data":{"id":"404","name":"oracle-p3-fixture","type":1},"channel":{"id":"202","type":0,"name":"fixture"},"channel_id":"202","token":"fake-interaction-token","version":1,"app_permissions":"0","locale":"en-US","entitlements":[],"attachment_size_limit":10485760},"op":0,"s":4,"t":"INTERACTION_CREATE"}
