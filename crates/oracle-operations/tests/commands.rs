@@ -15,6 +15,7 @@ struct State {
     lost_ack: bool,
     mismatch: bool,
     cancel: Option<CancellationToken>,
+    revoke_before_write: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 #[derive(Default)]
 struct Backend(Mutex<State>);
@@ -29,6 +30,9 @@ impl CommandBackend for Backend {
         definition: &Value,
         guard: &SendGuard,
     ) -> Result<PublishedCommand> {
+        if let Some(active) = self.0.lock().unwrap().revoke_before_write.take() {
+            active.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         guard.dispatch(|| {
             let mut state = self.0.lock().unwrap();
             state.writes += 1;
@@ -282,4 +286,48 @@ async fn wrong_readback_retains_pending() {
 fn canonical_server_fields_and_empty_localizations() {
     assert_eq!(canonical_definition(&json!({"id":"1","application_id":"2","guild_id":"3","version":"4","name":"one","description":"x","name_localizations":{},"description_localizations":null})).unwrap(),json!({"name":"one","description":"x","type":1}));
     assert!(canonical_definition(&json!({"name":"BAD","type":1})).is_err());
+}
+
+#[tokio::test]
+async fn registry_revocation_at_backend_send_blocks_publication() {
+    use oracle_operations::executor::DispatchFence;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct RegistryFence(Arc<AtomicBool>);
+    impl DispatchFence for RegistryFence {
+        fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            if !self.0.load(Ordering::SeqCst) {
+                return Err(Error::new(ErrorCode::ModuleUnavailable));
+            }
+            send()
+        }
+    }
+    let (_root, store, backend, guild) = setup().await;
+    let active = Arc::new(AtomicBool::new(true));
+    backend.0.lock().unwrap().revoke_before_write = Some(active.clone());
+    let reconciler = CommandReconciler::new(store.clone(), backend.clone());
+    let result = reconciler
+        .reconcile_fenced(
+            &guild,
+            &[desired("one")],
+            &CancellationToken::new(),
+            now() + 60,
+            Arc::new(RegistryFence(active)),
+        )
+        .await;
+    assert_eq!(result.unwrap_err().code, ErrorCode::ModuleUnavailable);
+    assert_eq!(backend.0.lock().unwrap().writes, 0);
+    assert!(backend.0.lock().unwrap().commands.is_empty());
+    let bindings = reconciler.bindings(&guild).await.unwrap();
+    assert!(
+        bindings.is_empty(),
+        "pending publication must not become a live route"
+    );
+    let records = store
+        .workflow_list(&guild, WorkflowKind::CommandBinding, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let pending: CommandBinding = serde_json::from_value(records[0].value.clone()).unwrap();
+    assert_eq!(pending.pending, Some(PendingCommand::Create));
+    store.close().await.unwrap();
 }

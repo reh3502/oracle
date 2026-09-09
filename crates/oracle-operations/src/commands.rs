@@ -1,5 +1,5 @@
 //! Minimal command publication with durable ownership and uncertainty records.
-use crate::executor::SendGuard;
+use crate::executor::{DispatchFence, SendGuard};
 use async_trait::async_trait;
 use oracle_core::*;
 use serde::{Deserialize, Serialize};
@@ -257,6 +257,29 @@ impl CommandReconciler {
         cancel: &CancellationToken,
         expires_at: u64,
     ) -> Result<CommandReport> {
+        self.reconcile_inner(guild, desired, cancel, expires_at, None)
+            .await
+    }
+    /// Bind actual writes to a live registry revision, including writes after rate waits.
+    pub async fn reconcile_fenced(
+        &self,
+        guild: &GuildId,
+        desired: &[DesiredCommand],
+        cancel: &CancellationToken,
+        expires_at: u64,
+        fence: Arc<dyn DispatchFence>,
+    ) -> Result<CommandReport> {
+        self.reconcile_inner(guild, desired, cancel, expires_at, Some(fence))
+            .await
+    }
+    async fn reconcile_inner(
+        &self,
+        guild: &GuildId,
+        desired: &[DesiredCommand],
+        cancel: &CancellationToken,
+        expires_at: u64,
+        fence: Option<Arc<dyn DispatchFence>>,
+    ) -> Result<CommandReport> {
         let lock = self
             .locks
             .lock()
@@ -265,7 +288,10 @@ impl CommandReconciler {
             .or_default()
             .clone();
         let _lock = tokio::select! {biased;_=cancel.cancelled()=>return Err(error(ErrorCode::Cancelled)),lock=lock.lock()=>lock};
-        let guard = SendGuard::new(cancel.clone(), expires_at);
+        let guard = match fence {
+            Some(fence) => SendGuard::with_fence(cancel.clone(), expires_at, fence),
+            None => SendGuard::new(cancel.clone(), expires_at),
+        };
         let mut wanted = BTreeMap::new();
         for d in desired {
             let mut d = d.clone();
