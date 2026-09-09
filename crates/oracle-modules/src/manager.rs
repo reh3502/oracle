@@ -68,6 +68,47 @@ pub struct ModuleManager {
 fn unavailable() -> Error {
     Error::new(ErrorCode::ModuleUnavailable)
 }
+// Keep one guild command slot for /oracle. Count only explicitly published,
+// granted routes; callers exclude the candidate's previous activation.
+fn validate_command_admission(
+    candidate: &ModuleManifest,
+    grants: &BTreeSet<String>,
+    active: &[(ModuleManifest, BTreeSet<String>)],
+) -> Result<()> {
+    let Some(commands) = &candidate.commands else {
+        return Ok(());
+    };
+    if active.iter().any(|(manifest, _)| {
+        manifest
+            .commands
+            .as_ref()
+            .is_some_and(|other| other.namespace == commands.namespace)
+    }) {
+        return Err(Error::new(ErrorCode::Conflict));
+    }
+    let publishes = |manifest: &ModuleManifest, grants: &BTreeSet<String>| {
+        manifest.commands.as_ref().is_some_and(|commands| {
+            commands.routes.iter().any(|route| {
+                manifest.operations.iter().any(|operation| {
+                    operation.name == route.operation
+                        && operation
+                            .capabilities
+                            .iter()
+                            .all(|capability| grants.contains(capability))
+                })
+            })
+        })
+    };
+    let count = active
+        .iter()
+        .filter(|(manifest, grants)| publishes(manifest, grants))
+        .count()
+        + usize::from(publishes(candidate, grants));
+    if count > 99 {
+        return Err(Error::new(ErrorCode::QuotaExceeded));
+    }
+    Ok(())
+}
 // Own provisional processes across persistence awaits. A cancelled lifecycle
 // request must never leave unpublished code running in the background.
 struct Provisional(Option<Arc<Generation>>);
@@ -483,35 +524,34 @@ impl ModuleManager {
             }
             let generation = self.get(&desired.module)?;
             let manifest = &generation.installed.package.manifest;
-            if let Some(commands) = &manifest.commands {
-                for other in self.registry.read().unwrap().values() {
+            let grants: BTreeSet<_> = desired.grants.iter().cloned().collect();
+            let active_commands: Vec<_> = self
+                .registry
+                .read()
+                .unwrap()
+                .values()
+                .filter_map(|other| {
                     if other.installed.package.manifest.id == manifest.id
                         || !other.process().is_alive()
                     {
-                        continue;
+                        return None;
                     }
-                    if other
-                        .installed
-                        .package
-                        .manifest
-                        .commands
-                        .as_ref()
-                        .is_some_and(|c| c.namespace == commands.namespace)
-                        && other
-                            .activations
-                            .lock()
-                            .unwrap()
-                            .get(&desired.guild)
-                            .is_some_and(|a| other.gate.is_active(&desired.guild, a.epoch))
-                    {
-                        return Err(Error::new(ErrorCode::Conflict));
-                    }
-                }
-            }
+                    let active = other
+                        .activations
+                        .lock()
+                        .unwrap()
+                        .get(&desired.guild)
+                        .cloned()?;
+                    other
+                        .gate
+                        .is_active(&desired.guild, active.epoch)
+                        .then(|| (other.installed.package.manifest.clone(), active.grants))
+                })
+                .collect();
+            validate_command_admission(manifest, &grants, &active_commands)?;
             if !manifest.subscriptions.is_empty() {
                 self.require_event_intents(&generation)?;
             }
-            let grants: BTreeSet<_> = desired.grants.iter().cloned().collect();
             if grants.iter().any(|c| !manifest.capabilities.contains(c)) {
                 return Err(Error::new(ErrorCode::ForbiddenPermission));
             }
@@ -1055,5 +1095,39 @@ impl ModuleManager {
         stopped?;
         Ok(())
         }).await
+    }
+}
+
+#[cfg(test)]
+mod command_admission_tests {
+    use super::*;
+    #[test]
+    fn publication_limit_counts_granted_routes_and_reserves_bootstrap() {
+        let mut candidate: ModuleManifest = serde_json::from_str(include_str!(
+            "../../../examples/modules/configuration-probe/manifest-events.json"
+        ))
+        .unwrap();
+        let grants: BTreeSet<String> = candidate.capabilities.iter().cloned().collect();
+        let active: Vec<_> = (0..99)
+            .map(|index| {
+                let mut manifest = candidate.clone();
+                manifest.commands.as_mut().unwrap().namespace = format!("module-{index}");
+                (manifest, grants.clone())
+            })
+            .collect();
+        validate_command_admission(&candidate, &grants, &active[..98]).unwrap();
+        assert_eq!(
+            validate_command_admission(&candidate, &grants, &active)
+                .unwrap_err()
+                .code,
+            ErrorCode::QuotaExceeded
+        );
+        // An operation without its grant contributes no command to publication.
+        for operation in &mut candidate.operations {
+            operation.capabilities = vec!["host.echo".into()];
+        }
+        validate_command_admission(&candidate, &BTreeSet::new(), &active).unwrap();
+        candidate.commands = None;
+        validate_command_admission(&candidate, &grants, &active).unwrap();
     }
 }
