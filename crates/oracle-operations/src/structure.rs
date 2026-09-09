@@ -11,6 +11,7 @@ pub enum ChannelKind {
     Category,
     Text,
     Voice,
+    Other(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +159,68 @@ fn expands(before: &[Overwrite], after: &[Overwrite]) -> bool {
         || before.iter().any(|v| v.deny & !find(after, v).1 != 0)
 }
 
+fn channel_bits(snapshot: &Snapshot, member: &Member, access: &[Overwrite]) -> Result<u64> {
+    permissions::channel_permissions(
+        snapshot.guild.as_str(),
+        &snapshot.owner,
+        &snapshot.roles,
+        member,
+        access,
+    )
+}
+fn require_channel_management(
+    snapshot: &Snapshot,
+    access: &[Overwrite],
+    permission: u64,
+) -> Result<()> {
+    for member in [&snapshot.actor, &snapshot.bot] {
+        if channel_bits(snapshot, member, access)? & permission == 0 {
+            return Err(denied());
+        }
+    }
+    Ok(())
+}
+fn require_overwrite_ceiling(
+    snapshot: &Snapshot,
+    existing: Option<&Channel>,
+    parent: Option<&Step>,
+    access: &[Overwrite],
+) -> Result<()> {
+    let requested = access.iter().fold(0, |bits, o| bits | o.allow | o.deny);
+    for member in [&snapshot.actor, &snapshot.bot] {
+        let guild = permissions::guild_permissions(
+            snapshot.guild.as_str(),
+            &snapshot.owner,
+            &snapshot.roles,
+            member,
+        )?;
+        if let Some(existing) = existing {
+            let explicit_manage = existing.overwrites.iter().any(|o| {
+                o.allow & permissions::MANAGE_ROLES != 0
+                    && match o.kind {
+                        permissions::OverwriteKind::Member => o.id == member.id,
+                        permissions::OverwriteKind::Role => {
+                            o.id == snapshot.guild.as_str() || member.roles.contains(&o.id)
+                        }
+                    }
+            });
+            let parent_bits = parent
+                .map(|p| channel_bits(snapshot, member, &p.overwrites))
+                .transpose()?
+                .unwrap_or(0);
+            if !explicit_manage && requested & !(guild | parent_bits) != 0 {
+                return Err(denied());
+            }
+        } else if requested & !guild != 0
+            || (requested & permissions::MANAGE_ROLES != 0
+                && guild & permissions::ADMINISTRATOR == 0)
+        {
+            return Err(denied());
+        }
+    }
+    Ok(())
+}
+
 /// Bindings come only from durable host records, never from caller assertions.
 pub fn build_steps(
     snapshot: &Snapshot,
@@ -184,7 +247,8 @@ pub fn build_steps(
     let mut keys = BTreeSet::new();
     let mut selected = BTreeSet::new();
     for desired in &request.channels {
-        if !key(&desired.key)
+        if matches!(desired.kind, ChannelKind::Other(_))
+            || !key(&desired.key)
             || !keys.insert(desired.key.clone())
             || desired.name.is_empty()
             || desired.name.chars().count() > 100
@@ -204,6 +268,13 @@ pub fn build_steps(
             .transpose()?;
         if desired.kind == ChannelKind::Category && parent.is_some() {
             return Err(invalid());
+        }
+        if steps.iter().any(|step| {
+            step.name == desired.name
+                && step.kind == desired.kind
+                && step.parent_key == desired.parent
+        }) {
+            return Err(Error::new(ErrorCode::Conflict));
         }
         let parent_id = parent.and_then(|p| p.before.as_ref().map(|c| c.id.clone()));
         let explicit = desired.existing_id.as_ref();
@@ -271,20 +342,6 @@ pub fn build_steps(
             &snapshot.bot,
             &access,
         )?;
-        if access != before_access {
-            for member in [&snapshot.actor, &snapshot.bot] {
-                if permissions::guild_permissions(
-                    snapshot.guild.as_str(),
-                    &snapshot.owner,
-                    &snapshot.roles,
-                    member,
-                )? & permissions::MANAGE_ROLES
-                    == 0
-                {
-                    return Err(denied());
-                }
-            }
-        }
         let change = match &existing {
             None => Change::Create,
             Some(c)
@@ -294,6 +351,34 @@ pub fn build_steps(
             }
             Some(_) => Change::Update,
         };
+        if change != Change::Reuse {
+            if let Some(existing) = &existing {
+                require_channel_management(
+                    &snapshot,
+                    &existing.overwrites,
+                    permissions::MANAGE_CHANNELS,
+                )?;
+            }
+            if let Some(parent) = parent {
+                let current = parent
+                    .before
+                    .as_ref()
+                    .map(|c| c.overwrites.as_slice())
+                    .unwrap_or(&parent.overwrites);
+                require_channel_management(&snapshot, current, permissions::MANAGE_CHANNELS)?;
+                require_channel_management(
+                    &snapshot,
+                    &parent.overwrites,
+                    permissions::MANAGE_CHANNELS,
+                )?;
+            }
+            if access != before_access {
+                require_channel_management(&snapshot, &before_access, permissions::MANAGE_ROLES)?;
+            }
+            if existing.is_none() || access != before_access {
+                require_overwrite_ceiling(&snapshot, existing.as_ref(), parent, &access)?;
+            }
+        }
         steps.push(Step {
             key: desired.key.clone(),
             name: desired.name.clone(),
@@ -304,6 +389,36 @@ pub fn build_steps(
             overwrites: access,
             change,
         });
+    }
+    // Discord propagates category overwrite edits to synced children. Every affected
+    // resource must be visible, authorized and represented in the approved plan.
+    for category in steps
+        .iter()
+        .filter(|step| step.kind == ChannelKind::Category)
+    {
+        let Some(before) = &category.before else {
+            continue;
+        };
+        if before.overwrites == category.overwrites {
+            continue;
+        }
+        if !snapshot.complete {
+            return Err(denied());
+        }
+        for child in snapshot.channels.iter().filter(|child| {
+            child.parent.as_deref() == Some(before.id.as_str())
+                && child.overwrites == before.overwrites
+        }) {
+            if !steps.iter().any(|step| {
+                step.before
+                    .as_ref()
+                    .is_some_and(|before| before.id == child.id)
+                    && step.parent_key.as_deref() == Some(category.key.as_str())
+                    && step.overwrites == category.overwrites
+            }) {
+                return Err(Error::new(ErrorCode::Conflict));
+            }
+        }
     }
     Ok(steps)
 }
@@ -500,5 +615,149 @@ mod tests {
         request = layout();
         request.channels[1].key = request.channels[0].key.clone();
         assert!(build_steps(&snapshot(), &request, &BTreeMap::new()).is_err());
+    }
+    #[test]
+    fn duplicate_new_resource_identity_is_rejected() {
+        let request = StructureRequest {
+            channels: vec![
+                desired("one", "same", ChannelKind::Text, None),
+                desired("two", "same", ChannelKind::Text, None),
+            ],
+        };
+        assert!(build_steps(&snapshot(), &request, &BTreeMap::new()).is_err());
+    }
+    #[test]
+    fn channel_denials_override_guild_management_for_actor_and_bot() {
+        for member in ["50", "60"] {
+            for denied_bit in [MANAGE_CHANNELS, MANAGE_ROLES] {
+                let mut s = snapshot();
+                s.channels.push(Channel {
+                    id: "200".into(),
+                    guild: s.guild.clone(),
+                    parent: None,
+                    kind: ChannelKind::Text,
+                    name: "before".into(),
+                    overwrites: vec![Overwrite {
+                        id: member.into(),
+                        kind: OverwriteKind::Member,
+                        allow: 0,
+                        deny: denied_bit,
+                    }],
+                });
+                let mut channel = desired("one", "after", ChannelKind::Text, None);
+                channel.existing_id = Some("200".into());
+                if denied_bit == MANAGE_ROLES {
+                    channel.overwrites = Some(vec![]);
+                }
+                assert!(
+                    build_steps(
+                        &s,
+                        &StructureRequest {
+                            channels: vec![channel]
+                        },
+                        &BTreeMap::new()
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+    #[test]
+    fn creation_cannot_copy_unheld_permissions_or_grant_manage_roles_without_admin() {
+        for permission in [permissions::CONNECT, MANAGE_ROLES] {
+            let mut channel = desired("one", "new", ChannelKind::Text, None);
+            channel.overwrites = Some(vec![Overwrite {
+                id: "100".into(),
+                kind: OverwriteKind::Role,
+                allow: permission,
+                deny: 0,
+            }]);
+            assert!(
+                build_steps(
+                    &snapshot(),
+                    &StructureRequest {
+                        channels: vec![channel]
+                    },
+                    &BTreeMap::new()
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn creation_under_category_checks_current_parent_authority() {
+        let mut s = snapshot();
+        s.channels.push(Channel {
+            id: "200".into(),
+            guild: s.guild.clone(),
+            parent: None,
+            kind: ChannelKind::Category,
+            name: "Minecraft".into(),
+            overwrites: vec![Overwrite {
+                id: "50".into(),
+                kind: OverwriteKind::Member,
+                allow: 0,
+                deny: MANAGE_CHANNELS,
+            }],
+        });
+        assert!(build_steps(&s, &layout(), &BTreeMap::new()).is_err());
+    }
+    #[test]
+    fn category_edits_require_complete_explicit_synced_children() {
+        let mut s = snapshot();
+        let old = vec![Overwrite {
+            id: "100".into(),
+            kind: OverwriteKind::Role,
+            allow: 0,
+            deny: SEND_MESSAGES,
+        }];
+        s.channels = vec![
+            Channel {
+                id: "200".into(),
+                guild: s.guild.clone(),
+                parent: None,
+                kind: ChannelKind::Category,
+                name: "Minecraft".into(),
+                overwrites: old.clone(),
+            },
+            Channel {
+                id: "201".into(),
+                guild: s.guild.clone(),
+                parent: Some("200".into()),
+                kind: ChannelKind::Text,
+                name: "minecraft-info".into(),
+                overwrites: old.clone(),
+            },
+            Channel {
+                id: "202".into(),
+                guild: s.guild.clone(),
+                parent: Some("200".into()),
+                kind: ChannelKind::Text,
+                name: "unsynced".into(),
+                overwrites: vec![],
+            },
+        ];
+        let mut request = layout();
+        request.channels.truncate(1);
+        request.channels[0].overwrites = Some(vec![]);
+        assert!(build_steps(&s, &request, &BTreeMap::new()).is_err());
+        let mut child = desired(
+            "minecraft.info",
+            "minecraft-info",
+            ChannelKind::Text,
+            Some("minecraft.category"),
+        );
+        child.overwrites = Some(vec![]);
+        request.channels.push(child);
+        let steps = build_steps(&s, &request, &BTreeMap::new()).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert!(
+            steps
+                .iter()
+                .all(|s| s.change == Change::Update && s.approval_required)
+        );
+        assert!(steps.iter().all(|s| s.before.as_ref().unwrap().id != "202"));
+        s.complete = false;
+        assert!(build_steps(&s, &request, &BTreeMap::new()).is_err());
     }
 }
