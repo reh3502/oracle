@@ -9,6 +9,9 @@ pub enum WorkflowKind {
     ResourceBinding,
     CommandBinding,
     Configuration,
+    AgentRun,
+    AgentCall,
+    AgentSpend,
 }
 impl WorkflowKind {
     pub fn as_str(self) -> &'static str {
@@ -17,6 +20,9 @@ impl WorkflowKind {
             Self::ResourceBinding => "resource_binding",
             Self::CommandBinding => "command_binding",
             Self::Configuration => "configuration",
+            Self::AgentRun => "agent_run",
+            Self::AgentCall => "agent_call",
+            Self::AgentSpend => "agent_spend",
         }
     }
 }

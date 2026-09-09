@@ -30,6 +30,8 @@ const MIGRATION: &str = include_str!("../migrations/0001.sql");
 const MIGRATION_SQLITE_2: &str = include_str!("../migrations/0002-sqlite.sql");
 const MIGRATION_POSTGRES_2: &str = include_str!("../migrations/0002-postgres.sql");
 const MIGRATION_SQLITE_3: &str = include_str!("../migrations/0003-sqlite.sql");
+const MIGRATION_SQLITE_4: &str = include_str!("../migrations/0004-sqlite.sql");
+const MIGRATION_POSTGRES_4: &str = include_str!("../migrations/0004-postgres.sql");
 const MIGRATION_POSTGRES_3: &str = include_str!("../migrations/0003-postgres.sql");
 const LOCK_KEY: i64 = 0x4f5241434c453031;
 #[derive(Clone)]
@@ -280,7 +282,7 @@ impl Storage {
         store.ensure_not_restoring().await?;
         store.migrate_base().await?;
         let version = store.schema_version().await?;
-        if version < 3 {
+        if version < 4 {
             let defaults = PgTools::default();
             let default_root;
             let (tools, root) = match options {
@@ -302,7 +304,10 @@ impl Storage {
             if version == 1 {
                 store.migrate_second().await?;
             }
-            store.migrate_third().await?;
+            if version < 3 {
+                store.migrate_third().await?;
+            }
+            store.migrate_fourth().await?;
         }
         store.verify_integrity().await?;
         store.startup_recovery(false).await?;
@@ -334,11 +339,32 @@ impl Storage {
             Ok(())
         })
     }
+    fn fourth_migration(&self) -> &'static str {
+        match self.inner.backend {
+            Backend::Sqlite { .. } => MIGRATION_SQLITE_4,
+            Backend::Postgres { .. } => MIGRATION_POSTGRES_4,
+        }
+    }
+    async fn migrate_fourth(&self) -> Result<()> {
+        write_tx!(self, tx, {
+            sqlx::raw_sql(self.fourth_migration())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES(4,$1)")
+                .bind(checksum(self.fourth_migration().as_bytes()))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            Ok(())
+        })
+    }
     fn expected_migrations(&self) -> Vec<(i64, String)> {
         vec![
             (1, checksum(MIGRATION.as_bytes())),
             (2, checksum(self.second_migration().as_bytes())),
             (3, checksum(self.third_migration().as_bytes())),
+            (4, checksum(self.fourth_migration().as_bytes())),
         ]
     }
     async fn schema_version(&self) -> Result<i64> {
@@ -349,6 +375,8 @@ impl Storage {
         );
         let expected = self.expected_migrations();
         if migrations == expected {
+            Ok(4)
+        } else if migrations == expected[..3] {
             Ok(3)
         } else if migrations == expected[..2] {
             Ok(2)
@@ -513,6 +541,7 @@ impl Storage {
             if !migrations.is_empty()
                 && migrations != self.expected_migrations()[..1]
                 && migrations != self.expected_migrations()[..2]
+                && migrations != self.expected_migrations()[..3]
                 && migrations != self.expected_migrations()
             {
                 return Err(err(ErrorCode::MigrationMismatch));
@@ -547,6 +576,15 @@ impl Storage {
                     .map_err(db)?;
                 sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES(3,$1)")
                     .bind(checksum(self.third_migration().as_bytes()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                sqlx::raw_sql(self.fourth_migration())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES(4,$1)")
+                    .bind(checksum(self.fourth_migration().as_bytes()))
                     .execute(&mut *tx)
                     .await
                     .map_err(db)?;
@@ -1124,6 +1162,9 @@ impl Storage {
         if incoming_version < 3 {
             store.migrate_third().await?;
         }
+        if incoming_version < 4 {
+            store.migrate_fourth().await?;
+        }
         store.startup_recovery(true).await?;
         store.verify_integrity().await?;
         match &store.inner.config {
@@ -1314,6 +1355,9 @@ mod tests {
     }
     async fn contract(config: DatabaseConfig, destination: DatabaseConfig, scratch: &Scratch) {
         module_tests::upgrades(&config, &scratch.0, &tools())
+            .await
+            .unwrap();
+        module_tests::workflow_upgrade(&config, &scratch.0, &tools())
             .await
             .unwrap();
         let guild = GuildId::new("123").unwrap();

@@ -134,15 +134,18 @@ pub(super) async fn exercise(config: &DatabaseConfig, store: Storage) -> Storage
     assert!(!page.is_empty() && page.len() < 10);
     assert!(serde_json::to_vec(&page).unwrap().len() <= 512 * 1024);
     assert!(store.workflow_list(&g, kind, None, 101).await.is_err());
+    agent_records(&store).await;
     store.close().await.unwrap();
     let store = Storage::open(config.clone()).await.unwrap();
     assert_eq!(
         store.workflow_get(&g, kind, "plan").await.unwrap(),
         Some(saved)
     );
+    agent_records_survive(&store).await;
     store
 }
 pub(super) async fn restored(store: &Storage) {
+    agent_records_survive(store).await;
     let g = GuildId::new("123").unwrap();
     let record = store
         .workflow_get(&g, WorkflowKind::StructurePlan, "plan")
@@ -164,4 +167,145 @@ pub(super) async fn restored(store: &Storage) {
             .value,
         json!(9)
     );
+}
+
+const AGENT_KINDS: [(WorkflowKind, &str); 3] = [
+    (WorkflowKind::AgentRun, "agent_run"),
+    (WorkflowKind::AgentCall, "agent_call"),
+    (WorkflowKind::AgentSpend, "agent_spend"),
+];
+
+pub(super) async fn agent_records(store: &Storage) {
+    let guild = GuildId::new("123").unwrap();
+    let other = GuildId::new("456").unwrap();
+    store
+        .initialize_guilds(&[guild.clone(), other.clone()])
+        .await
+        .unwrap();
+    for (kind, name) in AGENT_KINDS {
+        assert_eq!(kind.as_str(), name);
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+        assert_eq!(
+            serde_json::from_value::<WorkflowKind>(json!(name)).unwrap(),
+            kind
+        );
+        assert!(
+            store
+                .workflow_get(&guild, kind, "agent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let saved = store
+            .workflow_put(&guild, kind, "agent", None, &json!(name))
+            .await
+            .unwrap();
+        assert_eq!(saved.revision, 1);
+        assert!(
+            store
+                .workflow_get(&other, kind, "agent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .workflow_list(&other, kind, None, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .workflow_put(&other, kind, "agent", Some(1), &json!(null))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let guild = guild.clone();
+            tasks.spawn(async move {
+                store
+                    .workflow_put(&guild, kind, "agent", Some(1), &json!({"kind":name}))
+                    .await
+            });
+        }
+        let mut wins = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(record) => {
+                    wins += 1;
+                    assert_eq!(record.revision, 2);
+                }
+                Err(error) => assert_eq!(error.code, ErrorCode::Conflict),
+            }
+        }
+        assert_eq!(wins, 1);
+        assert_eq!(
+            store
+                .workflow_put(&guild, kind, "agent", None, &json!(null))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        // JSON quotes count toward the unchanged 64 KiB per-record bound.
+        store
+            .workflow_put(&guild, kind, "boundary", None, &json!("x".repeat(65534)))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .workflow_put(&guild, kind, "oversize", None, &json!("x".repeat(65535)))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidInput
+        );
+    }
+    // Calls remain separate records; updating one never rewrites another call.
+    store
+        .workflow_put(
+            &guild,
+            WorkflowKind::AgentCall,
+            "call-2",
+            None,
+            &json!({"run":"agent"}),
+        )
+        .await
+        .unwrap();
+}
+
+pub(super) async fn agent_records_survive(store: &Storage) {
+    let guild = GuildId::new("123").unwrap();
+    for (kind, name) in AGENT_KINDS {
+        let record = store
+            .workflow_get(&guild, kind, "agent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.revision, 2);
+        assert_eq!(record.value, json!({"kind":name}));
+        let page = store.workflow_list(&guild, kind, None, 100).await.unwrap();
+        assert_eq!(page[0], record);
+        assert_eq!(
+            store
+                .workflow_get(&guild, kind, "boundary")
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            json!("x".repeat(65534))
+        );
+    }
+    let call = store
+        .workflow_get(&guild, WorkflowKind::AgentCall, "call-2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.revision, 1);
+    assert_eq!(call.value, json!({"run":"agent"}));
 }

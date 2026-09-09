@@ -488,7 +488,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let upgraded = Storage::open_with_options(source.clone(), tools, &backups)
         .await
         .unwrap();
-    assert_eq!(upgraded.schema_version().await.unwrap(), 3);
+    assert_eq!(upgraded.schema_version().await.unwrap(), 4);
     assert_eq!(upgraded.status(None).await.unwrap().deployment, original);
     let bundles: Vec<_> = std::fs::read_dir(&backups).unwrap().collect();
     assert_eq!(bundles.len(), 1);
@@ -502,7 +502,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let restored = Storage::restore(destination.clone(), &old_bundle, tools)
         .await
         .unwrap();
-    assert_eq!(restored.schema_version().await.unwrap(), 3);
+    assert_eq!(restored.schema_version().await.unwrap(), 4);
     let status = restored.status(None).await.unwrap();
     assert_ne!(status.deployment, original);
     assert!(status.guilds[0].paused);
@@ -521,7 +521,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
             .execute(&mut *tx)
             .await
             .map_err(db)?;
-        sqlx::query("DELETE FROM oracle_migrations WHERE version=3")
+        sqlx::query("DELETE FROM oracle_migrations WHERE version>=3")
             .execute(&mut *tx)
             .await
             .map_err(db)?;
@@ -551,7 +551,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let upgraded2 = Storage::open_with_options(source2.clone(), tools, &backups2)
         .await
         .unwrap();
-    assert_eq!(upgraded2.schema_version().await.unwrap(), 3);
+    assert_eq!(upgraded2.schema_version().await.unwrap(), 4);
     let bundles2: Vec<_> = std::fs::read_dir(&backups2).unwrap().collect();
     assert_eq!(bundles2.len(), 1);
     let saved2: BackupManifest = serde_json::from_slice(
@@ -564,11 +564,167 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let restored2 = Storage::restore(destination2.clone(), &stage2_bundle, tools)
         .await
         .unwrap();
-    assert_eq!(restored2.schema_version().await.unwrap(), 3);
+    assert_eq!(restored2.schema_version().await.unwrap(), 4);
     restored2.close().await.unwrap();
     drop(restored2);
     remove_isolated(base, &source2).await;
     remove_isolated(base, &destination2).await;
+    remove_isolated(base, &source).await;
+    remove_isolated(base, &destination).await;
+    Ok(())
+}
+
+pub(super) async fn workflow_upgrade(
+    base: &DatabaseConfig,
+    root: &Path,
+    tools: &PgTools,
+) -> Result<()> {
+    use oracle_core::WorkflowRepository;
+    let source = isolated(base, root, "stage3-source").await;
+    let destination = isolated(base, root, "stage3-restore").await;
+    let raw = Storage::connect(normalize(source.clone())?, None).await?;
+    // Build the shipped v3 schema from immutable SQL, independently of fresh init.
+    write_tx!(&raw, tx, {
+        sqlx::query(
+            "CREATE TABLE oracle_migrations(version BIGINT PRIMARY KEY,checksum TEXT NOT NULL)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        for (version, sql) in [
+            (1, MIGRATION),
+            (2, raw.second_migration()),
+            (3, raw.third_migration()),
+        ] {
+            sqlx::raw_sql(sql).execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES($1,$2)")
+                .bind(version as i64)
+                .bind(checksum(sql.as_bytes()))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        sqlx::query("INSERT INTO oracle_deployment(singleton,id,restored) VALUES(1,$1,0)")
+            .bind(DeploymentId::generate().as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        Ok(())
+    })?;
+    let guild = GuildId::new("123").unwrap();
+    raw.initialize_guilds(std::slice::from_ref(&guild)).await?;
+    let kinds = [
+        WorkflowKind::StructurePlan,
+        WorkflowKind::ResourceBinding,
+        WorkflowKind::CommandBinding,
+        WorkflowKind::Configuration,
+    ];
+    for kind in kinds {
+        raw.workflow_put(
+            &guild,
+            kind,
+            "legacy",
+            None,
+            &json!({"kind":kind,"nested":[null,true,"é"]}),
+        )
+        .await?;
+        raw.workflow_put(
+            &guild,
+            kind,
+            "legacy",
+            Some(1),
+            &json!({"kind":kind,"nested":[null,false,"é"]}),
+        )
+        .await?;
+    }
+    let before = rows!(
+        &raw,
+        (String, String, String, i64, String),
+        "SELECT guild,kind,key,revision,value FROM oracle_workflows ORDER BY guild,kind,key"
+    );
+    // All new kinds must actually be rejected by the old database constraint.
+    for kind in [
+        WorkflowKind::AgentRun,
+        WorkflowKind::AgentCall,
+        WorkflowKind::AgentSpend,
+    ] {
+        assert!(
+            raw.workflow_put(&guild, kind, "agent", None, &json!(null))
+                .await
+                .is_err()
+        );
+    }
+    let original = raw.status(None).await?.deployment;
+    raw.close().await?;
+    drop(raw);
+    let blocked = root.join("stage3-backup-blocked");
+    std::fs::write(&blocked, b"occupied").unwrap();
+    assert!(
+        Storage::open_with_options(source.clone(), tools, &blocked)
+            .await
+            .is_err()
+    );
+    let raw = Storage::connect(normalize(source.clone())?, None).await?;
+    assert_eq!(raw.schema_version().await?, 3);
+    assert_eq!(
+        rows!(
+            &raw,
+            (String, String, String, i64, String),
+            "SELECT guild,kind,key,revision,value FROM oracle_workflows ORDER BY guild,kind,key"
+        ),
+        before
+    );
+    raw.close().await?;
+    drop(raw);
+    if matches!(source, DatabaseConfig::Postgres { .. }) {
+        match Storage::open(source.clone()).await {
+            Err(error) => assert_eq!(error.code, ErrorCode::Backup),
+            Ok(_) => panic!("PostgreSQL schema3 guessed backup destination"),
+        }
+    }
+    let backups = root.join("stage3-upgrade-backups");
+    let upgraded = Storage::open_with_options(source.clone(), tools, &backups).await?;
+    assert_eq!(upgraded.schema_version().await?, 4);
+    assert_eq!(upgraded.status(None).await?.deployment, original);
+    assert_eq!(
+        rows!(
+            &upgraded,
+            (String, String, String, i64, String),
+            "SELECT guild,kind,key,revision,value FROM oracle_workflows ORDER BY guild,kind,key"
+        ),
+        before
+    );
+    let bundles: Vec<_> = std::fs::read_dir(&backups).unwrap().collect();
+    assert_eq!(bundles.len(), 1);
+    let bundle = bundles[0].as_ref().unwrap().path();
+    let manifest: BackupManifest =
+        serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.migrations, upgraded.expected_migrations()[..3]);
+    workflow_tests::agent_records(&upgraded).await;
+    upgraded.close().await?;
+    drop(upgraded);
+    let reopened = Storage::open(source.clone()).await?;
+    workflow_tests::agent_records_survive(&reopened).await;
+    reopened.close().await?;
+    drop(reopened);
+    // Restore the actual mandatory pre-upgrade v3 native backup under its guard.
+    let restored = Storage::restore(destination.clone(), &bundle, tools).await?;
+    assert_eq!(restored.schema_version().await?, 4);
+    assert_eq!(
+        rows!(
+            &restored,
+            (String, String, String, i64, String),
+            "SELECT guild,kind,key,revision,value FROM oracle_workflows ORDER BY guild,kind,key"
+        ),
+        before
+    );
+    let status = restored.status(None).await?;
+    assert_ne!(status.deployment, original);
+    assert!(status.guilds[0].paused);
+    workflow_tests::agent_records(&restored).await;
+    restored.verify_integrity().await?;
+    restored.close().await?;
+    drop(restored);
     remove_isolated(base, &source).await;
     remove_isolated(base, &destination).await;
     Ok(())
