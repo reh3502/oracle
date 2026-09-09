@@ -77,6 +77,10 @@ impl Instance {
     fn fence(&self) {
         self.admitting.store(false, Ordering::Release);
     }
+    fn request_stop(&self) {
+        self.fence();
+        self.stop.cancel();
+    }
 }
 struct State {
     closing: bool,
@@ -188,8 +192,7 @@ impl ProcessRuntime {
         let response = match response {
             Ok(response) if instance.admitting.load(Ordering::Acquire) => response,
             result => {
-                instance.fence();
-                instance.stop.cancel();
+                instance.request_stop();
                 wait_report(&instance, None).await?;
                 return Err(result
                     .err()
@@ -212,8 +215,7 @@ impl ProcessRuntime {
             state.instances.values().cloned().collect()
         };
         for instance in &instances {
-            instance.fence();
-            instance.stop.cancel();
+            instance.request_stop();
         }
         let mut reports = Vec::new();
         for instance in instances {
@@ -252,8 +254,7 @@ impl Drop for ProcessRuntime {
         let mut state = self.inner.state.lock().unwrap();
         state.closing = true;
         for instance in state.instances.values() {
-            instance.fence();
-            instance.stop.cancel();
+            instance.request_stop();
         }
     }
 }
@@ -261,8 +262,7 @@ struct CleanupGuard(Option<Arc<Instance>>);
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if let Some(instance) = &self.0 {
-            instance.fence();
-            instance.stop.cancel();
+            instance.request_stop();
         }
     }
 }
@@ -317,12 +317,10 @@ impl ModuleProcess {
     }
     /// Request cleanup through the runtime-owned supervisor without spawning a waiter.
     pub fn request_stop(&self) {
-        self.instance.fence();
-        self.instance.stop.cancel();
+        self.instance.request_stop();
     }
     pub async fn force_stop(&self) -> Result<StopReport> {
-        self.instance.fence();
-        self.instance.stop.cancel();
+        self.instance.request_stop();
         self.wait_stopped(Duration::from_secs(5)).await
     }
     pub async fn wait_stopped(&self, duration: Duration) -> Result<StopReport> {

@@ -286,6 +286,28 @@ struct State {
     guilds: BTreeMap<GuildId, GuildState>,
     prepared: BTreeMap<GuildId, (u64, u64, Value)>,
 }
+impl State {
+    fn require_normal_session(&self, session: &str, generation: u64) -> Result<()> {
+        if self.stopping
+            || self.mode != Some(Mode::Normal)
+            || !self
+                .hello
+                .as_ref()
+                .is_some_and(|(current, number)| current == session && *number == generation)
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn active_guild(&self, guild: &GuildId, epoch: u64) -> Result<&GuildContext> {
+        self.guilds
+            .get(guild)
+            .filter(|g| g.active && g.context.epoch == epoch)
+            .map(|g| &g.context)
+            .ok_or_else(denied)
+    }
+}
 struct Driver<M: Module> {
     module: Arc<M>,
     state: Mutex<State>,
@@ -347,18 +369,11 @@ impl<M: Module> RpcHandler for Driver<M> {
             let request: Invocation = decode(params)?;
             let guild_cancel = {
                 let state = self.state.lock().unwrap();
-                if state.stopping
-                    || state.mode != Some(Mode::Normal)
-                    || state.hello.as_ref() != Some(&(request.session.clone(), request.generation))
-                {
-                    return Err(denied());
-                }
-                let guild = state
-                    .guilds
-                    .get(&request.guild)
-                    .filter(|g| g.active && g.context.epoch == request.epoch)
-                    .ok_or_else(denied)?;
-                guild.context.tasks.cancellation()
+                state.require_normal_session(&request.session, request.generation)?;
+                state
+                    .active_guild(&request.guild, request.epoch)?
+                    .tasks
+                    .cancellation()
             };
             let context = CallContext {
                 peer,
@@ -389,20 +404,11 @@ impl<M: Module> RpcHandler for Driver<M> {
             let request: ConfigurationRequest = decode(params)?;
             let context = {
                 let state = self.state.lock().unwrap();
-                if state.stopping
-                    || state.mode != Some(Mode::Normal)
-                    || state.hello.as_ref() != Some(&(request.session.clone(), request.generation))
-                    || self.module.manifest().configuration.is_none()
-                {
+                state.require_normal_session(&request.session, request.generation)?;
+                if self.module.manifest().configuration.is_none() {
                     return Err(denied());
                 }
-                state
-                    .guilds
-                    .get(&request.guild)
-                    .filter(|g| g.active && g.context.epoch == request.epoch)
-                    .ok_or_else(denied)?
-                    .context
-                    .clone()
+                state.active_guild(&request.guild, request.epoch)?.clone()
             };
             return match method.as_str() {
                 "configuration.prepare" => {
