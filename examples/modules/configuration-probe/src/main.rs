@@ -13,7 +13,9 @@ struct Probe(Mutex<BTreeMap<GuildId, EffectiveConfiguration>>);
 #[async_trait]
 impl Module for Probe {
     fn manifest(&self) -> ModuleManifest {
-        serde_json::from_str(if cfg!(feature = "events") {
+        serde_json::from_str(if cfg!(feature = "collision") {
+            include_str!("../manifest-collision.json")
+        } else if cfg!(feature = "events") {
             include_str!("../manifest-events.json")
         } else {
             include_str!("../manifest.json")

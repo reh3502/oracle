@@ -33,6 +33,8 @@ pub struct ModuleManifest {
     pub configuration: Option<ModuleConfiguration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<GuildEventKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<ModuleCommands>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -181,4 +183,23 @@ pub struct GuildEvent {
     pub subject_id: Option<String>,
     pub actor_id: Option<String>,
     pub related_id: Option<String>,
+}
+
+/// Explicit human command opt-in. The host owns the final Discord namespace and
+/// resolves these routes to the same versioned operations used by other ingress.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleCommands {
+    pub namespace: String,
+    pub description: String,
+    pub routes: Vec<ModuleCommandRoute>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleCommandRoute {
+    pub name: String,
+    pub description: String,
+    pub operation: String,
+    /// One fixed JSON string option named input. If omitted, the host uses {}.
+    pub input_required: bool,
 }

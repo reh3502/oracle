@@ -89,6 +89,11 @@ async fn event_notification_rechecks_intents_after_readiness() {
 async fn event_routes_require_configuration_and_reuse_verified_effect_receipts() {
     run("routing").await;
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ORACLE_EVENT_PROBE and ORACLE_COMMAND_COLLISION_PROBE"]
+async fn command_namespace_collision_is_refused_before_activation_and_scoped_to_guild() {
+    run("collision").await;
+}
 async fn run(case: &'static str) {
     let scratch = std::env::temp_dir().join(format!("oracle-event-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&scratch).unwrap();
@@ -104,12 +109,22 @@ async fn run(case: &'static str) {
         .initialize_guilds(std::slice::from_ref(&guild))
         .await
         .unwrap();
+    storage
+        .initialize_guilds(&["124".parse().unwrap()])
+        .await
+        .unwrap();
     let core = Arc::new(CoreService::new(
         storage.clone(),
-        vec![GuildPolicy {
-            guild: guild.clone(),
-            operators: vec![],
-        }],
+        vec![
+            GuildPolicy {
+                guild: guild.clone(),
+                operators: vec![],
+            },
+            GuildPolicy {
+                guild: "124".parse().unwrap(),
+                operators: vec![],
+            },
+        ],
     ));
     let manager = ModuleManager::new(storage.clone(), core, scratch.join("artifacts")).unwrap();
     manager
@@ -163,6 +178,8 @@ async fn run(case: &'static str) {
     manager.set_event_intents(intents()).unwrap();
     manager.activate(&ACTOR, desired).await.unwrap();
     let task_manager = manager.clone();
+    let task_scratch = scratch.clone();
+    let task_storage = storage.clone();
     let task = tokio::spawn(async move {
         let manager = task_manager;
         if case == "routing" {
@@ -217,6 +234,86 @@ async fn run(case: &'static str) {
             .await
             .unwrap();
         match case {
+            "collision" => {
+                transport.ready.add_permits(1);
+                wait_health(&manager, |delivered, _| delivered == 1).await;
+                let path = PathBuf::from(
+                    std::env::var_os("ORACLE_COMMAND_COLLISION_PROBE")
+                        .expect("set ORACLE_COMMAND_COLLISION_PROBE"),
+                );
+                let bytes = std::fs::read(path).unwrap();
+                let source = task_scratch.join("collision-source");
+                std::fs::create_dir(&source).unwrap();
+                std::fs::write(source.join("module"), &bytes).unwrap();
+                let package = ModulePackage {
+                    manifest: serde_json::from_str(include_str!(
+                        "../../../examples/modules/configuration-probe/manifest-collision.json"
+                    ))
+                    .unwrap(),
+                    entrypoint: "module".into(),
+                    files: BTreeMap::from([(
+                        "module".into(),
+                        format!("{:x}", Sha256::digest(bytes)),
+                    )]),
+                    source_revision: "collision-fixture".into(),
+                    toolchain: "separate feature artifact".into(),
+                    license: "test-only".into(),
+                };
+                std::fs::write(
+                    source.join("package.json"),
+                    serde_json::to_vec(&package).unwrap(),
+                )
+                .unwrap();
+                let installed = manager.install(&source, true).await.unwrap();
+                let second = installed.package.manifest.id.clone();
+                manager.load(&installed.digest).await.unwrap();
+                let desired = DesiredActivation {
+                    module: second.clone(),
+                    guild: guild.clone(),
+                    active: true,
+                    grants: vec![
+                        "config.own".into(),
+                        "events.guild".into(),
+                        "discord.notify".into(),
+                    ],
+                    bindings: BTreeMap::new(),
+                };
+                assert_eq!(
+                    manager
+                        .activate(&ACTOR, desired.clone())
+                        .await
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::Conflict
+                );
+                assert!(
+                    !task_storage
+                        .desired_activations()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|a| a.module == second)
+                );
+                let other: GuildId = "124".parse().unwrap();
+                manager
+                    .activate(
+                        &ACTOR,
+                        DesiredActivation {
+                            guild: other.clone(),
+                            ..desired
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    manager.catalog(&ACTOR, &guild).await.unwrap()[0].module,
+                    module
+                );
+                assert_eq!(
+                    manager.catalog(&ACTOR, &other).await.unwrap()[0].module,
+                    second
+                );
+            }
             "fence" => {
                 let mut accepted = 0;
                 let mut dropped = 0;
@@ -341,10 +438,34 @@ async fn run(case: &'static str) {
                         .await
                         .is_err()
                 );
+                let snapshot = manager.catalog_snapshot(&ACTOR, &guild).await.unwrap();
+                let permit = manager.registry_permit(snapshot.revision);
+                let mut changes = manager.registry_changes();
+                changes.borrow_and_update();
                 manager
                     .deactivate(&ACTOR, &module, &guild, Duration::from_secs(1))
                     .await
                     .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), changes.changed())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(manager.registry_revision() > snapshot.revision);
+                let sent = std::sync::atomic::AtomicUsize::new(0);
+                assert!(
+                    permit
+                        .dispatch(|| sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                        .is_err()
+                );
+                assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(
+                    manager
+                        .catalog_snapshot(&ACTOR, &guild)
+                        .await
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
                 manager
                     .activate(
                         &ACTOR,

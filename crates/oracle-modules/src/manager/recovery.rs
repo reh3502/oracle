@@ -126,7 +126,7 @@ impl ModuleManager {
             if stopped.cleanup_error.is_some() {
                 return Err(Error::new(ErrorCode::Io));
             }
-            self.registry.write().unwrap().remove(&id);
+            self.registry_remove(&id);
         }
         let desired = self.repository.desired_modules().await?;
         let activations = self.repository.desired_activations().await?;
@@ -192,7 +192,7 @@ impl ModuleManager {
                     if stopped.cleanup_error.is_some() {
                         return Err(Error::new(ErrorCode::Io));
                     }
-                    self.registry.write().unwrap().remove(&id);
+                    self.registry_remove(&id);
                 }
                 if let Some(state) = self.recovery.lock().unwrap().get_mut(&id) {
                     state.error = error.code;

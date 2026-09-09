@@ -132,6 +132,7 @@ impl Generation {
         repository: Arc<dyn ModuleRepository>,
         router: Arc<dyn ContractRouter>,
         mode: &str,
+        registry: Arc<crate::registry::RegistrySignal>,
     ) -> Result<Arc<Self>> {
         if !matches!(mode, "normal" | "migration") || number == 0 {
             return Err(error(ErrorCode::InvalidInput));
@@ -140,7 +141,7 @@ impl Generation {
             installed,
             number,
             session: uuid::Uuid::new_v4().to_string(),
-            gate: Arc::new(Admission::default()),
+            gate: Arc::new(Admission::with_registry(registry)),
             process: OnceLock::new(),
             activations: Mutex::new(BTreeMap::new()),
             repository,
@@ -242,9 +243,14 @@ impl Generation {
         if !self.process().is_alive() {
             return Err(unavailable());
         }
-        let activations = self.activations.lock().unwrap();
-        let activation = activations.get(guild).ok_or_else(unavailable)?;
-        self.gate.activate(guild.clone(), activation.epoch)
+        let epoch = self
+            .activations
+            .lock()
+            .unwrap()
+            .get(guild)
+            .ok_or_else(unavailable)?
+            .epoch;
+        self.gate.activate(guild.clone(), epoch)
     }
     #[allow(clippy::too_many_arguments)] // Pin both configuration and activation revisions at admission.
     pub async fn invoke(
@@ -427,15 +433,26 @@ impl Generation {
         revision: u64,
         values: Value,
     ) -> Result<Value> {
-        self.configuration_for_activation(guild,method,revision,values,true).await
+        self.configuration_for_activation(guild, method, revision, values, true)
+            .await
     }
-    pub async fn configuration_for_activation(&self,guild:&GuildId,method:&str,revision:u64,values:Value,published:bool)->Result<Value> {
+    pub async fn configuration_for_activation(
+        &self,
+        guild: &GuildId,
+        method: &str,
+        revision: u64,
+        values: Value,
+        published: bool,
+    ) -> Result<Value> {
         let epoch = self
             .activations
             .lock()
             .unwrap()
             .get(guild)
-            .filter(|a| a.grants.contains("config.own") && (!published || self.gate.is_active(guild, a.epoch)))
+            .filter(|a| {
+                a.grants.contains("config.own")
+                    && (!published || self.gate.is_active(guild, a.epoch))
+            })
             .ok_or_else(unavailable)?
             .epoch;
         if !self.normal || !self.process().is_alive() {
@@ -453,8 +470,15 @@ impl Generation {
             )
             .await
             .map_err(runtime_error)?;
-        if !self.process().is_alive() || (published && !self.gate.is_active(guild, epoch))
-            || self.activations.lock().unwrap().get(guild).is_none_or(|a|a.epoch!=epoch) {
+        if !self.process().is_alive()
+            || (published && !self.gate.is_active(guild, epoch))
+            || self
+                .activations
+                .lock()
+                .unwrap()
+                .get(guild)
+                .is_none_or(|a| a.epoch != epoch)
+        {
             return Err(unavailable());
         }
         Ok(result)

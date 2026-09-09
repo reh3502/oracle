@@ -85,7 +85,7 @@ impl ModuleManager {
                 stopped: false,
             };
             old.gate.close(None);
-            self.registry.write().unwrap().remove(module);
+            self.registry_remove(module);
             self.publish_counts();
             let drained = old.quiesce(None, grace).await.unwrap_or(false);
             let stopped = if drained {
@@ -135,10 +135,7 @@ impl Drop for OldWriterGuard<'_> {
             self.generation.gate.fence(None);
             self.generation.process().request_stop();
             self.manager
-                .registry
-                .write()
-                .unwrap()
-                .insert(self.module.clone(), self.generation.clone());
+                .registry_insert(self.module.clone(), self.generation.clone());
             self.manager.publish_counts();
         }
     }

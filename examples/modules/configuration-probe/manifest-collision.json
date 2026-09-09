@@ -1,6 +1,6 @@
 {
   "manifest_version": 1,
-  "id": "configuration-probe",
+  "id": "configuration-probe-second",
   "version": "1.0.0",
   "target": "x86_64-unknown-linux-gnu",
   "protocol_major": 1,

@@ -227,6 +227,44 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     {
         return Err(err(ErrorCode::InvalidInput));
     }
+    if let Some(commands) = &manifest.commands {
+        fn slug(value: &str, max: usize) -> bool {
+            !value.is_empty()
+                && value.len() <= max
+                && value.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }
+        fn description(value: &str) -> bool {
+            !value.is_empty()
+                && value.chars().count() <= 100
+                && !value.chars().any(char::is_control)
+        }
+        if !slug(&commands.namespace, 20)
+            || commands.namespace == "oracle"
+            || !description(&commands.description)
+            || commands.routes.is_empty()
+            || commands.routes.len() > 25
+            || !unique(commands.routes.iter().map(|r| r.name.as_str()))
+        {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+        for route in &commands.routes {
+            let operation = manifest
+                .operations
+                .iter()
+                .find(|op| op.name == route.operation)
+                .ok_or_else(|| err(ErrorCode::InvalidInput))?;
+            if !slug(&route.name, 32)
+                || !description(&route.description)
+                || (!route.input_required
+                    && !schema_validator(&operation.input_schema)?.is_valid(&serde_json::json!({})))
+            {
+                return Err(err(ErrorCode::InvalidInput));
+            }
+        }
+    }
     for operation in &manifest.operations {
         if !name(&operation.name)
             || operation.description.len() > 2048
@@ -765,6 +803,43 @@ mod tests {
         let mut config = manifest;
         config.configuration = None;
         assert!(validate_manifest(&config).is_err());
+    }
+    #[test]
+    fn command_descriptors_validate_names_routes_and_input_contracts() {
+        let manifest: ModuleManifest = serde_json::from_str(include_str!(
+            "../../../examples/modules/configuration-probe/manifest-events.json"
+        ))
+        .unwrap();
+        validate_manifest(&manifest).unwrap();
+        let mut bad = manifest.clone();
+        bad.commands.as_mut().unwrap().namespace = "oracle".into();
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        let commands = bad.commands.as_mut().unwrap();
+        commands.routes.push(commands.routes[0].clone());
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        bad.commands.as_mut().unwrap().routes[0].operation = "missing".into();
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        let operation = bad.commands.as_ref().unwrap().routes[0].operation.clone();
+        bad.operations
+            .iter_mut()
+            .find(|o| o.name == operation)
+            .unwrap()
+            .input_schema = json!({"type":"object", "required":["value"]});
+        assert!(validate_manifest(&bad).is_err());
+        bad.commands.as_mut().unwrap().routes[0].input_required = true;
+        validate_manifest(&bad).unwrap();
+        let mut legacy = manifest;
+        legacy.commands = None;
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("commands")
+        );
     }
     #[test]
     fn scripts_are_rejected_without_running_install_hooks() {

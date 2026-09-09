@@ -32,6 +32,7 @@ struct State {
 }
 #[derive(Default)]
 pub(crate) struct Admission {
+    registry: Arc<crate::registry::RegistrySignal>,
     state: Mutex<State>,
     changed: Notify,
 }
@@ -53,19 +54,32 @@ fn unavailable() -> Error {
     Error::new(ErrorCode::ModuleUnavailable)
 }
 impl Admission {
-    pub fn activate(&self, guild: GuildId, epoch: u64) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.closed || state.activations.contains_key(&guild) {
-            return Err(unavailable());
+    pub fn with_registry(registry: Arc<crate::registry::RegistrySignal>) -> Self {
+        Self {
+            registry,
+            ..Self::default()
         }
-        state.activations.insert(
-            guild,
-            Activation {
-                epoch,
-                accepting: true,
-            },
-        );
-        Ok(())
+    }
+    pub fn has_active(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.closed && state.activations.values().any(|a| a.accepting)
+    }
+
+    pub fn activate(&self, guild: GuildId, epoch: u64) -> Result<()> {
+        self.registry.mutate(|| {
+            let mut state = self.state.lock().unwrap();
+            if state.closed || state.activations.contains_key(&guild) {
+                return Err(unavailable());
+            }
+            state.activations.insert(
+                guild,
+                Activation {
+                    epoch,
+                    accepting: true,
+                },
+            );
+            Ok(())
+        })
     }
     pub fn admit(self: &Arc<Self>, mut authority: Authority) -> Result<Lease> {
         let mut state = self.state.lock().unwrap();
@@ -125,37 +139,41 @@ impl Admission {
         self.state.lock().unwrap().leases.len()
     }
     pub fn close(&self, guild: Option<&GuildId>) {
-        let mut state = self.state.lock().unwrap();
-        match guild {
-            Some(guild) => {
-                if let Some(active) = state.activations.get_mut(guild) {
-                    active.accepting = false;
+        self.registry.mutate(|| {
+            let mut state = self.state.lock().unwrap();
+            match guild {
+                Some(guild) => {
+                    if let Some(active) = state.activations.get_mut(guild) {
+                        active.accepting = false;
+                    }
+                }
+                None => {
+                    state.closed = true;
                 }
             }
-            None => {
-                state.closed = true;
-            }
-        }
+        })
     }
     pub fn fence(&self, guild: Option<&GuildId>) {
-        let mut state = self.state.lock().unwrap();
-        state.leases.retain(|_, authority| {
-            let affected = guild.is_none_or(|guild| guild == &authority.guild);
-            if affected {
-                authority.cancel.cancel();
+        self.registry.mutate(|| {
+            let mut state = self.state.lock().unwrap();
+            state.leases.retain(|_, authority| {
+                let affected = guild.is_none_or(|guild| guild == &authority.guild);
+                if affected {
+                    authority.cancel.cancel();
+                }
+                !affected
+            });
+            match guild {
+                Some(guild) => {
+                    state.activations.remove(guild);
+                }
+                None => {
+                    state.closed = true;
+                    state.activations.clear();
+                }
             }
-            !affected
-        });
-        match guild {
-            Some(guild) => {
-                state.activations.remove(guild);
-            }
-            None => {
-                state.closed = true;
-                state.activations.clear();
-            }
-        }
-        self.changed.notify_waiters();
+            self.changed.notify_waiters();
+        })
     }
     pub async fn drain(&self, guild: Option<&GuildId>, timeout: Duration) -> bool {
         let wait = async {

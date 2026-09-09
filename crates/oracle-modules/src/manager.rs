@@ -39,8 +39,15 @@ pub struct ModuleCatalogEntry {
     pub generation: u64,
     pub epoch: u64,
     pub operations: Vec<ModuleOperation>,
+    pub commands: ModuleCommands,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModuleCatalogSnapshot {
+    pub revision: u64,
+    pub entries: Vec<ModuleCatalogEntry>,
 }
 pub struct ModuleManager {
+    registry_signal: Arc<crate::registry::RegistrySignal>,
     event_services: RwLock<Option<events::EventServices>>,
     event_queues: std::sync::Mutex<BTreeMap<(ModuleId, GuildId), events::EventQueue>>,
     event_tasks: tasks::HostTasks,
@@ -86,10 +93,7 @@ impl Drop for RetainStopping<'_> {
             self.generation.gate.fence(None);
             self.generation.process().request_stop();
             self.manager
-                .registry
-                .write()
-                .unwrap()
-                .insert(self.module.clone(), self.generation.clone());
+                .registry_insert(self.module.clone(), self.generation.clone());
             self.manager.publish_counts();
         }
     }
@@ -238,6 +242,7 @@ impl ModuleManager {
         transport: Arc<dyn crate::SendTransport>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
+            registry_signal: Arc::new(crate::registry::RegistrySignal::default()),
             event_services: RwLock::new(None),
             event_queues: std::sync::Mutex::new(BTreeMap::new()),
             event_tasks: tasks::HostTasks::new(),
@@ -255,6 +260,50 @@ impl ModuleManager {
             next: AtomicU64::new(1),
             recovery: std::sync::Mutex::new(BTreeMap::new()),
         }))
+    }
+    pub fn registry_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.registry_signal.subscribe()
+    }
+    pub fn registry_revision(&self) -> u64 {
+        self.registry_signal.snapshot(|revision| revision)
+    }
+    pub fn registry_permit(&self, revision: u64) -> crate::RegistryDispatchPermit {
+        self.registry_signal
+            .snapshot(|_| crate::RegistryDispatchPermit {
+                signal: self.registry_signal.clone(),
+                revision,
+                processes: self
+                    .registry
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|g| g.process().is_alive() || g.gate.has_active())
+                    .map(|g| g.process().clone())
+                    .collect(),
+            })
+    }
+    fn registry_insert(&self, module: ModuleId, generation: Arc<Generation>) {
+        self.registry_signal
+            .mutate(|| self.registry.write().unwrap().insert(module, generation));
+    }
+    fn registry_remove(&self, module: &ModuleId) -> Option<Arc<Generation>> {
+        self.registry_signal
+            .mutate(|| self.registry.write().unwrap().remove(module))
+    }
+    fn watch_generation(&self, generation: &Arc<Generation>) -> Result<()> {
+        let generation = generation.clone();
+        let cancel = self.event_tasks.token();
+        self.event_tasks.spawn("module_registry_process",async move {
+            loop {
+                tokio::select! {biased;_=cancel.cancelled()=>break,
+                    result=generation.process().wait_stopped(Duration::from_secs(3600))=>{
+                        if result.is_ok()||!generation.process().is_alive() {generation.gate.fence(None);break;}
+                    }
+                }
+            }
+            Ok(())
+        }).map_err(|_|unavailable())?;
+        Ok(())
     }
     fn publish_counts(&self) {
         self.prune_event_queues();
@@ -357,7 +406,7 @@ impl ModuleManager {
                 if report.cleanup_error.is_some() {
                     return Err(Error::new(ErrorCode::Io));
                 }
-                self.registry.write().unwrap().remove(&module);
+                self.registry_remove(&module);
             }
             let artifact = self.artifacts.verify(&installed)?;
             // Resume all known namespaces before ordinary code can become visible,
@@ -379,6 +428,7 @@ impl ModuleManager {
                 self.repository.clone(),
                 Arc::new(Router(Arc::downgrade(self))),
                 "normal",
+                self.registry_signal.clone(),
             )
             .await?;
             let mut provisional = RetainStopping {
@@ -403,7 +453,8 @@ impl ModuleManager {
                 provisional.finished = true;
                 return Err(error);
             }
-            self.registry.write().unwrap().insert(module, generation);
+            self.watch_generation(&generation)?;
+            self.registry_insert(module, generation);
             provisional.finished = true;
             self.publish_counts();
             Ok(())
@@ -432,6 +483,31 @@ impl ModuleManager {
             }
             let generation = self.get(&desired.module)?;
             let manifest = &generation.installed.package.manifest;
+            if let Some(commands) = &manifest.commands {
+                for other in self.registry.read().unwrap().values() {
+                    if other.installed.package.manifest.id == manifest.id
+                        || !other.process().is_alive()
+                    {
+                        continue;
+                    }
+                    if other
+                        .installed
+                        .package
+                        .manifest
+                        .commands
+                        .as_ref()
+                        .is_some_and(|c| c.namespace == commands.namespace)
+                        && other
+                            .activations
+                            .lock()
+                            .unwrap()
+                            .get(&desired.guild)
+                            .is_some_and(|a| other.gate.is_active(&desired.guild, a.epoch))
+                    {
+                        return Err(Error::new(ErrorCode::Conflict));
+                    }
+                }
+            }
             if !manifest.subscriptions.is_empty() {
                 self.require_event_intents(&generation)?;
             }
@@ -543,7 +619,22 @@ impl ModuleManager {
         actor: &PolicyContext,
         guild: &GuildId,
     ) -> Result<Vec<ModuleCatalogEntry>> {
+        Ok(self.catalog_snapshot(actor, guild).await?.entries)
+    }
+    pub async fn catalog_snapshot(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+    ) -> Result<ModuleCatalogSnapshot> {
         self.core.authorize_module(actor, guild).await?;
+        Ok(self
+            .registry_signal
+            .snapshot(|revision| ModuleCatalogSnapshot {
+                revision,
+                entries: self.catalog_current(guild),
+            }))
+    }
+    fn catalog_current(&self, guild: &GuildId) -> Vec<ModuleCatalogEntry> {
         let generations: Vec<_> = self.registry.read().unwrap().values().cloned().collect();
         let mut catalog = Vec::new();
         for generation in generations {
@@ -559,6 +650,9 @@ impl ModuleManager {
             if !generation.gate.is_active(guild, active.epoch) {
                 continue;
             }
+            let Some(mut commands) = generation.installed.package.manifest.commands.clone() else {
+                continue;
+            };
             let operations = generation
                 .installed
                 .package
@@ -568,17 +662,30 @@ impl ModuleManager {
                 .filter(|op| op.capabilities.iter().all(|c| active.grants.contains(c)))
                 .cloned()
                 .collect::<Vec<_>>();
-            if !operations.is_empty() {
+            commands
+                .routes
+                .retain(|route| operations.iter().any(|op| op.name == route.operation));
+            if !commands.routes.is_empty() {
+                let operations = operations
+                    .into_iter()
+                    .filter(|op| {
+                        commands
+                            .routes
+                            .iter()
+                            .any(|route| route.operation == op.name)
+                    })
+                    .collect();
                 catalog.push(ModuleCatalogEntry {
                     module: generation.installed.package.manifest.id.clone(),
                     session: generation.session.clone(),
                     generation: generation.number,
                     epoch: active.epoch,
                     operations,
+                    commands,
                 });
             }
         }
-        Ok(catalog)
+        catalog
     }
     #[allow(clippy::too_many_arguments)] // Persisted command identity and invocation share one pinned generation.
     pub async fn invoke_bound(
@@ -711,7 +818,7 @@ impl ModuleManager {
             finished: false,
         };
         generation.gate.close(None);
-        self.registry.write().unwrap().remove(module);
+        self.registry_remove(module);
         self.publish_counts();
         let drained = generation.quiesce(None, grace).await?;
         let report = if drained {
@@ -809,7 +916,7 @@ impl ModuleManager {
         }
         generation.gate.close(None);
         generation.gate.fence(None);
-        self.registry.write().unwrap().remove(module);
+        self.registry_remove(module);
         self.publish_counts();
         generation.force_stop().await?;
         self.load_locked(&generation.installed.digest).await?;
@@ -846,11 +953,13 @@ impl ModuleManager {
     }
     pub async fn shutdown(&self) -> Result<()> {
         let _guard = self.lifecycle.lock().await;
-        for generation in self.registry.write().unwrap().values() {
+        let generations: Vec<_> = self.registry.read().unwrap().values().cloned().collect();
+        for generation in generations {
             generation.gate.close(None);
             generation.gate.fence(None);
         }
-        self.registry.write().unwrap().clear();
+        self.registry_signal
+            .mutate(|| self.registry.write().unwrap().clear());
         self.publish_counts();
         let events = self.event_tasks.shutdown(Duration::from_secs(5)).await;
         let effects = self.effect_tasks.shutdown(Duration::from_secs(10)).await;
@@ -918,6 +1027,7 @@ impl ModuleManager {
             self.repository.clone(),
             Arc::new(Router(Arc::downgrade(self))),
             "migration",
+            self.registry_signal.clone(),
         )
         .await?;
         let _provisional = Provisional(Some(migrator.clone()));

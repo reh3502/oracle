@@ -195,5 +195,23 @@
     "member_joined",
     "member_left",
     "maintenance"
-  ]
+  ],
+  "commands": {
+    "namespace": "activity-log",
+    "description": "Discord activity logging",
+    "routes": [
+      {
+        "name": "status",
+        "description": "Inspect activity logging",
+        "operation": "status",
+        "input_required": false
+      },
+      {
+        "name": "probe",
+        "description": "Verify logging delivery",
+        "operation": "probe",
+        "input_required": false
+      }
+    ]
+  }
 }

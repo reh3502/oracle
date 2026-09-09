@@ -17,3 +17,8 @@ pub use manager::{
 };
 
 pub use manager::ModuleCatalogEntry;
+
+mod registry;
+pub use registry::RegistryDispatchPermit;
+
+pub use manager::ModuleCatalogSnapshot;
