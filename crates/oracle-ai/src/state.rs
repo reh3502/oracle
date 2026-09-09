@@ -181,10 +181,171 @@ impl RunStore {
                 .settle(&reservation, None)
                 .map_err(|_| Error::new(ErrorCode::Integrity))?;
         }
+        for mut call in self.calls(&saved).await? {
+            if call.call.state == CallState::Admitted {
+                self.finish_call(
+                    &saved,
+                    &mut call,
+                    serde_json::json!({"error":"interrupted_call_requires_receipt_reconciliation"}),
+                    true,
+                    true,
+                )
+                .await?;
+            }
+        }
         saved.run.status = RunStatus::Recovering;
         saved.run.problem = Some("interrupted_run_requires_receipt_reconciliation".into());
         self.save(&mut saved, now_ms).await?;
         Ok(saved)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SavedCall {
+    /// Only the winner of the insertion may dispatch; existing admissions are recovery work.
+    pub newly_admitted: bool,
+    pub revision: u64,
+    pub call: CallRecord,
+}
+fn call_key(run: &OperationId, call_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{}:{:x}", run, Sha256::digest(call_id.as_bytes()))
+}
+impl RunStore {
+    /// Record admission before dispatch. Repeated IDs return the original outcome;
+    /// they never allocate fresh authority or a second invocation.
+    pub async fn admit_call(&self, saved: &SavedRun, call: CallRecord) -> Result<SavedCall> {
+        if call.run != saved.run.id
+            || call.call_id.is_empty()
+            || call.call_id.len() > 256
+            || call.name.is_empty()
+            || call.name.len() > 64
+            || call.binding.len() > 512
+            || call.state != CallState::Admitted
+            || call.result.is_some()
+            || call.is_error
+            || serde_json::to_vec(&call.arguments)
+                .map_err(|_| invalid())?
+                .len()
+                > 8192
+        {
+            return Err(invalid());
+        }
+        let key = call_key(&call.run, &call.call_id);
+        let value = serde_json::to_value(&call).map_err(|_| invalid())?;
+        match self
+            .repository
+            .workflow_put(
+                &saved.run.guild,
+                WorkflowKind::AgentCall,
+                &key,
+                None,
+                &value,
+            )
+            .await
+        {
+            Ok(record) => Ok(SavedCall {
+                newly_admitted: true,
+                revision: record.revision,
+                call,
+            }),
+            Err(error) if error.code == ErrorCode::Conflict => {
+                let record = self
+                    .repository
+                    .workflow_get(&saved.run.guild, WorkflowKind::AgentCall, &key)
+                    .await?
+                    .ok_or_else(|| Error::new(ErrorCode::Integrity))?;
+                let existing: CallRecord = serde_json::from_value(record.value)
+                    .map_err(|_| Error::new(ErrorCode::Integrity))?;
+                if existing.run != call.run
+                    || existing.call_id != call.call_id
+                    || existing.name != call.name
+                    || existing.binding != call.binding
+                    || existing.arguments != call.arguments
+                {
+                    return Err(Error::new(ErrorCode::Conflict));
+                }
+                Ok(SavedCall {
+                    newly_admitted: false,
+                    revision: record.revision,
+                    call: existing,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn finish_call(
+        &self,
+        run: &SavedRun,
+        saved: &mut SavedCall,
+        result: Value,
+        is_error: bool,
+        unknown: bool,
+    ) -> Result<()> {
+        if saved.call.run != run.run.id
+            || saved.call.state != CallState::Admitted
+            || serde_json::to_vec(&result).map_err(|_| invalid())?.len() > 16 * 1024
+        {
+            return Err(Error::new(ErrorCode::Conflict));
+        }
+        let mut call = saved.call.clone();
+        call.state = if unknown {
+            CallState::Unknown
+        } else {
+            CallState::Finished
+        };
+        call.result = Some(result);
+        call.is_error = is_error;
+        let value = serde_json::to_value(&call).map_err(|_| invalid())?;
+        let record = self
+            .repository
+            .workflow_put(
+                &run.run.guild,
+                WorkflowKind::AgentCall,
+                &call_key(&call.run, &call.call_id),
+                Some(saved.revision),
+                &value,
+            )
+            .await?;
+        saved.revision = record.revision;
+        saved.newly_admitted = false;
+        saved.call = call;
+        Ok(())
+    }
+
+    pub async fn calls(&self, run: &SavedRun) -> Result<Vec<SavedCall>> {
+        let prefix = format!("{}:", run.run.id);
+        let mut cursor = prefix.clone();
+        let mut calls = Vec::new();
+        loop {
+            let records = self
+                .repository
+                .workflow_list(&run.run.guild, WorkflowKind::AgentCall, Some(&cursor), 100)
+                .await?;
+            if records.is_empty() {
+                return Ok(calls);
+            }
+            for record in records {
+                if !record.key.starts_with(&prefix) {
+                    return Ok(calls);
+                }
+                cursor = record.key;
+                let call: CallRecord = serde_json::from_value(record.value)
+                    .map_err(|_| Error::new(ErrorCode::Integrity))?;
+                if call.run != run.run.id || cursor != call_key(&call.run, &call.call_id) {
+                    return Err(Error::new(ErrorCode::Integrity));
+                }
+                calls.push(SavedCall {
+                    newly_admitted: false,
+                    revision: record.revision,
+                    call,
+                });
+                if calls.len() > run.run.limits.max_tool_calls as usize {
+                    return Err(Error::new(ErrorCode::Integrity));
+                }
+            }
+        }
     }
 }
 
@@ -382,6 +543,92 @@ mod tests {
         assert!(recovered.run.budget.pending.is_none());
         let serialized = serde_json::to_string(&recovered.run).unwrap();
         assert!(!serialized.contains("opaque"));
+        storage.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn call_ids_preserve_one_outcome_and_restart_never_replays_admission() {
+        let (_folder, storage, store, guild) = setup().await;
+        let context = actor(&guild, "101");
+        let saved = store
+            .create(&context, draft(&context, guild.clone()))
+            .await
+            .unwrap();
+        let call = CallRecord {
+            run: saved.run.id.clone(),
+            call_id: "call-1".into(),
+            name: "core_discord_apply_v1".into(),
+            binding: "plan:owned".into(),
+            arguments: serde_json::json!({"plan_ref":"owned"}),
+            state: CallState::Admitted,
+            result: None,
+            is_error: false,
+        };
+        let mut admitted = store.admit_call(&saved, call.clone()).await.unwrap();
+        assert!(admitted.newly_admitted);
+        assert!(
+            !store
+                .admit_call(&saved, call.clone())
+                .await
+                .unwrap()
+                .newly_admitted
+        );
+        assert_eq!(
+            store
+                .admit_call(&saved, call.clone())
+                .await
+                .unwrap()
+                .revision,
+            admitted.revision
+        );
+        store
+            .finish_call(
+                &saved,
+                &mut admitted,
+                serde_json::json!({"receipt":"verified-1"}),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .admit_call(&saved, call.clone())
+                .await
+                .unwrap()
+                .call
+                .state,
+            CallState::Finished
+        );
+        let mut changed = call.clone();
+        changed.arguments = serde_json::json!({"plan_ref":"foreign"});
+        assert_eq!(
+            store.admit_call(&saved, changed).await.unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        let mut pending = call;
+        pending.call_id = "call-2".into();
+        store.admit_call(&saved, pending).await.unwrap();
+        let recovered = store
+            .recover(&context, &guild, &saved.run.id, 2)
+            .await
+            .unwrap();
+        let calls = store.calls(&recovered).await.unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.call.state == CallState::Finished)
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.call.state == CallState::Unknown)
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.call.state != CallState::Admitted)
+        );
         storage.close().await.unwrap();
     }
 }
