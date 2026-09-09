@@ -1,6 +1,6 @@
 # Oracle
 
-Oracle is a Rust Discord bot framework under development. It provides scoped human controls, a durable operation/effect ledger, SQLite or PostgreSQL storage, and runtime loading of separately installed native modules. It ships **zero feature modules** and requires no Gemini key. Stage 2 is implemented and locally qualified; see the [Stage 1 record](STAGE1.md) and [Stage 2 qualification and evidence](STAGE2.md). AI management remains a later roadmap stage.
+Oracle is a Rust Discord bot framework under development. It provides scoped human controls, a durable operation/effect ledger, SQLite or PostgreSQL storage, and runtime loading of separately installed native modules. It ships **zero feature modules** and requires no Gemini key. The bootstrap and dynamic module runtime are implemented. AI management remains a later roadmap stage.
 
 ## Build and initialize
 
@@ -125,6 +125,6 @@ python3 scripts/check-stage1.py --postgres-bin /usr/lib/postgresql/18/bin
 
 The acceptance drill creates and stops a disposable PostgreSQL cluster and exercises both backends, native backups, isolated restores and the actual running host. Supply `--postgres-share` and `--postgres-lib` when using an extracted PostgreSQL installation. The ordinary Cargo suite skips its PostgreSQL contract unless `ORACLE_TEST_POSTGRES_URL` and `ORACLE_TEST_POSTGRES_RESTORE_URL` name disposable databases; the acceptance drill supplies both.
 
-[Stage 0 qualification](prototypes/STAGE0.md) retains the process, effect-boundary, Discord, storage, Gemini and scenario prototypes. They are development fixtures, not bundled feature modules. Its separate local suite is `python3 scripts/check-stage0.py --offline-only`; live checks require separately supplied credentials. No routine test sends paid provider requests or changes a Discord guild.
+The `prototypes/` directory contains process, effect-boundary, Discord, storage, Gemini and scenario experiments. They are development fixtures, not bundled feature modules. Its separate local suite is `python3 scripts/check-stage0.py --offline-only`; live checks require separately supplied credentials. No routine test sends paid provider requests or changes a Discord guild.
 
 Build outputs, credentials, local design documents and agent instructions are excluded from Git.

@@ -2,7 +2,7 @@
 
 This standalone, disposable Rust/SQLx experiment runs the **same contract against real file-backed SQLite and PostgreSQL**. A missing or failing backend fails the run. It does not alter the root workspace, the P1 prototype, or a production database.
 
-The checked-in [machine report](artifacts/p4-report.json) records matching semantic digests and the actual query plans. [P4_REPORT.md](P4_REPORT.md) maps the gate to the evidence and its limits.
+The runner writes semantic digests and query plans to ignored local reports.
 
 ## Reproduce
 

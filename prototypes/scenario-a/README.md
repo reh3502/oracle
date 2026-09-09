@@ -8,7 +8,7 @@ From the repository root:
 ./scripts/check-p2-p6.sh
 ```
 
-The shared script checks formatting, Clippy with warnings denied, locked release builds and both executable acceptance harnesses. Generated P6 evidence is in `artifacts/`; the retained qualified run is [P6 evidence](../evidence/p6-2026-09-08.json).
+The shared script checks formatting, Clippy with warnings denied, locked release builds and both executable acceptance harnesses. Generated results stay in ignored `artifacts/`.
 
 [The executor](src/lib.rs) creates one Minecraft category, two text channels and one voice channel using fixed host-approved Minecraft/staff audience profiles. Information posting is staff-only; ordinary Minecraft members can chat/connect elsewhere; everyone has no access. Existing compatible channels are reused with custom fields preserved. Host policy, actor/bot capability, hierarchy, guild/principal/run ownership and snapshot freshness are checked outside model output. Incomplete visibility and ambiguous candidates block writes.
 

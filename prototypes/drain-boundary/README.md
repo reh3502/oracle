@@ -8,7 +8,7 @@ From the repository root run:
 ./scripts/check-p2-p6.sh
 ```
 
-This checks formatting, Clippy with warnings denied, locked release builds, and the P2/P6 executable harnesses. P2 also starts, stops and reloads the actual P1 alpha binary. Generated measurements are in `artifacts/`; the retained run is [P2 evidence](../evidence/p2-2026-09-08.json).
+This checks formatting, Clippy with warnings denied, locked release builds, and the P2/P6 executable harnesses. P2 also starts, stops and reloads the actual P1 alpha binary. Generated measurements stay in ignored `artifacts/`.
 
 The key boundary is `Sender::send` in [src/lib.rs](src/lib.rs). After each rate permit, including each 429 retry, it waits for socket writability, takes the same mutex as fence/revocation, validates the lease and writes a bounded request with one nonblocking `try_write` while still holding that mutex. A request either begins before fence or is denied after it. Partial writes and response loss remain unknown outcomes; they are never blindly retried. The append/fsync ledger records uncertainty before bytes can leave and remains readable after reopening, including after a torn final append. Per-effect ownership serializes concurrent duplicates across admission, dispatch and response handling. A 429 is an explicit rejected attempt, so only it permits another rate-controlled attempt.
 

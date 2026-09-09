@@ -1,6 +1,6 @@
 # P5 Gemini Interactions contract prototype
 
-The local contract checks and **authorized beta/3.8 live gate pass**. The three-request run completed two sequential tool rounds with exact native continuation/signature replay; see [live-success.json](live-success.json). Earlier HTTP 429 failures remain historical diagnostics. Stable v1/3.7 is a separate unqualified live profile. This is a standalone prototype workspace.
+This standalone prototype checks Gemini continuation and tool-result contracts. Run the offline tests or explicitly select a live profile below. Results stay local.
 
 ```sh
 cargo test --locked --manifest-path prototypes/gemini-contract/Cargo.toml

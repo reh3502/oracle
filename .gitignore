@@ -19,3 +19,14 @@ __pycache__/
 /deployment/
 /restored/
 /backups/
+
+# Local implementation notes and verification output
+/STAGE*.md
+/prototypes/STAGE*.md
+**/evidence/
+**/artifacts/
+**/*_REPORT.md
+**/EVIDENCE.md
+**/local-report.json
+**/live-success.json
+**/live-failures.jsonl

@@ -1,6 +1,6 @@
 # Stage 0 P1: native process runtime
 
-P1 is an executable Linux experiment for Oracle's proposed module boundary. Two ordinary Rust executables can be introduced after the host starts, loaded, invoked and unloaded without restarting the host. The harness exercises real pipes, TCP sockets, process crashes and descendant reaping. See [P1_REPORT.md](P1_REPORT.md) for the measured acceptance result.
+P1 is an executable Linux experiment for Oracle's proposed module boundary. Two ordinary Rust executables can be introduced after the host starts, loaded, invoked and unloaded without restarting the host. The harness exercises real pipes, TCP sockets, process crashes and descendant reaping.
 
 ## Reproduce
 
@@ -14,7 +14,7 @@ From the repository root:
 
 The script checks formatting, denies Clippy warnings, runs the unit tests, builds the workspace in release mode with the lockfile, and runs 60 measured load/invoke/unload cycles after 10 warmup generations. Pass an integer of at least 30 to change the measured cycle count, for example `./scripts/check-p1.sh 120`. Failure returns a nonzero exit status.
 
-Generated `artifacts/environment.json` records compiler, Cargo, kernel, hardware and source hashes. `artifacts/p1-release.json` records binary SHA-256 digests, pass/fail, cleanup reports, resource samples and acceptance checks. These outputs and `target/` are ignored by Git. [evidence/p1-2026-09-08.json](evidence/p1-2026-09-08.json) preserves the completed run and its environment independently of the generated directory.
+Generated `artifacts/environment.json` records compiler, Cargo, kernel, hardware and source hashes. `artifacts/p1-release.json` records binary SHA-256 digests, pass/fail, cleanup reports, resource samples and acceptance checks. These outputs and `target/` are ignored by Git.
 
 To exercise independently compiled executables with different Rust toolchains (install 1.95.0 first if needed):
 

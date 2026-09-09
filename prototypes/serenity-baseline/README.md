@@ -1,6 +1,6 @@
 # Stage 0 P3: pinned Serenity baseline
 
-This standalone workspace qualifies the selected development API and a narrow local fork. It is not the production Discord adapter. **Offline checks and the explicitly authorized disposable-guild live gate passed on 2026-09-08.** The live run created, verified and removed three test channels and one test command; an independent read confirmed the original four visible channels and zero guild commands were restored. See [EVIDENCE.md](EVIDENCE.md).
+This standalone workspace qualifies the selected development API and a narrow local fork. It is not the production Discord adapter. Run the checks below to generate local results.
 
 ## Reproduce offline
 
