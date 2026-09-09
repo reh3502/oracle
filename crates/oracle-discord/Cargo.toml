@@ -1,0 +1,17 @@
+[package]
+name = "oracle-discord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[dependencies]
+oracle-core = { path = "../oracle-core" }
+serenity.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+oracle-storage = { path = "../oracle-storage" }
+rustls = { version = "0.23", default-features = false, features = ["std"] }

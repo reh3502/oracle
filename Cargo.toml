@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/oracle-contracts", "crates/oracle-core", "crates/oracle-storage", "crates/oracle-discord", "crates/oracle", "crates/oracle-task-scope", "crates/oracle-rpc", "crates/oracle-process", "crates/oracle-module-sdk", "crates/oracle-modules", "examples/modules/counter", "examples/modules/dependent", "examples/modules/authority-probe", "prototypes/process-runtime", "prototypes/fixtures/alpha", "prototypes/fixtures/beta"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+libc = "0.2"
+nix = { version = "0.31.3", features = ["signal", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+serenity = { git = "https://github.com/serenity-rs/serenity.git", rev = "98ec74223b0ff77fc4e8085d25569ea59e09a36f", default-features = false, features = ["gateway", "model", "cache", "rustls_backend"] }
+
+[patch."https://github.com/serenity-rs/serenity.git"]
+serenity = { path = "target/serenity-fork" }

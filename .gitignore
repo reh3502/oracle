@@ -1,3 +1,21 @@
 # Local design documents and agent instructions
 /docs/
 [Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+
+# Rust build outputs and generated prototype measurements
+/target/
+/prototypes/process-runtime/artifacts/
+
+# Local credentials and the user's text-editor credential document
+/.env
+/.env.*
+/Text File.txt
+__pycache__/
+
+# Local deployments, database drills, and backup data
+**/.local/
+/oracle.json
+/state/
+/deployment/
+/restored/
+/backups/

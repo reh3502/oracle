@@ -1,0 +1,67 @@
+{
+  "manifest_version": 1,
+  "id": "fixture.dependent",
+  "version": "1.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "protocol_major": 1,
+  "protocol_minor_min": 0,
+  "host_api": "^1.0",
+  "data_version": 1,
+  "readable_data_versions": [
+    1
+  ],
+  "capabilities": [
+    "contracts.invoke",
+    "storage.own"
+  ],
+  "required_intents": [],
+  "provides": [],
+  "consumes": [
+    {
+      "name": "counter/v1",
+      "version": "^1",
+      "optional": false
+    }
+  ],
+  "operations": [
+    {
+      "name": "read_counter",
+      "description": "Read a counter through the host-resolved contract binding.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "epoch": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "value",
+          "generation",
+          "epoch"
+        ],
+        "additionalProperties": false
+      },
+      "timeout_ms": 5000,
+      "capabilities": [
+        "contracts.invoke",
+        "storage.own"
+      ]
+    }
+  ],
+  "collections": [],
+  "migrations": []
+}

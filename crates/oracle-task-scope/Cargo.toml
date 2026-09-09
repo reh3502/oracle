@@ -1,0 +1,12 @@
+[package]
+name = "oracle-task-scope"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+[dev-dependencies]
+serde_json.workspace = true

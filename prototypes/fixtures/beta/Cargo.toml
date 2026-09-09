@@ -1,0 +1,14 @@
+[package]
+name = "oracle-fixture-beta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+oracle-process-prototype = { path = "../../process-runtime" }
+async-trait.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

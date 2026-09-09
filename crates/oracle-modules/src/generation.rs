@@ -1,0 +1,604 @@
+//! One process generation and its opaque host-issued invocation authority.
+use crate::{
+    admission::{Admission, Authority},
+    package::{schema_validator, validate_input, validate_output},
+};
+use async_trait::async_trait;
+use oracle_core::{
+    DocumentWrite, Error, ErrorCode, GuildId, InstalledModule, ModuleId, ModuleManifest,
+    ModuleRepository, PolicyContext, Result,
+};
+use oracle_process::{ModuleProcess, ProcessRuntime, RuntimeError, StopReport};
+use oracle_rpc::{RpcError, RpcHandler, RpcPeer};
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::Path,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub(crate) struct Activation {
+    pub epoch: u64,
+    pub grants: BTreeSet<String>,
+    pub bindings: BTreeMap<String, ModuleId>,
+}
+#[async_trait]
+pub(crate) trait ContractRouter: Send + Sync {
+    async fn echo(
+        &self,
+        module: &ModuleId,
+        purpose: String,
+        body: Value,
+        authority: Authority,
+        permit: crate::DispatchPermit,
+        cancel: CancellationToken,
+    ) -> Result<Value>;
+
+    async fn invoke(
+        &self,
+        provider: &ModuleId,
+        contract: &str,
+        input: Value,
+        authority: Authority,
+    ) -> Result<Value>;
+}
+pub(crate) struct Generation {
+    pub installed: InstalledModule,
+    pub number: u64,
+    pub session: String,
+    pub gate: Arc<Admission>,
+    pub process: OnceLock<ModuleProcess>,
+    pub activations: Mutex<BTreeMap<GuildId, Activation>>,
+    repository: Arc<dyn ModuleRepository>,
+    router: Arc<dyn ContractRouter>,
+    normal: bool,
+}
+fn error(code: ErrorCode) -> Error {
+    Error::new(code)
+}
+fn unavailable() -> Error {
+    error(ErrorCode::ModuleUnavailable)
+}
+fn runtime_error(error: RuntimeError) -> Error {
+    match error {
+        RuntimeError::DigestMismatch => crate::generation::error(ErrorCode::ArtifactChanged),
+        _ => unavailable(),
+    }
+}
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T> {
+    serde_json::from_value(value).map_err(|_| error(ErrorCode::InvalidInput))
+}
+fn encode(value: impl serde::Serialize) -> Result<Value> {
+    serde_json::to_value(value).map_err(|_| error(ErrorCode::InvalidInput))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Hello {
+    protocol_major: u32,
+    protocol_minor: u32,
+    manifest: ModuleManifest,
+}
+struct StopOnDrop {
+    generation: Arc<Generation>,
+    armed: bool,
+}
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.generation.gate.fence(None);
+            if let Some(process) = self.generation.process.get() {
+                process.request_stop();
+            }
+        }
+    }
+}
+struct QuiesceGuard<'a> {
+    generation: &'a Generation,
+    armed: bool,
+}
+impl Drop for QuiesceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.generation.gate.fence(None);
+            self.generation.process().request_stop();
+        }
+    }
+}
+impl Generation {
+    #[allow(clippy::too_many_arguments)] // Explicit host-owned generation construction inputs.
+    pub async fn spawn(
+        runtime: &ProcessRuntime,
+        artifact: &Path,
+        installed: InstalledModule,
+        number: u64,
+        repository: Arc<dyn ModuleRepository>,
+        router: Arc<dyn ContractRouter>,
+        mode: &str,
+    ) -> Result<Arc<Self>> {
+        if !matches!(mode, "normal" | "migration") || number == 0 {
+            return Err(error(ErrorCode::InvalidInput));
+        }
+        let generation = Arc::new(Self {
+            installed,
+            number,
+            session: uuid::Uuid::new_v4().to_string(),
+            gate: Arc::new(Admission::default()),
+            process: OnceLock::new(),
+            activations: Mutex::new(BTreeMap::new()),
+            repository,
+            router,
+            normal: mode == "normal",
+        });
+        let mut cleanup = StopOnDrop {
+            generation: generation.clone(),
+            armed: true,
+        };
+        let digest = generation
+            .installed
+            .package
+            .files
+            .get(&generation.installed.package.entrypoint)
+            .ok_or_else(|| error(ErrorCode::ArtifactChanged))?;
+        let process=runtime.spawn(artifact,digest,json!({"protocol_major":1,"protocol_minor":0,"session":generation.session,"generation":number}),Arc::new(Callbacks(Arc::downgrade(&generation)))).await.map_err(runtime_error)?;
+        generation.process.set(process).map_err(|_| unavailable())?;
+        let initialized = async {
+            let hello: Hello = decode(generation.process().hello().clone())
+                .map_err(|_| error(ErrorCode::Compatibility))?;
+            if hello.protocol_major != 1
+                || hello.protocol_minor != 0
+                || hello.manifest != generation.installed.package.manifest
+            {
+                return Err(error(ErrorCode::Compatibility));
+            }
+            let result = generation
+                .process()
+                .call(
+                    "initialize",
+                    json!({"session":generation.session,"generation":number,"mode":mode}),
+                    Duration::from_secs(5),
+                )
+                .await
+                .map_err(runtime_error)?;
+            if result != json!({"initialized":true}) {
+                return Err(error(ErrorCode::Compatibility));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = initialized {
+            let _ = generation.force_stop().await;
+            return Err(error);
+        }
+        cleanup.armed = false;
+        Ok(generation)
+    }
+    pub fn process(&self) -> &ModuleProcess {
+        self.process
+            .get()
+            .expect("process installed before generation publication")
+    }
+    pub async fn prepare_activation(
+        self: &Arc<Self>,
+        guild: GuildId,
+        epoch: u64,
+        grants: BTreeSet<String>,
+        bindings: BTreeMap<String, ModuleId>,
+    ) -> Result<()> {
+        if !self.normal || epoch == 0 || self.activations.lock().unwrap().contains_key(&guild) {
+            return Err(unavailable());
+        }
+        if grants
+            .iter()
+            .any(|grant| !self.installed.package.manifest.capabilities.contains(grant))
+        {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        let mut cleanup = StopOnDrop {
+            generation: self.clone(),
+            armed: true,
+        };
+        let result = self
+            .process()
+            .call(
+                "activate",
+                json!({"guild":guild,"epoch":epoch}),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(runtime_error)?;
+        if result != json!({"activated":true}) {
+            return Err(unavailable());
+        }
+        self.activations.lock().unwrap().insert(
+            guild.clone(),
+            Activation {
+                epoch,
+                grants,
+                bindings,
+            },
+        );
+        cleanup.armed = false;
+        Ok(())
+    }
+    pub fn publish_activation(&self, guild: &GuildId) -> Result<()> {
+        if !self.process().is_alive() {
+            return Err(unavailable());
+        }
+        let activations = self.activations.lock().unwrap();
+        let activation = activations.get(guild).ok_or_else(unavailable)?;
+        self.gate.activate(guild.clone(), activation.epoch)
+    }
+    pub async fn invoke(
+        &self,
+        actor: PolicyContext,
+        guild: &GuildId,
+        operation: &str,
+        input: Value,
+        parent: Option<Authority>,
+    ) -> Result<Value> {
+        if !self.normal || !self.process().is_alive() {
+            return Err(unavailable());
+        }
+        if matches!(&actor,PolicyContext::Discord{guild:actor_guild,..} if actor_guild!=guild) {
+            return Err(error(ErrorCode::ForbiddenScope));
+        }
+        let operation = self
+            .installed
+            .package
+            .manifest
+            .operations
+            .iter()
+            .find(|op| op.name == operation)
+            .ok_or_else(|| error(ErrorCode::NotFound))?;
+        validate_input(operation, &input)?;
+        let active = self
+            .activations
+            .lock()
+            .unwrap()
+            .get(guild)
+            .cloned()
+            .ok_or_else(unavailable)?;
+        let mut capabilities: BTreeSet<String> = operation.capabilities.iter().cloned().collect();
+        if !capabilities.is_subset(&active.grants) {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        let mut authority = Authority {
+            guild: guild.clone(),
+            epoch: active.epoch,
+            actor,
+            capabilities: BTreeSet::new(),
+            deadline: Instant::now() + Duration::from_millis(operation.timeout_ms),
+            depth: 0,
+            cancel: CancellationToken::new(),
+        };
+        if let Some(parent) = parent {
+            if &parent.guild != guild {
+                return Err(error(ErrorCode::ForbiddenScope));
+            }
+            if parent.depth >= 8 {
+                return Err(error(ErrorCode::QuotaExceeded));
+            }
+            if !capabilities.is_subset(&parent.capabilities) {
+                return Err(error(ErrorCode::ForbiddenPermission));
+            }
+            capabilities = capabilities
+                .intersection(&parent.capabilities)
+                .cloned()
+                .collect();
+            authority.deadline = authority.deadline.min(parent.deadline);
+            authority.depth = parent.depth + 1;
+            authority.cancel = parent.cancel.child_token();
+            authority.actor = parent.actor;
+        }
+        authority.capabilities = capabilities;
+        let lease = self.gate.admit(authority)?;
+        let result=self.process().call_with_cancel("operation.invoke",json!({"invocation":lease.handle,"session":self.session,"generation":self.number,"guild":guild,"epoch":active.epoch,"operation":operation.name,"input":input}),lease.authority.deadline.saturating_duration_since(Instant::now()),lease.authority.cancel.clone()).await.map_err(runtime_error)?;
+        self.gate.authority(&lease.handle)?;
+        validate_output(operation, &result)?;
+        Ok(result)
+    }
+    /// Quiescing closes new admission while existing callbacks retain their leases.
+    pub async fn quiesce(&self, guild: Option<&GuildId>, grace: Duration) -> Result<bool> {
+        let mut cleanup = QuiesceGuard {
+            generation: self,
+            armed: true,
+        };
+        self.gate.close(guild);
+        let drained = self.gate.drain(guild, grace).await;
+        self.gate.fence(guild);
+        if !drained {
+            return Ok(false);
+        }
+        let result = match guild {
+            Some(guild) => {
+                let Some(active) = self.activations.lock().unwrap().get(guild).cloned() else {
+                    cleanup.armed = false;
+                    return Ok(true);
+                };
+                self.process()
+                    .call(
+                        "deactivate",
+                        json!({"guild":guild,"epoch":active.epoch}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .map(|value| value == json!({"deactivated":true}))
+            }
+            None => self
+                .process()
+                .call("quiesce", json!({"guild":null}), Duration::from_secs(5))
+                .await
+                .map(|value| value == json!({"quiesced":true})),
+        };
+        let mut activations = self.activations.lock().unwrap();
+        match guild {
+            Some(guild) => {
+                activations.remove(guild);
+            }
+            None => activations.clear(),
+        }
+        let success = result.unwrap_or(false);
+        cleanup.armed = !success;
+        Ok(success)
+    }
+    pub async fn health(&self) -> Result<Value> {
+        let mut health = self
+            .process()
+            .call("health", json!({}), Duration::from_secs(2))
+            .await
+            .map_err(runtime_error)?;
+        let object = health.as_object_mut().ok_or_else(unavailable)?;
+        object.insert("host".into(), json!({"pid":self.process().pid(),"generation":self.number,"session":self.session,"in_flight":self.gate.in_flight()}));
+        Ok(health)
+    }
+    pub async fn force_stop(&self) -> Result<StopReport> {
+        self.gate.fence(None);
+        self.process().force_stop().await.map_err(runtime_error)
+    }
+    pub async fn stop(&self, grace: Duration) -> Result<StopReport> {
+        self.gate.fence(None);
+        self.process().stop(grace).await.map_err(runtime_error)
+    }
+    fn collection(&self, name: &str) -> Result<&Value> {
+        self.installed
+            .package
+            .manifest
+            .collections
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.schema)
+            .ok_or_else(|| error(ErrorCode::ForbiddenPermission))
+    }
+    fn storage_authority(&self, handle: &str) -> Result<Authority> {
+        let authority = self.gate.authority(handle)?;
+        if !authority.capabilities.contains("storage.own") {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        Ok(authority)
+    }
+    async fn bounded<T>(
+        &self,
+        handle: &str,
+        authority: &Authority,
+        cancel: &CancellationToken,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        // Re-check after all validation and immediately before polling host dispatch.
+        self.gate.authority(handle)?;
+        tokio::select! {biased;
+            _=authority.cancel.cancelled()=>Err(error(ErrorCode::Cancelled)),
+            _=cancel.cancelled()=>Err(error(ErrorCode::Cancelled)),
+            _=tokio::time::sleep_until(authority.deadline)=>Err(unavailable()),
+            result=future=>result,
+        }
+    }
+    async fn callback(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value> {
+        if !self.normal {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        match method {
+            "host.echo" => {
+                let request: Echo = decode(params)?;
+                let authority = self.gate.authority(&request.invocation)?;
+                if !authority.capabilities.contains("host.echo") {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                if request.purpose.is_empty()
+                    || request.purpose.len() > 128
+                    || request.purpose.chars().any(char::is_control)
+                {
+                    return Err(error(ErrorCode::InvalidInput));
+                }
+                self.router
+                    .echo(
+                        &self.installed.package.manifest.id,
+                        request.purpose,
+                        request.body,
+                        authority,
+                        crate::DispatchPermit::new(self.gate.clone(), request.invocation),
+                        cancel,
+                    )
+                    .await
+            }
+            "host.document_get" => {
+                let request: Get = decode(params)?;
+                let authority = self.storage_authority(&request.invocation)?;
+                self.collection(&request.collection)?;
+                valid_key(&request.key)?;
+                let result = self
+                    .bounded(
+                        &request.invocation,
+                        &authority,
+                        &cancel,
+                        self.repository.document_get(
+                            &self.installed.package.manifest.id,
+                            &authority.guild,
+                            &request.collection,
+                            &request.key,
+                        ),
+                    )
+                    .await?;
+                if let Some(document) = &result {
+                    schema_validator(self.collection(&request.collection)?)?
+                        .validate(&document.value)
+                        .map_err(|_| error(ErrorCode::SchemaInvalid))?;
+                }
+                encode(result)
+            }
+            "host.document_batch" => {
+                let request: Batch = decode(params)?;
+                let authority = self.storage_authority(&request.invocation)?;
+                if request.writes.is_empty()
+                    || request.writes.len() > 100
+                    || serde_json::to_vec(&request.writes)
+                        .map_err(|_| error(ErrorCode::InvalidInput))?
+                        .len()
+                        > 512 * 1024
+                {
+                    return Err(error(ErrorCode::QuotaExceeded));
+                }
+                let mut keys = BTreeSet::new();
+                for write in &request.writes {
+                    valid_key(&write.key)?;
+                    let schema = self.collection(&write.collection)?;
+                    if !keys.insert((&write.collection, &write.key))
+                        || write.expected_revision == Some(0)
+                        || (write.value.is_none() && write.expected_revision.is_none())
+                    {
+                        return Err(error(ErrorCode::InvalidInput));
+                    }
+                    if let Some(value) = &write.value {
+                        if serde_json::to_vec(value)
+                            .map_err(|_| error(ErrorCode::InvalidInput))?
+                            .len()
+                            > 64 * 1024
+                        {
+                            return Err(error(ErrorCode::QuotaExceeded));
+                        }
+                        schema_validator(schema)?
+                            .validate(value)
+                            .map_err(|_| error(ErrorCode::SchemaInvalid))?;
+                    }
+                }
+                let result = self
+                    .bounded(
+                        &request.invocation,
+                        &authority,
+                        &cancel,
+                        self.repository.document_batch(
+                            &self.installed.package.manifest.id,
+                            &authority.guild,
+                            self.installed.package.manifest.data_version,
+                            &request.writes,
+                        ),
+                    )
+                    .await?;
+                encode(result)
+            }
+            "host.contract_invoke" => {
+                let request: Contract = decode(params)?;
+                let authority = self.gate.authority(&request.invocation)?;
+                if !authority.capabilities.contains("contracts.invoke") {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                if !self
+                    .installed
+                    .package
+                    .manifest
+                    .consumes
+                    .iter()
+                    .any(|c| c.name == request.contract)
+                {
+                    return Err(error(ErrorCode::DependencyUnavailable));
+                }
+                let active = self
+                    .activations
+                    .lock()
+                    .unwrap()
+                    .get(&authority.guild)
+                    .cloned()
+                    .filter(|a| a.epoch == authority.epoch)
+                    .ok_or_else(unavailable)?;
+                let provider = active
+                    .bindings
+                    .get(&request.contract)
+                    .ok_or_else(|| error(ErrorCode::DependencyUnavailable))?;
+                self.bounded(
+                    &request.invocation,
+                    &authority,
+                    &cancel,
+                    self.router.invoke(
+                        provider,
+                        &request.contract,
+                        request.input,
+                        authority.clone(),
+                    ),
+                )
+                .await
+            }
+            _ => Err(error(ErrorCode::ForbiddenPermission)),
+        }
+    }
+}
+fn valid_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 128 || key.contains('\0') {
+        Err(error(ErrorCode::InvalidInput))
+    } else {
+        Ok(())
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Get {
+    invocation: String,
+    collection: String,
+    key: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Batch {
+    invocation: String,
+    writes: Vec<DocumentWrite>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Contract {
+    invocation: String,
+    contract: String,
+    input: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Echo {
+    invocation: String,
+    purpose: String,
+    body: Value,
+}
+struct Callbacks(Weak<Generation>);
+#[async_trait]
+impl RpcHandler for Callbacks {
+    async fn handle(
+        &self,
+        _peer: RpcPeer,
+        method: String,
+        params: Value,
+        cancel: CancellationToken,
+    ) -> std::result::Result<Value, RpcError> {
+        let generation = self.0.upgrade().ok_or(RpcError::Closed)?;
+        generation
+            .callback(&method, params, cancel)
+            .await
+            .map_err(|error| RpcError::Remote(format!("{:?}", error.code)))
+    }
+}

@@ -1,0 +1,46 @@
+{
+  "manifest_version": 1,
+  "id": "fixture.authority-probe",
+  "version": "1.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "protocol_major": 1,
+  "protocol_minor_min": 0,
+  "host_api": "^1.0",
+  "data_version": 1,
+  "readable_data_versions": [
+    1
+  ],
+  "capabilities": [
+    "storage.own",
+    "host.echo"
+  ],
+  "required_intents": [],
+  "provides": [],
+  "consumes": [],
+  "operations": [
+    {
+      "name": "probe",
+      "description": "Test-only raw authority callback probe.",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 5000,
+      "capabilities": [
+        "storage.own",
+        "host.echo"
+      ]
+    }
+  ],
+  "collections": [
+    {
+      "name": "probes",
+      "schema": {
+        "type": "object"
+      }
+    }
+  ],
+  "migrations": []
+}

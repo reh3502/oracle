@@ -1,0 +1,223 @@
+{
+  "manifest_version": 1,
+  "id": "fixture.counter",
+  "version": "2.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "protocol_major": 1,
+  "protocol_minor_min": 0,
+  "host_api": "^1.0",
+  "data_version": 2,
+  "readable_data_versions": [
+    2
+  ],
+  "capabilities": [
+    "storage.own",
+    "host.echo"
+  ],
+  "required_intents": [],
+  "provides": [
+    {
+      "name": "counter/v1",
+      "version": "1.0.0",
+      "operation": "get"
+    }
+  ],
+  "consumes": [],
+  "operations": [
+    {
+      "name": "get",
+      "description": "Read the guild counter.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "epoch": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "value",
+          "generation",
+          "epoch"
+        ],
+        "additionalProperties": false
+      },
+      "timeout_ms": 5000,
+      "capabilities": [
+        "storage.own"
+      ]
+    },
+    {
+      "name": "increment",
+      "description": "Increment the guild counter using document CAS.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "epoch": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "value",
+          "generation",
+          "epoch"
+        ],
+        "additionalProperties": false
+      },
+      "timeout_ms": 5000,
+      "capabilities": [
+        "storage.own"
+      ]
+    },
+    {
+      "name": "wait",
+      "description": "Wait for invocation cancellation.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "timeout_ms": 30000,
+      "capabilities": []
+    },
+    {
+      "name": "uncooperative",
+      "description": "Test-only native task that requires forced process cleanup.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "timeout_ms": 30000,
+      "capabilities": []
+    },
+    {
+      "name": "count_to_total",
+      "description": "Migration-only transform from count to total with host-owned commits.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "integer",
+            "const": 1
+          },
+          "to": {
+            "type": "integer",
+            "const": 2
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "documents"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "timeout_ms": 5000,
+      "capabilities": []
+    },
+    {
+      "name": "echo",
+      "description": "Request a journaled host diagnostic echo.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "purpose": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "body": true
+        },
+        "required": [
+          "purpose",
+          "body"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": true,
+      "timeout_ms": 5000,
+      "capabilities": [
+        "host.echo"
+      ]
+    }
+  ],
+  "collections": [
+    {
+      "name": "counters",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "total"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "migrations": [
+    {
+      "from": 1,
+      "to": 2,
+      "operation": "count_to_total"
+    }
+  ]
+}
