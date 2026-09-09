@@ -258,15 +258,9 @@ fn native_pg(program: &Path, connection: &str) -> Result<tokio::process::Command
     Ok(command)
 }
 
-macro_rules! rows {($store:expr,$ty:ty,$sql:expr $(,$bind:expr)* $(,)?)=>{{match &$store.inner.backend{Backend::Sqlite{pool,..}=>sqlx::query_as::<_,$ty>($sql)$(.bind($bind))*.fetch_all(pool).await.map_err(db)?,Backend::Postgres{pool,..}=>sqlx::query_as::<_,$ty>($sql)$(.bind($bind))*.fetch_all(pool).await.map_err(db)?}}};}
-macro_rules! write_tx {($store:expr,$tx:ident,$body:block)=>{{
- let _barrier=$store.inner.barrier.read().await;$store.ensure_open()?;
- let _writer=match &$store.inner.writer{Some(lock)=>Some(lock.lock().await),None=>None};
- match &$store.inner.backend{
- Backend::Sqlite{pool,..}=>{let mut $tx=pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;let result:Result<_>=async $body.await;match result{Ok(value)=>{$tx.commit().await.map_err(db)?;Ok(value)},Err(e)=>{$tx.rollback().await.map_err(db)?;Err(e)}}},
- Backend::Postgres{lease,..}=>{let mut owner=lease.lock().await;let conn=owner.as_mut().ok_or_else(||err(ErrorCode::StorageUnavailable))?;pg_health(&$store.inner,conn).await?;let mut $tx=conn.begin().await.map_err(db)?;let result:Result<_>=async $body.await;match result{Ok(value)=>{$tx.commit().await.map_err(db)?;Ok(value)},Err(e)=>{$tx.rollback().await.map_err(db)?;Err(e)}}}
- }
-}};}
+#[macro_use]
+mod transactions;
+
 impl Storage {
     pub async fn open(config: DatabaseConfig) -> Result<Self> {
         Self::open_internal(config, None).await

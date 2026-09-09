@@ -1,4 +1,5 @@
 use crate::*;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -164,7 +165,11 @@ impl CoreService {
         if purpose.is_empty() || purpose.len() > 160 || purpose.chars().any(char::is_control) {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
-        let _admission = tokio::select! { biased; _ = cancel.cancelled() => return Err(Error::new(ErrorCode::Cancelled)), guard = self.mutation.lock() => guard };
+        let _admission = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::new(ErrorCode::Cancelled)),
+            guard = self.mutation.lock() => guard,
+        };
         if cancel.is_cancelled() {
             return Err(Error::new(ErrorCode::Cancelled));
         }
@@ -217,7 +222,11 @@ impl CoreService {
             .repository
             .transition_effect(guild, &effect.id, effect.revision, EffectState::Sent, None)
             .await?;
-        let outcome = tokio::select! { biased; _ = cancel.cancelled() => Err(Error::new(ErrorCode::Cancelled)), result = adapter.apply(&sent) => result };
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+            result = adapter.apply(&sent) => result,
+        };
         match outcome {
             Ok(receipt) => {
                 let verified = self

@@ -59,17 +59,69 @@ fn doc((collection, key, value, revision): DocRow) -> Result<ModuleDocument> {
         revision: u64::try_from(revision).map_err(integrity)?,
     })
 }
-macro_rules! apply_writes {($tx:ident,$module:expr,$guild:expr,$version:expr,$writes:expr)=>{{
- let mut result=Vec::new();for write in $writes {
-  let count=match (&write.value,write.expected_revision){
-   (Some(value),None)=>sqlx::query("INSERT INTO oracle_module_documents(module,guild,collection,key,value,revision,data_version) VALUES($1,$2,$3,$4,$5,1,$6) ON CONFLICT DO NOTHING").bind($module.as_str()).bind($guild.as_str()).bind(&write.collection).bind(&write.key).bind(serde_json::to_string(value).map_err(integrity)?).bind(i64::from($version)).execute(&mut *$tx).await.map_err(db)?.rows_affected(),
-   (Some(value),Some(expected))=>sqlx::query("UPDATE oracle_module_documents SET value=$5,revision=revision+1,data_version=$6 WHERE module=$1 AND guild=$2 AND collection=$3 AND key=$4 AND revision=$7").bind($module.as_str()).bind($guild.as_str()).bind(&write.collection).bind(&write.key).bind(serde_json::to_string(value).map_err(integrity)?).bind(i64::from($version)).bind(revision(expected)?).execute(&mut *$tx).await.map_err(db)?.rows_affected(),
-   (None,Some(expected))=>sqlx::query("DELETE FROM oracle_module_documents WHERE module=$1 AND guild=$2 AND collection=$3 AND key=$4 AND revision=$5").bind($module.as_str()).bind($guild.as_str()).bind(&write.collection).bind(&write.key).bind(revision(expected)?).execute(&mut *$tx).await.map_err(db)?.rows_affected(),
-   _=>return Err(err(ErrorCode::InvalidInput))
-  };if count!=1{return Err(err(ErrorCode::Conflict))}
-  if write.value.is_some(){let row:DocRow=sqlx::query_as("SELECT collection,key,value,revision FROM oracle_module_documents WHERE module=$1 AND guild=$2 AND collection=$3 AND key=$4").bind($module.as_str()).bind($guild.as_str()).bind(&write.collection).bind(&write.key).fetch_one(&mut *$tx).await.map_err(db)?;result.push(doc(row)?);}
- }if serde_json::to_vec(&result).map_err(integrity)?.len()>MAX_PAGE{return Err(err(ErrorCode::InvalidInput))}result
-}};}
+// The same scoped CAS writes serve normal batches and migration checkpoints.
+// Expand against the concrete transaction selected by write_tx!.
+macro_rules! apply_writes {
+    ($tx:ident, $module:expr, $guild:expr, $version:expr, $writes:expr) => {{
+        let mut result = Vec::new();
+        for write in $writes {
+            let count = match (&write.value, write.expected_revision) {
+                (Some(value), None) => sqlx::query("INSERT INTO oracle_module_documents(module,guild,collection,key,value,revision,data_version) VALUES($1,$2,$3,$4,$5,1,$6) ON CONFLICT DO NOTHING")
+                    .bind($module.as_str())
+                    .bind($guild.as_str())
+                    .bind(&write.collection)
+                    .bind(&write.key)
+                    .bind(serde_json::to_string(value).map_err(integrity)?)
+                    .bind(i64::from($version))
+                    .execute(&mut *$tx)
+                    .await
+                    .map_err(db)?
+                    .rows_affected(),
+                (Some(value), Some(expected)) => sqlx::query("UPDATE oracle_module_documents SET value=$5,revision=revision+1,data_version=$6 WHERE module=$1 AND guild=$2 AND collection=$3 AND key=$4 AND revision=$7")
+                    .bind($module.as_str())
+                    .bind($guild.as_str())
+                    .bind(&write.collection)
+                    .bind(&write.key)
+                    .bind(serde_json::to_string(value).map_err(integrity)?)
+                    .bind(i64::from($version))
+                    .bind(revision(expected)?)
+                    .execute(&mut *$tx)
+                    .await
+                    .map_err(db)?
+                    .rows_affected(),
+                (None, Some(expected)) => sqlx::query("DELETE FROM oracle_module_documents WHERE module=$1 AND guild=$2 AND collection=$3 AND key=$4 AND revision=$5")
+                    .bind($module.as_str())
+                    .bind($guild.as_str())
+                    .bind(&write.collection)
+                    .bind(&write.key)
+                    .bind(revision(expected)?)
+                    .execute(&mut *$tx)
+                    .await
+                    .map_err(db)?
+                    .rows_affected(),
+                _ => return Err(err(ErrorCode::InvalidInput)),
+            };
+            if count != 1 {
+                return Err(err(ErrorCode::Conflict));
+            }
+            if write.value.is_some() {
+                let row: DocRow = sqlx::query_as("SELECT collection,key,value,revision FROM oracle_module_documents WHERE module=$1 AND guild=$2 AND collection=$3 AND key=$4")
+                    .bind($module.as_str())
+                    .bind($guild.as_str())
+                    .bind(&write.collection)
+                    .bind(&write.key)
+                    .fetch_one(&mut *$tx)
+                    .await
+                    .map_err(db)?;
+                result.push(doc(row)?);
+            }
+        }
+        if serde_json::to_vec(&result).map_err(integrity)?.len() > MAX_PAGE {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+        result
+    }};
+}
 #[async_trait]
 impl ModuleRepository for Storage {
     async fn installations(&self) -> Result<Vec<InstalledModule>> {
