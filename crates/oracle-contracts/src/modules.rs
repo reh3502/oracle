@@ -29,6 +29,8 @@ pub struct ModuleManifest {
     pub collections: Vec<ModuleCollection>,
     #[serde(default)]
     pub migrations: Vec<ModuleMigration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<ModuleConfiguration>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -126,4 +128,20 @@ pub struct MigrationProgress {
 pub struct MigrationPage {
     pub documents: Vec<ModuleDocument>,
     pub next_cursor: Option<String>,
+}
+
+/// Presets are versioned partial objects merged over current values. The resulting
+/// complete object must satisfy the module schema and host policy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleConfiguration {
+    pub schema_version: u32,
+    pub schema: Value,
+    pub presets: BTreeMap<String, Value>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveConfiguration {
+    pub revision: u64,
+    pub values: Value,
 }

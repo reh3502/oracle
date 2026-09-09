@@ -2,7 +2,9 @@
 //! stdout is reserved for framed RPC. Use tracked scopes for background work.
 #![forbid(unsafe_code)]
 use async_trait::async_trait;
-use oracle_contracts::{DocumentWrite, GuildId, ModuleDocument, ModuleManifest};
+use oracle_contracts::{
+    DocumentWrite, EffectiveConfiguration, GuildId, ModuleDocument, ModuleManifest,
+};
 pub use oracle_rpc::RpcError;
 use oracle_rpc::{RpcHandler, RpcPeer};
 pub use oracle_task_scope::{HostTasks, SpawnError, TaskError, TaskId, TaskStats};
@@ -160,6 +162,32 @@ pub trait Module: Send + Sync + 'static {
         Ok(())
     }
     async fn invoke(&self, context: CallContext, operation: &str, input: Value) -> Result<Value>;
+    /// Pure validation/preparation. No ordinary host-call authority is supplied.
+    async fn prepare_configuration(
+        &self,
+        _context: GuildContext,
+        _revision: u64,
+        _values: Value,
+    ) -> Result<()> {
+        Err(denied())
+    }
+    /// Apply only the exact revision and values previously prepared by the host.
+    async fn apply_configuration(
+        &self,
+        _context: GuildContext,
+        _revision: u64,
+        _values: Value,
+    ) -> Result<()> {
+        Err(denied())
+    }
+    /// Independent observation, not a copy of the host's desired-state record.
+    async fn effective_configuration(
+        &self,
+        _context: GuildContext,
+    ) -> Result<Option<EffectiveConfiguration>> {
+        Err(denied())
+    }
+
     /// Pure transform only: no CallContext exists in migration mode.
     async fn migrate(
         &self,
@@ -219,6 +247,16 @@ struct Migration {
 struct Quiesce {
     guild: Option<GuildId>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigurationRequest {
+    session: String,
+    generation: u64,
+    guild: GuildId,
+    epoch: u64,
+    revision: u64,
+    values: Value,
+}
 struct GuildState {
     context: GuildContext,
     active: bool,
@@ -229,6 +267,7 @@ struct State {
     mode: Option<Mode>,
     stopping: bool,
     guilds: BTreeMap<GuildId, GuildState>,
+    prepared: BTreeMap<GuildId, (u64, u64, Value)>,
 }
 struct Driver<M: Module> {
     module: Arc<M>,
@@ -317,6 +356,53 @@ impl<M: Module> RpcHandler for Driver<M> {
         }
         // Hooks serialize state changes, but never hold the state mutex over module code.
         let _control = self.control.lock().await;
+        if matches!(
+            method.as_str(),
+            "configuration.prepare" | "configuration.apply" | "configuration.effective"
+        ) {
+            let request: ConfigurationRequest = decode(params)?;
+            let context = {
+                let state = self.state.lock().unwrap();
+                if state.stopping
+                    || state.mode != Some(Mode::Normal)
+                    || state.hello.as_ref() != Some(&(request.session.clone(), request.generation))
+                    || self.module.manifest().configuration.is_none()
+                {
+                    return Err(denied());
+                }
+                state
+                    .guilds
+                    .get(&request.guild)
+                    .filter(|g| g.active && g.context.epoch == request.epoch)
+                    .ok_or_else(denied)?
+                    .context
+                    .clone()
+            };
+            return match method.as_str() {
+                "configuration.prepare" => {
+                    self.module
+                        .prepare_configuration(context, request.revision, request.values.clone())
+                        .await?;
+                    self.state.lock().unwrap().prepared.insert(
+                        request.guild,
+                        (request.epoch, request.revision, request.values),
+                    );
+                    Ok(Value::Null)
+                }
+                "configuration.apply" => {
+                    if self.state.lock().unwrap().prepared.get(&request.guild)
+                        != Some(&(request.epoch, request.revision, request.values.clone()))
+                    {
+                        return Err(denied());
+                    }
+                    self.module
+                        .apply_configuration(context, request.revision, request.values)
+                        .await?;
+                    Ok(Value::Null)
+                }
+                _ => encode(self.module.effective_configuration(context).await?),
+            };
+        }
         match method.as_str() {
             "hello" => {
                 let request: Hello = decode(params)?;

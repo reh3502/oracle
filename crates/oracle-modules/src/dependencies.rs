@@ -167,6 +167,7 @@ mod tests {
     use oracle_core::ProvidedContract;
     fn module(id: &str) -> ModuleManifest {
         ModuleManifest {
+            configuration: None,
             manifest_version: 1,
             id: ModuleId::new(id).unwrap(),
             version: "1.0.0".into(),

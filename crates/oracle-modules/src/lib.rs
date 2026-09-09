@@ -5,6 +5,9 @@ pub mod dependencies;
 mod generation;
 mod manager;
 pub mod package;
-pub use manager::ModuleManager;
+pub use manager::{
+    ConfigurationPlan, ConfigurationPolicy, ConfigurationReceipt, ConfigurationStatus,
+    ModuleManager,
+};
 mod effects;
 pub use effects::{DispatchPermit, EchoTransport, Observation, SendTransport};

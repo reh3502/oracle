@@ -347,6 +347,41 @@ impl Generation {
         cleanup.armed = !success;
         Ok(success)
     }
+    pub async fn configuration(
+        &self,
+        guild: &GuildId,
+        method: &str,
+        revision: u64,
+        values: Value,
+    ) -> Result<Value> {
+        let epoch = self
+            .activations
+            .lock()
+            .unwrap()
+            .get(guild)
+            .filter(|a| a.grants.contains("config.own") && self.gate.is_active(guild, a.epoch))
+            .ok_or_else(unavailable)?
+            .epoch;
+        if !self.normal || !self.process().is_alive() {
+            return Err(unavailable());
+        }
+        let result = self
+            .process()
+            .call(
+                method,
+                serde_json::json!({
+                    "session": self.session, "generation": self.number, "guild": guild,
+                    "epoch": epoch, "revision": revision, "values": values
+                }),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(runtime_error)?;
+        if !self.gate.is_active(guild, epoch) || !self.process().is_alive() {
+            return Err(unavailable());
+        }
+        Ok(result)
+    }
     pub async fn health(&self) -> Result<Value> {
         let mut health = self
             .process()

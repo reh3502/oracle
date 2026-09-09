@@ -19,10 +19,17 @@ use std::{
     time::Duration,
 };
 
+#[path = "configuration.rs"]
+mod configuration;
+pub use configuration::{
+    ConfigurationPlan, ConfigurationPolicy, ConfigurationReceipt, ConfigurationStatus,
+};
 mod recovery;
 mod upgrade;
 
 pub struct ModuleManager {
+    configuration_services: RwLock<Option<configuration::ConfigurationServices>>,
+    configuration_plans: std::sync::Mutex<BTreeMap<String, configuration::BoundPlan>>,
     repository: Arc<dyn ModuleRepository>,
     core: Arc<CoreService>,
     artifacts: ArtifactStore,
@@ -166,6 +173,8 @@ impl ModuleManager {
         transport: Arc<dyn crate::SendTransport>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
+            configuration_services: RwLock::new(None),
+            configuration_plans: std::sync::Mutex::new(BTreeMap::new()),
             effect_tasks: tasks::HostTasks::new(),
             effect_slots: Arc::new(tokio::sync::Semaphore::new(64)),
             transport,

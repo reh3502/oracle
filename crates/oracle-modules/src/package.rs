@@ -46,7 +46,10 @@ fn unique<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     values.all(|value| set.insert(value))
 }
 fn allowed_capability(value: &str) -> bool {
-    matches!(value, "storage.own" | "contracts.invoke" | "host.echo")
+    matches!(
+        value,
+        "storage.own" | "contracts.invoke" | "host.echo" | "config.own"
+    )
 }
 
 /// Reject every external reference before passing a schema to the offline-only validator.
@@ -166,6 +169,26 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         || !unique(manifest.consumes.iter().map(|v| v.name.as_str()))
     {
         return Err(err(ErrorCode::InvalidInput));
+    }
+    if let Some(configuration) = &manifest.configuration {
+        if configuration.schema_version == 0
+            || configuration.presets.len() > 32
+            || !manifest.capabilities.iter().any(|c| c == "config.own")
+        {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+        schema_validator(&configuration.schema)?;
+        for (preset, values) in &configuration.presets {
+            if !name(preset)
+                || !values.is_object()
+                || serde_json::to_vec(values)
+                    .map_err(|_| err(ErrorCode::InvalidInput))?
+                    .len()
+                    > 65536
+            {
+                return Err(err(ErrorCode::InvalidInput));
+            }
+        }
     }
     for operation in &manifest.operations {
         if !name(&operation.name)
