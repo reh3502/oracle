@@ -276,11 +276,11 @@ async fn malformed_member_or_command_and_failed_ack_never_reach_repository() {
 }
 
 #[test]
-fn descriptor_has_only_status_and_scoped_pause_resume() {
+fn descriptor_has_bootstrap_controls_and_scoped_operation_groups() {
     let definition = serde_json::to_value(oracle_command()).unwrap();
     assert_eq!(definition["name"], "oracle");
     assert_eq!(definition["default_member_permissions"], "32");
-    assert_eq!(definition["options"].as_array().unwrap().len(), 2);
+    assert_eq!(definition["options"].as_array().unwrap().len(), 4);
     assert_eq!(
         definition["options"][1]["options"][0]["choices"],
         json!([{"name":"pause","value":"pause"},{"name":"resume","value":"resume"}])
@@ -334,9 +334,343 @@ fn published_command_matches_discord_omitted_empty_localizations() {
                     {"name":"resume","value":"resume"}]}]}
         ]
     });
+    let groups = interaction_ops::descriptors()
+        .into_iter()
+        .map(|g| serde_json::to_value(g).unwrap());
+    payload["options"].as_array_mut().unwrap().extend(groups);
+    fn omit_localizations(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("name_localizations");
+                map.remove("description_localizations");
+                for value in map.values_mut() {
+                    omit_localizations(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    omit_localizations(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    omit_localizations(&mut payload);
     let command: discord::Command = serde_json::from_value(payload.clone()).unwrap();
     assert!(command_matches(&command));
     payload["default_member_permissions"] = json!("0");
     let changed: discord::Command = serde_json::from_value(payload).unwrap();
     assert!(!command_matches(&changed));
+}
+
+#[derive(Default)]
+struct OperationsCapture {
+    requests: Mutex<
+        Vec<(
+            PolicyContext,
+            GuildId,
+            oracle_operations::ingress::OperationRequest,
+        )>,
+    >,
+    token: Mutex<Option<CancellationToken>>,
+    events: Arc<Mutex<Vec<String>>>,
+    block: bool,
+    result: Value,
+}
+#[async_trait]
+impl oracle_operations::ingress::HumanOperations for OperationsCapture {
+    async fn execute(
+        &self,
+        context: &PolicyContext,
+        guild: &GuildId,
+        request: oracle_operations::ingress::OperationRequest,
+        cancel: &CancellationToken,
+    ) -> core::Result<Value> {
+        assert_eq!(
+            self.events.lock().unwrap().first().map(String::as_str),
+            Some("defer")
+        );
+        self.requests
+            .lock()
+            .unwrap()
+            .push((context.clone(), guild.clone(), request));
+        *self.token.lock().unwrap() = Some(cancel.clone());
+        if self.block {
+            cancel.cancelled().await;
+            return Err(core::Error::new(ErrorCode::Cancelled));
+        }
+        Ok(self.result.clone())
+    }
+}
+struct ExactResponder {
+    events: Arc<Mutex<Vec<String>>>,
+    result: Mutex<Option<Value>>,
+    attachment: Mutex<Option<Vec<u8>>>,
+}
+#[async_trait]
+impl InteractionResponder for ExactResponder {
+    async fn defer_ephemeral(&self) -> Result<()> {
+        self.events.lock().unwrap().push("defer".into());
+        Ok(())
+    }
+    async fn complete(&self, message: &str) -> Result<()> {
+        self.events.lock().unwrap().push(message.into());
+        Ok(())
+    }
+    async fn reject_ephemeral(&self, message: &str) -> Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("reject:{message}"));
+        Ok(())
+    }
+    async fn complete_result(&self, value: &Value) -> Result<()> {
+        *self.result.lock().unwrap() = Some(value.clone());
+        match interaction_ops::render(value)? {
+            interaction_ops::ExactResponse::Text(text) => self.events.lock().unwrap().push(text),
+            interaction_ops::ExactResponse::Attachment { filename, bytes } => {
+                assert!(matches!(filename, "plan.json" | "result.json"));
+                *self.attachment.lock().unwrap() = Some(bytes);
+            }
+        }
+        Ok(())
+    }
+}
+fn operation_interaction(group: &str, command: &str, args: Value) -> discord::CommandInteraction {
+    let base = interaction("101", "303", "32", None);
+    let mut value = serde_json::to_value(base).unwrap();
+    value["data"]["options"] =
+        json!([{"name":group,"type":2,"options":[{"name":command,"type":1,"options":args}]}]);
+    // Deserialize the concrete Serenity command again, retaining authenticated member data.
+    serde_json::from_str(&value.to_string()).unwrap()
+}
+fn operations_setup(
+    result: Value,
+    block: bool,
+) -> (DiscordBootstrap, Arc<OperationsCapture>, ExactResponder) {
+    let (base, _) = setup();
+    let events = Arc::new(Mutex::new(vec![]));
+    let operations = Arc::new(OperationsCapture {
+        events: events.clone(),
+        result,
+        block,
+        ..Default::default()
+    });
+    let bootstrap = DiscordBootstrap::with_operations(base.core, operations.clone());
+    (
+        bootstrap,
+        operations,
+        ExactResponder {
+            events,
+            result: Mutex::new(None),
+            attachment: Mutex::new(None),
+        },
+    )
+}
+#[tokio::test]
+async fn operations_authenticated_route_defer_and_exact_large_plan() {
+    let expected = json!({"hash":"exact-plan-hash","steps":[{"description":"x".repeat(3000)}]});
+    let (bootstrap, operations, responder) = operations_setup(expected.clone(), false);
+    let interaction = operation_interaction(
+        "structure",
+        "approve",
+        json!([{"name":"plan","type":3,"value":"plan123"},{"name":"hash","type":3,"value":"exact-plan-hash"}]),
+    );
+    bootstrap
+        .handle_command(&interaction, &responder)
+        .await
+        .unwrap();
+    let requests = operations.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        matches!(&requests[0].0,PolicyContext::Discord{guild,user,manage_guild:true} if guild.as_str()=="101"&&user.as_str()=="303")
+    );
+    assert!(
+        matches!(&requests[0].2,oracle_operations::ingress::OperationRequest::Approve{plan,hash} if plan=="plan123"&&hash=="exact-plan-hash")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(responder.attachment.lock().unwrap().as_ref().unwrap())
+            .unwrap(),
+        expected
+    );
+}
+#[tokio::test]
+async fn operations_malformed_and_crossguild_never_execute() {
+    for malformed in 0..3 {
+        let (bootstrap, operations, responder) = operations_setup(json!({}), false);
+        let mut command = operation_interaction("structure", "inspect", json!([]));
+        match malformed {
+            0 => command.member.as_mut().unwrap().guild_id = discord::GuildId::new(999),
+            1 => command.guild_id = Some(discord::GuildId::new(999)),
+            _ => {
+                command = operation_interaction(
+                    "module-config",
+                    "plan",
+                    json!([{"name":"module","type":3,"value":"logger"},{"name":"values","type":3,"value":"not json"}]),
+                );
+            }
+        }
+        bootstrap
+            .handle_command(&command, &responder)
+            .await
+            .unwrap();
+        assert!(operations.requests.lock().unwrap().is_empty());
+        assert!(responder.events.lock().unwrap()[0].starts_with("reject:"));
+    }
+}
+#[tokio::test]
+async fn operations_timeout_cancels_authority() {
+    let (bootstrap, operations, responder) = operations_setup(json!({}), true);
+    bootstrap
+        .handle_operation(
+            &operation_interaction("structure", "inspect", json!([])),
+            &responder,
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
+    assert!(
+        operations
+            .token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_cancelled()
+    );
+    assert!(
+        responder
+            .events
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("timed out")
+    );
+}
+#[test]
+fn operations_descriptor_and_config_parser() {
+    let descriptor = serde_json::to_value(oracle_command()).unwrap();
+    let groups = descriptor["options"].as_array().unwrap();
+    assert!(groups.iter().any(|v| v["name"] == "structure"));
+    assert!(groups.iter().any(|v| v["name"] == "module-config"));
+    let command = operation_interaction(
+        "module-config",
+        "plan",
+        json!([{"name":"module","type":3,"value":"community.activity-log"},{"name":"preset","type":3,"value":"moderate/v1"},{"name":"values","type":3,"value":"{\"destination\":\"123\"}"}]),
+    );
+    assert!(
+        matches!(interaction_ops::parse(&command).unwrap().2,oracle_operations::ingress::OperationRequest::ConfigurationPlan{module,preset:Some(preset),values} if module.as_str()=="community.activity-log"&&preset=="moderate/v1"&&values==json!({"destination":"123"}))
+    );
+}
+
+#[tokio::test]
+async fn operations_configured_scope_blocks_other_authenticated_guild() {
+    let (bootstrap, operations, responder) = operations_setup(json!({}), false);
+    let mut command = operation_interaction("structure", "inspect", json!([]));
+    command.guild_id = Some(discord::GuildId::new(999));
+    command.member.as_mut().unwrap().guild_id = discord::GuildId::new(999);
+    bootstrap
+        .handle_command(&command, &responder)
+        .await
+        .unwrap();
+    assert!(operations.requests.lock().unwrap().is_empty());
+    let events = responder.events.lock().unwrap();
+    assert_eq!(events[0], "defer");
+    assert!(events[1].contains("ForbiddenScope"));
+}
+
+struct NoNotification;
+#[async_trait]
+impl oracle_modules::NotificationTransport for NoNotification {
+    async fn send(
+        &self,
+        _: &oracle_modules::NotificationRequest,
+        _: &oracle_modules::DispatchPermit,
+        _: &dyn oracle_modules::NotificationCheck,
+        _: CancellationToken,
+    ) -> core::Result<Value> {
+        Err(core::Error::new(ErrorCode::InvalidInput))
+    }
+}
+#[tokio::test]
+async fn gateway_coverage_is_unavailable_until_ready_and_clears_on_disconnect_and_shutdown() {
+    let root = std::env::temp_dir().join(format!(
+        "oracle-gateway-test-{}",
+        core::OperationId::generate()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let storage = Arc::new(
+        oracle_storage::Storage::open(oracle_storage::DatabaseConfig::Sqlite {
+            path: root.join("db"),
+        })
+        .await
+        .unwrap(),
+    );
+    let (base, _) = setup();
+    let modules = oracle_modules::ModuleManager::new(
+        storage.clone(),
+        base.core.clone(),
+        root.join("modules"),
+    )
+    .unwrap();
+    modules
+        .set_event_services(
+            ["guilds".into()].into_iter().collect(),
+            Arc::new(NoNotification),
+        )
+        .unwrap();
+    let names = [
+        "guilds".into(),
+        "guild_members".into(),
+        "guild_moderation".into(),
+    ]
+    .into_iter()
+    .collect();
+    let bootstrap = Arc::new(
+        DiscordBootstrap::with_runtime(
+            base.core,
+            Arc::new(OperationsCapture::default()),
+            modules.clone(),
+            names,
+        )
+        .unwrap(),
+    );
+    assert!(modules.event_intents().is_empty());
+    assert_eq!(bootstrap.event_coverage()["connected"], false);
+    let raw = json!({"op":0,"s":1,"t":"READY","d":{"v":10,"user":{"id":"505","username":"oracle","discriminator":"0","avatar":null,"bot":true},"guilds":[],"session_id":"fixture-session","resume_gateway_url":"wss://gateway.discord.gg","application":{"id":"505","flags":0}}});
+    let discord::GatewayEvent::Dispatch { event, .. } =
+        serde_json::from_str::<discord::GatewayEvent>(&raw.to_string()).unwrap()
+    else {
+        panic!("ready");
+    };
+    let ready =
+        discord::FullEvent::from_event(event.into_event(), &mut None, &discord::Cache::default());
+    bootstrap.observe_connection(&ready);
+    assert_eq!(modules.event_intents().len(), 3);
+    assert_eq!(bootstrap.event_coverage()["connected"], true);
+    let stage: discord::ShardStageUpdateEvent =
+        serde_json::from_str(r#"{"new":"Disconnected","old":"Connected","shard_id":0}"#).unwrap();
+    // The public FullEvent is non-exhaustive; use the typed Event conversion.
+    let disconnected = discord::FullEvent::from_event(
+        Box::new(discord::Event::ShardStageUpdate(stage)),
+        &mut None,
+        &discord::Cache::default(),
+    );
+    bootstrap.observe_connection(&disconnected);
+    assert!(modules.event_intents().is_empty());
+    bootstrap.observe_connection(&ready);
+    assert_eq!(modules.event_intents().len(), 3);
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    bootstrap
+        .clone()
+        .run_gateway("invented.never.sent".parse().unwrap(), cancelled)
+        .await
+        .unwrap();
+    assert!(modules.event_intents().is_empty());
+    assert_eq!(bootstrap.event_coverage()["connected"], false);
+    modules.shutdown().await.unwrap();
+    storage.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

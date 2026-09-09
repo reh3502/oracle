@@ -68,7 +68,7 @@ impl DiscordWriteClient {
         let mut authorization = HeaderValue::from_str(&format!("Bot {token}"))
             .map_err(|_| error(ErrorCode::InvalidInput))?;
         authorization.set_sensitive(true);
-        let provider = rustls::crypto::ring::default_provider();
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -656,5 +656,41 @@ mod tests {
             ErrorCode::QuotaExceeded
         );
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn external_module_fence_guards_actual_socket_writes() {
+        use oracle_operations::executor::DispatchFence;
+        struct Fence(Arc<std::sync::Mutex<bool>>);
+        impl DispatchFence for Fence {
+            fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+                let active = self.0.lock().unwrap();
+                if !*active {
+                    return Err(error(ErrorCode::ModuleUnavailable));
+                }
+                send()
+            }
+        }
+        let active = Arc::new(std::sync::Mutex::new(true));
+        let guard = SendGuard::with_fence(
+            CancellationToken::new(),
+            now() + 10,
+            Arc::new(Fence(active.clone())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut io = GuardedIo::new(stream, guard);
+        io.write_all(b"first").await.unwrap();
+        let mut first = [0; 5];
+        peer.read_exact(&mut first).await.unwrap();
+        *active.lock().unwrap() = false;
+        assert!(io.write_all(b"second").await.is_err());
+        drop(io);
+        let mut remainder = Vec::new();
+        peer.read_to_end(&mut remainder).await.unwrap();
+        assert_eq!(&first, b"first");
+        assert!(remainder.is_empty());
     }
 }

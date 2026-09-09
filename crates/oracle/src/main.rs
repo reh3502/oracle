@@ -1,5 +1,6 @@
 //! Host composition root. Feature modules enter only through runtime installation.
 #![forbid(unsafe_code)]
+mod cli_ops;
 mod config;
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -8,6 +9,7 @@ use oracle_core::{
     *,
 };
 use oracle_modules::ModuleManager;
+use oracle_operations::ingress::{HumanOperations, OperationRequest};
 use oracle_storage::{PgTools, Storage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,6 +34,9 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    Structure(cli_ops::StructureArgs),
+    #[command(name = "module-config")]
+    Configuration(cli_ops::ConfigurationArgs),
     /// Create a config and initialize/migrate an empty deployment. Never overwrites config.
     Init {
         #[arg(long)]
@@ -239,6 +244,10 @@ enum Action {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    Operation {
+        guild: GuildId,
+        request: OperationRequest,
+    },
     Module {
         request: ModuleRequest,
     },
@@ -271,6 +280,9 @@ fn present_result<'de, D: serde::Deserializer<'de>>(
     serde_json::Value::deserialize(deserializer).map(Some)
 }
 struct Host {
+    operations: std::sync::OnceLock<Arc<oracle_operations::executor::StructureExecutor>>,
+    command_sync: std::sync::OnceLock<Arc<oracle_operations::commands::CommandReconciler>>,
+    operation_tasks: HostTasks,
     storage: Arc<Storage>,
     core: Arc<CoreService>,
     modules: Arc<ModuleManager>,
@@ -325,6 +337,9 @@ impl Host {
             }
         };
         Ok(Self {
+            operations: std::sync::OnceLock::new(),
+            command_sync: std::sync::OnceLock::new(),
+            operation_tasks: HostTasks::new(),
             storage,
             core,
             modules,
@@ -333,12 +348,22 @@ impl Host {
         })
     }
     async fn close(&self) -> Result<()> {
+        self.operation_tasks.shutdown(Duration::from_secs(30)).await;
         let modules = self.modules.shutdown().await;
         let storage = self.storage.close().await;
         modules.and(storage)
     }
     async fn handle(&self, request: Request) -> Result<serde_json::Value> {
         match request {
+            Request::Operation { guild, request } => {
+                self.execute(
+                    &PolicyContext::LocalOperator,
+                    &guild,
+                    request,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            }
             Request::Module { request } => match request {
                 ModuleRequest::Install {
                     source,
@@ -429,11 +454,28 @@ impl Host {
                 }
                 ModuleRequest::Health {} => value(self.modules.health().await),
             },
-            Request::Status { guild } => value(
-                self.core
-                    .status(&PolicyContext::LocalOperator, guild.as_ref())
-                    .await?,
-            ),
+            Request::Status { guild } => {
+                let mut status = value(
+                    self.core
+                        .status(&PolicyContext::LocalOperator, guild.as_ref())
+                        .await?,
+                )?;
+                let events: Vec<_> = self
+                    .modules
+                    .event_health()
+                    .into_iter()
+                    .filter(|event| guild.as_ref().is_none_or(|id| id == &event.guild))
+                    .collect();
+                let object = status
+                    .as_object_mut()
+                    .ok_or_else(|| Error::new(ErrorCode::Integrity))?;
+                object.insert("module_events".into(), value(events)?);
+                object.insert(
+                    "available_event_intents".into(),
+                    value(self.modules.event_intents())?,
+                );
+                Ok(status)
+            }
             Request::Control {
                 guild,
                 paused,
@@ -531,6 +573,20 @@ async fn run(cli: Cli) -> Result<()> {
             output(restored.status(None).await?)
         }
         Command::PublishCommands => publish(&config).await,
+        Command::Structure(args) => {
+            let request = args.request()?;
+            let stream = UnixStream::connect(config.socket())
+                .await
+                .map_err(|_| Error::new(ErrorCode::ModuleUnavailable))?;
+            output(remote(stream, request).await?)
+        }
+        Command::Configuration(args) => {
+            let request = args.request()?;
+            let stream = UnixStream::connect(config.socket())
+                .await
+                .map_err(|_| Error::new(ErrorCode::ModuleUnavailable))?;
+            output(remote(stream, request).await?)
+        }
         Command::Module { command } => {
             let request = Request::Module {
                 request: command.request()?,
@@ -633,6 +689,36 @@ async fn serve(config: Config, tools: PgTools) -> Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
     let host = Arc::new(Host::open(&config, tools).await?);
+    if let Some(token) = &token {
+        let adapter = Arc::new(oracle_discord::operations::DiscordOperations::new(
+            token.clone(),
+            host.core.clone(),
+        )?);
+        host.operations
+            .set(Arc::new(
+                oracle_operations::executor::StructureExecutor::new(
+                    host.core.clone(),
+                    host.storage.clone(),
+                    adapter.clone(),
+                ),
+            ))
+            .map_err(|_| Error::new(ErrorCode::Conflict))?;
+        host.command_sync
+            .set(Arc::new(
+                oracle_operations::commands::CommandReconciler::new(
+                    host.storage.clone(),
+                    adapter.clone(),
+                ),
+            ))
+            .map_err(|_| Error::new(ErrorCode::Conflict))?;
+        host.modules
+            .set_configuration_services(host.storage.clone(), adapter.clone())?;
+        host.modules
+            .set_event_services(Default::default(), adapter)?;
+    } else {
+        host.modules
+            .set_configuration_services(host.storage.clone(), Arc::new(cli_ops::OfflinePolicy))?;
+    }
     let mut stopped = None;
     let result: Result<()> = async {
     let socket = config.socket();
@@ -676,10 +762,8 @@ async fn serve(config: Config, tools: PgTools) -> Result<()> {
                 }
             }
         }).map_err(|_| Error::new(ErrorCode::Cancelled))?;
-        let restored = host.modules.restore_desired().await?;
-        for (module, error) in &restored { tracing::warn!(module = %module, error = ?error, "module desired state was not restored"); }
         let gateway=if let Some(token)=token {
-            let gateway=Arc::new(oracle_discord::DiscordBootstrap::new(host.core.clone()));
+            let gateway=Arc::new(oracle_discord::DiscordBootstrap::with_runtime(host.core.clone(),host.clone(),host.modules.clone(),config.discord.as_ref().ok_or_else(|| Error::new(ErrorCode::InvalidInput))?.intents.iter().cloned().collect())?);
             let running=gateway.clone();let cancel=stop.clone();
             tasks.spawn("discord_gateway",async move {
                 let outcome=running.run_gateway(token,cancel.clone()).await;cancel.cancel();outcome.map_err(|_|TaskError)
@@ -692,6 +776,43 @@ async fn serve(config: Config, tools: PgTools) -> Result<()> {
             }
             Some(gateway)
         } else {None};
+        let restored = host.modules.restore_desired().await?;
+        for (module, error) in &restored { tracing::warn!(module = %module, error = ?error, "module desired state was not restored"); }
+        let maintenance_modules = host.modules.clone();
+        let maintenance_stop = stop.clone();
+        let maintenance_guilds: Vec<_> = config.guilds.iter().map(|p| p.guild.clone()).collect();
+        tasks.spawn("module_maintenance", async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Restoration finishes before the first maintenance event.
+            interval.tick().await;
+            loop {
+                tokio::select! { biased;
+                    _ = maintenance_stop.cancelled() => return Ok(()),
+                    _ = interval.tick() => {}
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| TaskError)?.as_millis() as u64;
+                for guild in &maintenance_guilds {
+                    let event = GuildEvent {
+                        id: format!("maintenance:{now}"),
+                        kind: GuildEventKind::Maintenance,
+                        occurred_at_ms: now,
+                        origin: GuildEventOrigin::Oracle,
+                        subject_id: None, actor_id: None, related_id: None,
+                    };
+                    tokio::select! { biased;
+                        _ = maintenance_stop.cancelled() => return Ok(()),
+                        result = maintenance_modules.deliver_event(guild, event) => {
+                            if let Err(error) = result {
+                                tracing::debug!(guild = %guild, error = ?error.code, "module maintenance unavailable");
+                            }
+                        }
+                    }
+                }
+            }
+        }).map_err(|_| Error::new(ErrorCode::Cancelled))?;
         output(serde_json::json!({"event":"ready","discord_connected":gateway.is_some(),"status":host.core.status(&PolicyContext::LocalOperator,None).await?}))?;
         let slots=Arc::new(tokio::sync::Semaphore::new(16));
         loop {

@@ -26,6 +26,11 @@ pub enum Database {
 #[serde(deny_unknown_fields)]
 pub struct Discord {
     pub token_env: String,
+    #[serde(default = "default_intents")]
+    pub intents: Vec<String>,
+}
+fn default_intents() -> Vec<String> {
+    vec!["guilds".into()]
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -55,6 +60,16 @@ impl Config {
         }
         if let Some(discord) = &config.discord {
             validate_env(&discord.token_env)?;
+            let unique: std::collections::BTreeSet<_> = discord.intents.iter().collect();
+            if !discord.intents.iter().any(|i| i == "guilds")
+                || unique.len() != discord.intents.len()
+                || discord
+                    .intents
+                    .iter()
+                    .any(|i| !matches!(i.as_str(), "guilds" | "guild_members" | "guild_moderation"))
+            {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
         }
         Ok(config)
     }
