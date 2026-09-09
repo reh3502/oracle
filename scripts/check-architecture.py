@@ -7,6 +7,7 @@ import tomllib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Direct production dependencies. Test adapters are deliberately excluded.
 ALLOWED = {
+    "oracle-ai": {"oracle-core", "oracle-contracts", "oracle-task-scope"},
     "oracle-contracts": set(),
     "oracle-task-scope": set(),
     "oracle-rpc": set(),
@@ -17,11 +18,11 @@ ALLOWED = {
     "oracle-operations": {"oracle-core", "oracle-contracts", "oracle-task-scope"},
     "oracle-storage": {"oracle-core", "oracle-contracts"},
     "oracle-discord": {"oracle-core", "oracle-contracts", "oracle-modules", "oracle-operations"},
-    "oracle": {"oracle-core", "oracle-contracts", "oracle-storage", "oracle-discord", "oracle-modules", "oracle-operations", "oracle-task-scope"},
+    "oracle": {"oracle-ai", "oracle-core", "oracle-contracts", "oracle-storage", "oracle-discord", "oracle-modules", "oracle-operations", "oracle-task-scope"},
 }
 # These boundaries must also stay free of concrete third-party adapters.
 ADAPTERS = {"serenity", "sqlx", "rusqlite", "tokio-postgres", "postgres", "diesel"}
-PURE = {"oracle-contracts", "oracle-core", "oracle-module-sdk", "oracle-rpc", "oracle-task-scope", "oracle-process", "oracle-modules", "oracle-operations"}
+PURE = {"oracle-ai", "oracle-contracts", "oracle-core", "oracle-module-sdk", "oracle-rpc", "oracle-task-scope", "oracle-process", "oracle-modules", "oracle-operations"}
 
 
 def dependencies(manifest, workspace):

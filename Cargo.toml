@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/oracle-ai",
     "crates/oracle-operations",
     "crates/oracle-contracts",
     "crates/oracle-core",
