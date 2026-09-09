@@ -427,12 +427,15 @@ impl Generation {
         revision: u64,
         values: Value,
     ) -> Result<Value> {
+        self.configuration_for_activation(guild,method,revision,values,true).await
+    }
+    pub async fn configuration_for_activation(&self,guild:&GuildId,method:&str,revision:u64,values:Value,published:bool)->Result<Value> {
         let epoch = self
             .activations
             .lock()
             .unwrap()
             .get(guild)
-            .filter(|a| a.grants.contains("config.own") && self.gate.is_active(guild, a.epoch))
+            .filter(|a| a.grants.contains("config.own") && (!published || self.gate.is_active(guild, a.epoch)))
             .ok_or_else(unavailable)?
             .epoch;
         if !self.normal || !self.process().is_alive() {
@@ -450,7 +453,8 @@ impl Generation {
             )
             .await
             .map_err(runtime_error)?;
-        if !self.gate.is_active(guild, epoch) || !self.process().is_alive() {
+        if !self.process().is_alive() || (published && !self.gate.is_active(guild, epoch))
+            || self.activations.lock().unwrap().get(guild).is_none_or(|a|a.epoch!=epoch) {
             return Err(unavailable());
         }
         Ok(result)

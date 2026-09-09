@@ -1672,6 +1672,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-example-activity-log"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "oracle-contracts",
+ "oracle-module-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "oracle-example-authority-probe"
 version = "0.1.0"
 dependencies = [

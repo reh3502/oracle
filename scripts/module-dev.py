@@ -253,7 +253,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--stage-only", action="store_true", help="build and stage without contacting a host (default)")
     mode.add_argument("--reload", action="store_true", help="install, replace the loaded generation, and activate on a running host")
-    parser.add_argument("--profile", choices=["counter", "dependent"], default="counter")
+    parser.add_argument("--profile", choices=["counter", "dependent", "activity-log"], default="counter")
     parser.add_argument("--v2", action="store_true", help="select the counter's migration-capable v2 artifact")
     parser.add_argument("--upgrade", action="store_true", help="explicitly advance counter data via the host upgrade command; requires --reload --v2")
     parser.add_argument("--config", type=pathlib.Path)

@@ -309,7 +309,16 @@ impl ModuleManager {
         let mut saved = decode(record.as_ref())?;
         if saved.receipt.as_ref().is_some_and(|r| r.plan == plan_id) {
             return self
-                .config_resume(actor, guild, module, &services, &generation, record, saved)
+                .config_resume(
+                    actor,
+                    guild,
+                    module,
+                    &services,
+                    &generation,
+                    record,
+                    saved,
+                    false,
+                )
                 .await;
         }
         if record.as_ref().map(|r| r.revision) != bound.record_revision
@@ -350,6 +359,7 @@ impl ModuleManager {
             &generation,
             Some(record),
             saved,
+            false,
         )
         .await
     }
@@ -382,6 +392,7 @@ impl ModuleManager {
         generation: &Generation,
         mut record: Option<WorkflowRecord>,
         mut saved: Saved,
+        service_restore: bool,
     ) -> Result<ConfigurationReceipt> {
         if !generation
             .installed
@@ -396,8 +407,9 @@ impl ModuleManager {
             .candidate
             .clone()
             .ok_or_else(|| err(ErrorCode::InvalidInput))?;
-        if candidate.actor != principal(actor)
-            || candidate.deployment != self.core.status(actor, Some(guild)).await?.deployment
+        if !service_restore
+            && (candidate.actor != principal(actor)
+                || candidate.deployment != self.core.status(actor, Some(guild)).await?.deployment)
         {
             return Err(err(ErrorCode::ForbiddenScope));
         }
@@ -426,11 +438,12 @@ impl ModuleManager {
             return Ok(receipt);
         }
         if generation
-            .configuration(
+            .configuration_for_activation(
                 guild,
                 "configuration.prepare",
                 candidate.revision,
                 candidate.values.clone(),
+                !service_restore,
             )
             .await
             .is_err()
@@ -501,11 +514,12 @@ impl ModuleManager {
             self.require_event_intents(generation)?;
         }
         let applied = generation
-            .configuration(
+            .configuration_for_activation(
                 guild,
                 "configuration.apply",
                 candidate.revision,
                 candidate.values.clone(),
+                !service_restore,
             )
             .await;
         receipt.state = "unknown".into();
@@ -513,7 +527,13 @@ impl ModuleManager {
         receipt.problem = Some("apply_or_readback_unavailable".into());
         if applied.is_ok() {
             let observed = generation
-                .configuration(guild, "configuration.effective", 0, Value::Null)
+                .configuration_for_activation(
+                    guild,
+                    "configuration.effective",
+                    0,
+                    Value::Null,
+                    !service_restore,
+                )
                 .await;
             if let Ok(value) = observed
                 && let Ok(Some(effective)) =
@@ -534,6 +554,88 @@ impl ModuleManager {
         self.config_save(services, guild, module, record.as_ref(), &saved)
             .await?;
         Ok(receipt)
+    }
+    /// Reapply already committed intent while the new activation is still private.
+    /// A pending candidate is never permission to replace saved desired values.
+    pub(super) async fn restore_configuration_locked(
+        &self,
+        guild: &GuildId,
+        generation: &Generation,
+    ) -> Result<()> {
+        if generation
+            .installed
+            .package
+            .manifest
+            .configuration
+            .is_none()
+        {
+            return Ok(());
+        }
+        let services = self.config_services()?;
+        let module = &generation.installed.package.manifest.id;
+        let record = services
+            .repository
+            .workflow_get(guild, WorkflowKind::Configuration, module.as_str())
+            .await?;
+        let mut saved = decode(record.as_ref())?;
+        let Some(values) = saved.values.clone() else {
+            return Ok(());
+        };
+        let epoch = generation
+            .activations
+            .lock()
+            .unwrap()
+            .get(guild)
+            .ok_or_else(unavailable)?
+            .epoch;
+        let candidate = saved
+            .candidate
+            .clone()
+            .filter(|c| c.revision == saved.revision && c.values == values)
+            .unwrap_or(Candidate {
+                expires_at: now(),
+                generation: generation.number,
+                session: generation.session.clone(),
+                epoch,
+                plan: format!("restore-{}", uuid::Uuid::new_v4()),
+                actor: principal(&PolicyContext::LocalOperator),
+                deployment: self
+                    .core
+                    .status(&PolicyContext::LocalOperator, Some(guild))
+                    .await?
+                    .deployment,
+                schema_version: saved.schema_version.ok_or_else(unavailable)?,
+                revision: saved.revision,
+                values,
+            });
+        saved.receipt = Some(ConfigurationReceipt {
+            plan: candidate.plan.clone(),
+            stored_revision: saved.revision,
+            effective_revision: None,
+            state: "committed".into(),
+            problem: Some("restoring_configuration".into()),
+        });
+        saved.candidate = Some(candidate);
+        saved.effective_session = None;
+        let record = self
+            .config_save(&services, guild, module, record.as_ref(), &saved)
+            .await?;
+        let receipt = self
+            .config_resume(
+                &PolicyContext::LocalOperator,
+                guild,
+                module,
+                &services,
+                generation,
+                Some(record),
+                saved,
+                true,
+            )
+            .await?;
+        if receipt.state != "effective" {
+            return Err(unavailable());
+        }
+        Ok(())
     }
     /// Explicit recovery reauthorizes the saved desired revision against the
     /// current generation. A restored deployment cannot reuse old authority.
@@ -557,8 +659,17 @@ impl ModuleManager {
         if saved.receipt.as_ref().is_none_or(|r| r.state == "pending") {
             return Err(err(ErrorCode::InvalidInput));
         }
-        self.config_resume(actor, guild, module, &services, &generation, record, saved)
-            .await
+        self.config_resume(
+            actor,
+            guild,
+            module,
+            &services,
+            &generation,
+            record,
+            saved,
+            false,
+        )
+        .await
     }
     /// Last independently verified config bound to this executable session. This
     /// path intentionally does not call back into a module waiting on host.notify.

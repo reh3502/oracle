@@ -465,7 +465,10 @@ impl ModuleManager {
                     .await;
                 return Err(error);
             }
-            // Admission becomes visible only after activation intent is durable.
+            self.restore_configuration_locked(&desired.guild, &generation)
+                .await?;
+            // Admission becomes visible only after activation intent and restored
+            // configuration have both been verified.
             // Keep this publication synchronous with disarming cancellation cleanup.
             generation.publish_activation(&desired.guild)?;
             provisional.0 = None;

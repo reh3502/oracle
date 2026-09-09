@@ -1,0 +1,199 @@
+{
+  "manifest_version": 1,
+  "id": "community.activity-log",
+  "version": "1.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "protocol_major": 1,
+  "protocol_minor_min": 0,
+  "host_api": "^1.0",
+  "data_version": 1,
+  "readable_data_versions": [
+    1
+  ],
+  "capabilities": [
+    "storage.own",
+    "config.own",
+    "events.guild",
+    "discord.notify"
+  ],
+  "required_intents": [
+    "guilds",
+    "guild_members",
+    "guild_moderation"
+  ],
+  "provides": [],
+  "consumes": [],
+  "operations": [
+    {
+      "name": "status",
+      "description": "Inspect logging state.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 30000,
+      "capabilities": [
+        "storage.own"
+      ]
+    },
+    {
+      "name": "probe",
+      "description": "Send a safe synthetic delivery probe.",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 30000,
+      "capabilities": [
+        "storage.own",
+        "discord.notify"
+      ]
+    }
+  ],
+  "collections": [
+    {
+      "name": "logging",
+      "schema": {
+        "type": "object"
+      }
+    }
+  ],
+  "migrations": [],
+  "configuration": {
+    "schema_version": 1,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "preset": {
+          "const": "moderate/v1"
+        },
+        "enabled": {
+          "const": [
+            "moderation_audit",
+            "channel_changes",
+            "role_access_changes",
+            "member_role_changes",
+            "bans_unbans",
+            "membership_summary"
+          ]
+        },
+        "excluded": {
+          "const": [
+            "message_create",
+            "message_edit",
+            "message_delete",
+            "message_bodies",
+            "attachments",
+            "reactions",
+            "typing",
+            "presence",
+            "routine_voice"
+          ]
+        },
+        "membership_summary_minutes": {
+          "const": 15
+        },
+        "retention_days": {
+          "const": 14
+        },
+        "retain_message_content": {
+          "const": false
+        },
+        "retain_attachments": {
+          "const": false
+        },
+        "self_origin_exclusion": {
+          "const": true
+        },
+        "coalesce": {
+          "const": true
+        },
+        "coalesce_seconds": {
+          "const": 30
+        },
+        "queue_limit": {
+          "const": 128
+        },
+        "dropped_event_summary": {
+          "const": true
+        },
+        "destination": {
+          "type": "string",
+          "pattern": "^[0-9]{1,20}$"
+        },
+        "operator_note": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "preset",
+        "enabled",
+        "excluded",
+        "membership_summary_minutes",
+        "retention_days",
+        "retain_message_content",
+        "retain_attachments",
+        "self_origin_exclusion",
+        "coalesce",
+        "coalesce_seconds",
+        "queue_limit",
+        "dropped_event_summary",
+        "destination"
+      ],
+      "additionalProperties": false
+    },
+    "presets": {
+      "moderate/v1": {
+        "preset": "moderate/v1",
+        "enabled": [
+          "moderation_audit",
+          "channel_changes",
+          "role_access_changes",
+          "member_role_changes",
+          "bans_unbans",
+          "membership_summary"
+        ],
+        "excluded": [
+          "message_create",
+          "message_edit",
+          "message_delete",
+          "message_bodies",
+          "attachments",
+          "reactions",
+          "typing",
+          "presence",
+          "routine_voice"
+        ],
+        "membership_summary_minutes": 15,
+        "retention_days": 14,
+        "retain_message_content": false,
+        "retain_attachments": false,
+        "self_origin_exclusion": true,
+        "coalesce": true,
+        "coalesce_seconds": 30,
+        "queue_limit": 128,
+        "dropped_event_summary": true
+      }
+    }
+  },
+  "subscriptions": [
+    "moderation_audit",
+    "channel_changed",
+    "role_access_changed",
+    "member_roles_changed",
+    "ban",
+    "unban",
+    "member_joined",
+    "member_left",
+    "maintenance"
+  ]
+}

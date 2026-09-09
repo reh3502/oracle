@@ -1,4 +1,5 @@
 //! Real subprocess event admission with controlled host transport readiness.
+//! Optional ORACLE_TEST_EVENTS_POSTGRES_URL selects an isolated PostgreSQL database.
 use oracle_core::*;
 use oracle_modules::{
     ConfigurationPolicy, DispatchPermit, ModuleManager, NotificationCheck, NotificationRequest,
@@ -91,13 +92,13 @@ async fn event_routes_require_configuration_and_reuse_verified_effect_receipts()
 async fn run(case: &'static str) {
     let scratch = std::env::temp_dir().join(format!("oracle-event-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&scratch).unwrap();
-    let storage = Arc::new(
-        Storage::open(DatabaseConfig::Sqlite {
+    let database = match std::env::var("ORACLE_TEST_EVENTS_POSTGRES_URL") {
+        Ok(url) => DatabaseConfig::Postgres { url },
+        Err(_) => DatabaseConfig::Sqlite {
             path: scratch.join("state.sqlite"),
-        })
-        .await
-        .unwrap(),
-    );
+        },
+    };
+    let storage = Arc::new(Storage::open(database.clone()).await.unwrap());
     let guild: GuildId = "123".parse().unwrap();
     storage
         .initialize_guilds(std::slice::from_ref(&guild))
@@ -417,6 +418,57 @@ async fn run(case: &'static str) {
     .await;
     let stopped = manager.shutdown().await;
     let closed = storage.close().await;
+    if task.is_ok() && case == "routing" {
+        stopped.as_ref().unwrap();
+        closed.as_ref().unwrap();
+        // Reopen the actual backend and rebuild the host. The verified event purpose
+        // must resolve to its prior receipt without dispatching another notification.
+        let reopened = Arc::new(Storage::open(database).await.unwrap());
+        let guild: GuildId = "123".parse().unwrap();
+        let core = Arc::new(CoreService::new(
+            reopened.clone(),
+            vec![GuildPolicy {
+                guild: guild.clone(),
+                operators: vec![],
+            }],
+        ));
+        let restarted =
+            ModuleManager::new(reopened.clone(), core, scratch.join("artifacts")).unwrap();
+        restarted
+            .set_configuration_services(reopened.clone(), Arc::new(Policy))
+            .unwrap();
+        let no_resend = Arc::new(Transport {
+            entered: Notify::new(),
+            ready: Semaphore::new(0),
+            sent: Mutex::new(vec![]),
+        });
+        restarted
+            .set_event_services(intents(), no_resend.clone())
+            .unwrap();
+        let worker = restarted.clone();
+        let recovery = tokio::spawn(async move {
+            assert!(worker.restore_desired().await.unwrap().is_empty());
+            assert_eq!(
+                worker
+                    .deliver_event(&guild, event("first"))
+                    .await
+                    .unwrap()
+                    .accepted,
+                1
+            );
+            wait_health(&worker, |delivered, _| delivered == 1).await;
+            assert!(no_resend.sent.lock().unwrap().is_empty());
+        })
+        .await;
+        let stopped = restarted.shutdown().await;
+        let closed = reopened.close().await;
+        if let Err(error) = recovery {
+            remove_tree(&scratch);
+            std::panic::resume_unwind(error.into_panic());
+        }
+        stopped.unwrap();
+        closed.unwrap();
+    }
     remove_tree(&scratch);
     if let Err(error) = task {
         std::panic::resume_unwind(error.into_panic());
@@ -425,7 +477,7 @@ async fn run(case: &'static str) {
     closed.unwrap();
 }
 async fn wait_health(manager: &ModuleManager, done: impl Fn(usize, usize) -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if manager
                 .event_health()
@@ -437,8 +489,12 @@ async fn wait_health(manager: &ModuleManager, done: impl Fn(usize, usize) -> boo
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        result.is_ok(),
+        "event health wait failed: {:?}",
+        manager.event_health()
+    );
 }
 fn remove_tree(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
