@@ -1,4 +1,5 @@
 use super::*;
+use crate::command_presentation::command_matches;
 use oracle_core as core;
 use serde_json::{Value, json};
 use std::sync::{
@@ -334,7 +335,7 @@ fn published_command_matches_discord_omitted_empty_localizations() {
                     {"name":"resume","value":"resume"}]}]}
         ]
     });
-    let groups = interaction_ops::descriptors()
+    let groups = command_presentation::descriptors()
         .into_iter()
         .map(|g| serde_json::to_value(g).unwrap());
     payload["options"].as_array_mut().unwrap().extend(groups);

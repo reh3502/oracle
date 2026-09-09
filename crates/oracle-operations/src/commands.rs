@@ -1,4 +1,8 @@
 //! Minimal command publication with durable ownership and uncertainty records.
+mod definition;
+pub use definition::canonical_definition;
+use definition::command_key;
+
 use crate::executor::{DispatchFence, SendGuard};
 use async_trait::async_trait;
 use oracle_core::*;
@@ -72,135 +76,6 @@ pub trait CommandBackend: Send + Sync {
     ) -> Result<PublishedCommand>;
     async fn delete(&self, guild: &GuildId, id: &str, guard: &SendGuard) -> Result<()>;
 }
-/// Server-owned identity and empty localization maps do not change a command definition.
-pub fn canonical_definition(value: &Value) -> Result<Value> {
-    let mut value = value.clone();
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| error(ErrorCode::InvalidInput))?;
-    for field in ["id", "application_id", "guild_id", "version"] {
-        object.remove(field);
-    }
-    if !object.contains_key("type") {
-        object.insert("type".into(), Value::from(1));
-    }
-    fn normalize(value: &mut Value) {
-        match value {
-            Value::Object(map) => {
-                // Discord's localized display fields are derived from the localization maps.
-                map.remove("name_localized");
-                map.remove("description_localized");
-                for field in [
-                    "min_value",
-                    "max_value",
-                    "min_length",
-                    "max_length",
-                    "handler",
-                    "dm_permission",
-                ] {
-                    if map.get(field).is_some_and(Value::is_null) {
-                        map.remove(field);
-                    }
-                }
-                for field in ["required", "autocomplete"] {
-                    if map.get(field).and_then(Value::as_bool) == Some(false) {
-                        map.remove(field);
-                    }
-                }
-                for field in [
-                    "options",
-                    "choices",
-                    "channel_types",
-                    "file_types",
-                    "integration_types",
-                ] {
-                    if map
-                        .get(field)
-                        .and_then(Value::as_array)
-                        .is_some_and(Vec::is_empty)
-                    {
-                        map.remove(field);
-                    }
-                }
-                for field in ["name_localizations", "description_localizations"] {
-                    if map
-                        .get(field)
-                        .is_some_and(|v| v.is_null() || v.as_object().is_some_and(|m| m.is_empty()))
-                    {
-                        map.remove(field);
-                    }
-                }
-                for v in map.values_mut() {
-                    normalize(v);
-                }
-            }
-            Value::Array(values) => {
-                for v in values {
-                    normalize(v);
-                }
-            }
-            _ => {}
-        }
-    }
-    normalize(&mut value);
-    // Discord materializes these optional defaults in its readback objects.
-    let object = value.as_object_mut().unwrap();
-    for field in [
-        "default_member_permissions",
-        "contexts",
-        "integration_types",
-    ] {
-        if object.get(field).is_some_and(Value::is_null) {
-            object.remove(field);
-        }
-    }
-    for (field, default) in [
-        ("dm_permission", true),
-        ("default_permission", true),
-        ("nsfw", false),
-    ] {
-        if object.get(field).and_then(Value::as_bool) == Some(default) {
-            object.remove(field);
-        }
-    }
-    if object
-        .get("options")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-    {
-        object.remove("options");
-    }
-    command_key(&value)?;
-    Ok(value)
-}
-fn command_key(value: &Value) -> Result<String> {
-    let name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| error(ErrorCode::InvalidInput))?;
-    let kind = match value.get("type") {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| error(ErrorCode::InvalidInput))?,
-        None => 1,
-    };
-    if !(1..=3).contains(&kind)
-        || name.is_empty()
-        || name.chars().count() > 32
-        || name.chars().any(char::is_control)
-        || (kind == 1
-            && name
-                .chars()
-                .any(|c| !(c.is_lowercase() || c.is_numeric() || c == '-' || c == '_')))
-    {
-        return Err(error(ErrorCode::InvalidInput));
-    }
-    let key = format!("{kind}:{name}");
-    if key.len() > 128 {
-        return Err(error(ErrorCode::InvalidInput));
-    }
-    Ok(key)
-}
 pub struct CommandReconciler {
     repository: Arc<dyn WorkflowRepository>,
     backend: Arc<dyn CommandBackend>,
@@ -214,6 +89,17 @@ impl CommandReconciler {
             locks: Mutex::new(BTreeMap::new()),
         }
     }
+    // Release the map mutex before awaiting the per-guild lock. Adoption and
+    // reconciliation must serialize through the same lock for a guild.
+    fn guild_lock(&self, guild: &GuildId) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap()
+            .entry(guild.clone())
+            .or_default()
+            .clone()
+    }
+
     /// Adopt only an exact supported bootstrap definition already present remotely.
     /// This never mutates Discord and never replaces an existing ownership or recovery record.
     pub async fn adopt_known(
@@ -235,13 +121,7 @@ impl CommandReconciler {
         {
             return Err(error(ErrorCode::InvalidInput));
         }
-        let lock = self
-            .locks
-            .lock()
-            .unwrap()
-            .entry(guild.clone())
-            .or_default()
-            .clone();
+        let lock = self.guild_lock(guild);
         let _lock = lock.lock().await;
         if let Some((_, binding)) = self.records(guild).await?.get("1:oracle") {
             return if &binding.owner == owner {
@@ -375,13 +255,7 @@ impl CommandReconciler {
         expires_at: u64,
         fence: Option<Arc<dyn DispatchFence>>,
     ) -> Result<CommandReport> {
-        let lock = self
-            .locks
-            .lock()
-            .unwrap()
-            .entry(guild.clone())
-            .or_default()
-            .clone();
+        let lock = self.guild_lock(guild);
         let _lock = tokio::select! {biased;_=cancel.cancelled()=>return Err(error(ErrorCode::Cancelled)),lock=lock.lock()=>lock};
         let guard = match fence {
             Some(fence) => SendGuard::with_fence(cancel.clone(), expires_at, fence),
