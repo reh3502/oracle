@@ -1,0 +1,1 @@
+CREATE TABLE oracle_workflows(guild TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('structure_plan','resource_binding','command_binding','configuration')),key TEXT COLLATE "C" NOT NULL,revision BIGINT NOT NULL CHECK(revision>0),value TEXT NOT NULL,PRIMARY KEY(guild,kind,key),FOREIGN KEY(guild) REFERENCES oracle_guilds(id));

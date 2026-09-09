@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/oracle-contracts", "crates/oracle-core", "crates/oracle-storage", "crates/oracle-discord", "crates/oracle", "crates/oracle-task-scope", "crates/oracle-rpc", "crates/oracle-process", "crates/oracle-module-sdk", "crates/oracle-modules", "examples/modules/counter", "examples/modules/dependent", "examples/modules/authority-probe", "prototypes/process-runtime", "prototypes/fixtures/alpha", "prototypes/fixtures/beta"]
+members = ["crates/oracle-operations", "crates/oracle-contracts", "crates/oracle-core", "crates/oracle-storage", "crates/oracle-discord", "crates/oracle", "crates/oracle-task-scope", "crates/oracle-rpc", "crates/oracle-process", "crates/oracle-module-sdk", "crates/oracle-modules", "examples/modules/counter", "examples/modules/dependent", "examples/modules/authority-probe", "prototypes/process-runtime", "prototypes/fixtures/alpha", "prototypes/fixtures/beta"]
 
 [workspace.package]
 edition = "2024"

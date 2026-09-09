@@ -29,6 +29,8 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 const MIGRATION: &str = include_str!("../migrations/0001.sql");
 const MIGRATION_SQLITE_2: &str = include_str!("../migrations/0002-sqlite.sql");
 const MIGRATION_POSTGRES_2: &str = include_str!("../migrations/0002-postgres.sql");
+const MIGRATION_SQLITE_3: &str = include_str!("../migrations/0003-sqlite.sql");
+const MIGRATION_POSTGRES_3: &str = include_str!("../migrations/0003-postgres.sql");
 const LOCK_KEY: i64 = 0x4f5241434c453031;
 #[derive(Clone)]
 pub enum DatabaseConfig {
@@ -283,7 +285,8 @@ impl Storage {
         let store = Self::connect(normalize(config)?, None).await?;
         store.ensure_not_restoring().await?;
         store.migrate_base().await?;
-        if store.schema_version().await? == 1 {
+        let version = store.schema_version().await?;
+        if version < 3 {
             let defaults = PgTools::default();
             let default_root;
             let (tools, root) = match options {
@@ -300,9 +303,12 @@ impl Storage {
                 },
             };
             std::fs::create_dir_all(root).map_err(io)?;
-            let backup = root.join(format!("schema1-{}", uuid::Uuid::new_v4()));
+            let backup = root.join(format!("schema{version}-{}", uuid::Uuid::new_v4()));
             store.backup(&backup, tools).await?;
-            store.migrate_second().await?;
+            if version == 1 {
+                store.migrate_second().await?;
+            }
+            store.migrate_third().await?;
         }
         store.verify_integrity().await?;
         store.startup_recovery(false).await?;
@@ -314,10 +320,31 @@ impl Storage {
             Backend::Postgres { .. } => MIGRATION_POSTGRES_2,
         }
     }
+    fn third_migration(&self) -> &'static str {
+        match self.inner.backend {
+            Backend::Sqlite { .. } => MIGRATION_SQLITE_3,
+            Backend::Postgres { .. } => MIGRATION_POSTGRES_3,
+        }
+    }
+    async fn migrate_third(&self) -> Result<()> {
+        write_tx!(self, tx, {
+            sqlx::raw_sql(self.third_migration())
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES(3,$1)")
+                .bind(checksum(self.third_migration().as_bytes()))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            Ok(())
+        })
+    }
     fn expected_migrations(&self) -> Vec<(i64, String)> {
         vec![
             (1, checksum(MIGRATION.as_bytes())),
             (2, checksum(self.second_migration().as_bytes())),
+            (3, checksum(self.third_migration().as_bytes())),
         ]
     }
     async fn schema_version(&self) -> Result<i64> {
@@ -328,6 +355,8 @@ impl Storage {
         );
         let expected = self.expected_migrations();
         if migrations == expected {
+            Ok(3)
+        } else if migrations == expected[..2] {
             Ok(2)
         } else if migrations == expected[..1] {
             Ok(1)
@@ -489,6 +518,7 @@ impl Storage {
                     .map_err(db)?;
             if !migrations.is_empty()
                 && migrations != self.expected_migrations()[..1]
+                && migrations != self.expected_migrations()[..2]
                 && migrations != self.expected_migrations()
             {
                 return Err(err(ErrorCode::MigrationMismatch));
@@ -514,6 +544,15 @@ impl Storage {
                     .map_err(db)?;
                 sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES(2,$1)")
                     .bind(checksum(self.second_migration().as_bytes()))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                sqlx::raw_sql(self.third_migration())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES(3,$1)")
+                    .bind(checksum(self.third_migration().as_bytes()))
                     .execute(&mut *tx)
                     .await
                     .map_err(db)?;
@@ -1088,6 +1127,9 @@ impl Storage {
         if incoming_version == 1 {
             store.migrate_second().await?;
         }
+        if incoming_version < 3 {
+            store.migrate_third().await?;
+        }
         store.startup_recovery(true).await?;
         store.verify_integrity().await?;
         match &store.inner.config {
@@ -1116,6 +1158,9 @@ fn url_to_env_placeholder() -> &'static str {
 #[cfg(test)]
 mod module_tests;
 mod modules;
+#[cfg(test)]
+mod workflow_tests;
+mod workflows;
 
 #[cfg(test)]
 mod tests {
@@ -1289,6 +1334,7 @@ mod tests {
             "second host obtained ownership"
         );
         let store = module_tests::exercise(&config, store).await;
+        let store = workflow_tests::exercise(&config, store).await;
         let before = store.status(None).await.unwrap();
         assert_eq!(before.modules_loaded, 0);
         assert!(!before.ai_available);
@@ -1422,7 +1468,7 @@ mod tests {
         let bundle = scratch.0.join("bundle");
         let manifest = store.backup(&bundle, &tools()).await.unwrap();
         assert_eq!(manifest.source_deployment, before.deployment);
-        assert_eq!(manifest.table_counts.len(), 12);
+        assert_eq!(manifest.table_counts.len(), 13);
         failed_restore_guard(&config, &bundle, &manifest, scratch).await;
         assert_eq!(
             store.effect(&guild, &prepared.id).await.unwrap().state,
@@ -1433,6 +1479,7 @@ mod tests {
             .await
             .unwrap();
         module_tests::restored(&restored).await;
+        workflow_tests::restored(&restored).await;
         let status = restored.status(None).await.unwrap();
         assert_ne!(status.deployment, before.deployment);
         assert!(status.guilds.iter().all(|g| g.paused));

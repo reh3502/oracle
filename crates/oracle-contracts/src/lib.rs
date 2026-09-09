@@ -252,3 +252,6 @@ fn module_id(s: &str) -> bool {
 identifier!(ModuleId, module_id);
 pub mod modules;
 pub use modules::*;
+
+mod workflows;
+pub use workflows::*;

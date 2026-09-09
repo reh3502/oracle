@@ -488,7 +488,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let upgraded = Storage::open_with_options(source.clone(), tools, &backups)
         .await
         .unwrap();
-    assert_eq!(upgraded.schema_version().await.unwrap(), 2);
+    assert_eq!(upgraded.schema_version().await.unwrap(), 3);
     assert_eq!(upgraded.status(None).await.unwrap().deployment, original);
     let bundles: Vec<_> = std::fs::read_dir(&backups).unwrap().collect();
     assert_eq!(bundles.len(), 1);
@@ -502,13 +502,73 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let restored = Storage::restore(destination.clone(), &old_bundle, tools)
         .await
         .unwrap();
-    assert_eq!(restored.schema_version().await.unwrap(), 2);
+    assert_eq!(restored.schema_version().await.unwrap(), 3);
     let status = restored.status(None).await.unwrap();
     assert_ne!(status.deployment, original);
     assert!(status.guilds[0].paused);
     assert!(restored.desired_modules().await.unwrap().is_empty());
     restored.close().await.unwrap();
     drop(restored);
+    // A Stage2 database also requires a native snapshot before schema3 is installed.
+    let source2 = isolated(base, root, "stage2-source").await;
+    let destination2 = isolated(base, root, "stage2-restore").await;
+    let raw = Storage::connect(normalize(source2.clone()).unwrap(), None)
+        .await
+        .unwrap();
+    raw.migrate_base().await.unwrap();
+    write_tx!(&raw, tx, {
+        sqlx::query("DROP TABLE oracle_workflows")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        sqlx::query("DELETE FROM oracle_migrations WHERE version=3")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        Ok(())
+    })
+    .unwrap();
+    raw.initialize_guilds(std::slice::from_ref(&g))
+        .await
+        .unwrap();
+    let stage2_bundle = root.join("stage2-bundle");
+    let manifest2 = raw.backup(&stage2_bundle, tools).await.unwrap();
+    assert_eq!(manifest2.migrations.len(), 2);
+    raw.close().await.unwrap();
+    drop(raw);
+    assert!(
+        Storage::open_with_options(source2.clone(), tools, &blocked)
+            .await
+            .is_err()
+    );
+    let raw = Storage::connect(normalize(source2.clone()).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(raw.schema_version().await.unwrap(), 2);
+    raw.close().await.unwrap();
+    drop(raw);
+    let backups2 = root.join("upgrades2");
+    let upgraded2 = Storage::open_with_options(source2.clone(), tools, &backups2)
+        .await
+        .unwrap();
+    assert_eq!(upgraded2.schema_version().await.unwrap(), 3);
+    let bundles2: Vec<_> = std::fs::read_dir(&backups2).unwrap().collect();
+    assert_eq!(bundles2.len(), 1);
+    let saved2: BackupManifest = serde_json::from_slice(
+        &std::fs::read(bundles2[0].as_ref().unwrap().path().join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved2.migrations, manifest2.migrations);
+    upgraded2.close().await.unwrap();
+    drop(upgraded2);
+    let restored2 = Storage::restore(destination2.clone(), &stage2_bundle, tools)
+        .await
+        .unwrap();
+    assert_eq!(restored2.schema_version().await.unwrap(), 3);
+    restored2.close().await.unwrap();
+    drop(restored2);
+    remove_isolated(base, &source2).await;
+    remove_isolated(base, &destination2).await;
     remove_isolated(base, &source).await;
     remove_isolated(base, &destination).await;
     Ok(())

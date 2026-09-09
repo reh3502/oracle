@@ -98,3 +98,6 @@ pub trait ModuleRepository: Send + Sync {
         complete: bool,
     ) -> Result<MigrationProgress>;
 }
+
+mod workflows;
+pub use workflows::*;
