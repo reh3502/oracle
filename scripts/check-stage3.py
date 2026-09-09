@@ -27,6 +27,8 @@ CONFIGURATION = [
     "configuration_policy_changed_during_prepare_cannot_commit",
 ]
 EVENTS = [
+    "notification_rechecks_configuration_changed_during_policy_read",
+    "notification_rechecks_intents_changed_during_policy_read",
     "event_queue_is_bounded_and_unload_fences_waiting_notification",
     "event_notification_rechecks_configuration_revision_after_readiness",
     "event_notification_rechecks_intents_after_readiness",
@@ -162,7 +164,7 @@ def main():
             "ORACLE_ACTIVITY_LOG": q.fixture("activity-log", "oracle-example-activity-log", "", "ORACLE_ACTIVITY_LOG"),
         }
         q.command("workspace-tests", ["cargo", "test", "--locked", "--workspace"], minimum=1)
-        for suite, minimum in [("configuration", len(CONFIGURATION)), ("events", len(EVENTS)), ("activity_log", 3)]:
+        for suite, minimum in [("configuration", len(CONFIGURATION)), ("events", len(EVENTS)), ("activity_log", 4)]:
             q.command("sqlite-" + suite, ["cargo", "test", "--locked", "-p", "oracle-modules", "--test", suite, "--", "--ignored", "--nocapture", "--test-threads=1"], fixtures, minimum=minimum)
         q.command("command-runtime", ["cargo", "test", "--locked", "-p", "oracle", HOST_TEST, "--", "--ignored", "--exact", "--nocapture"], fixtures, minimum=1)
         if pg:

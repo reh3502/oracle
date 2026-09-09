@@ -172,6 +172,9 @@ pub enum GuildEventKind {
 pub enum GuildEventOrigin {
     External,
     Oracle,
+    /// The Gateway observation does not identify the actor.
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -202,4 +205,53 @@ pub struct ModuleCommandRoute {
     pub operation: String,
     /// One fixed JSON string option named input. If omitted, the host uses {}.
     pub input_required: bool,
+}
+
+/// Host observations for the exact module invocation; no recursive module RPC is used.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleHostHealth {
+    pub module: ModuleId,
+    pub guild: GuildId,
+    pub session: String,
+    pub generation: u64,
+    pub epoch: u64,
+    pub observed_at_ms: u64,
+    pub configuration: HostConfigurationHealth,
+    pub subscriptions: HostSubscriptionHealth,
+    pub destination: HostDestinationHealth,
+    pub queue: Option<HostEventQueueHealth>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfigurationHealth {
+    pub stored: Option<EffectiveConfiguration>,
+    pub receipt_state: Option<String>,
+    pub verified: bool,
+    pub error: Option<crate::ErrorCode>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostSubscriptionHealth {
+    pub declared: Vec<GuildEventKind>,
+    pub effective: Vec<GuildEventKind>,
+    pub missing_intents: Vec<String>,
+    pub ready: bool,
+    pub error: Option<crate::ErrorCode>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostDestinationHealth {
+    pub id: Option<String>,
+    pub verified: bool,
+    pub error: Option<crate::ErrorCode>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostEventQueueHealth {
+    pub accepting: bool,
+    pub queued: usize,
+    pub delivered: usize,
+    pub dropped: usize,
+    pub last_error: Option<crate::ErrorCode>,
 }

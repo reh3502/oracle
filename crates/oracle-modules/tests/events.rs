@@ -16,9 +16,32 @@ use std::{
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
-struct Policy;
+struct Policy {
+    hold: std::sync::atomic::AtomicBool,
+    entered: Notify,
+    release: Semaphore,
+}
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            hold: false.into(),
+            entered: Notify::new(),
+            release: Semaphore::new(0),
+        }
+    }
+}
 #[async_trait::async_trait]
 impl ConfigurationPolicy for Policy {
+    async fn validate_subscriptions(
+        &self,
+        _: &PolicyContext,
+        _: &GuildId,
+        _: &ModuleId,
+        _: &[GuildEventKind],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn validate(
         &self,
         _: &PolicyContext,
@@ -26,6 +49,10 @@ impl ConfigurationPolicy for Policy {
         _: &ModuleId,
         values: &Value,
     ) -> Result<()> {
+        if self.hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+        }
         if values["destination"] == "456" {
             Ok(())
         } else {
@@ -127,8 +154,9 @@ async fn run(case: &'static str) {
         ],
     ));
     let manager = ModuleManager::new(storage.clone(), core, scratch.join("artifacts")).unwrap();
+    let policy = Arc::new(Policy::default());
     manager
-        .set_configuration_services(storage.clone(), Arc::new(Policy))
+        .set_configuration_services(storage.clone(), policy.clone())
         .unwrap();
     let transport = Arc::new(Transport {
         entered: Notify::new(),
@@ -375,6 +403,39 @@ async fn run(case: &'static str) {
                     ["event new-config"]
                 );
             }
+            "policy_configuration" | "policy_intents" => {
+                policy.hold.store(true, std::sync::atomic::Ordering::SeqCst);
+                transport.ready.add_permits(1);
+                tokio::time::timeout(Duration::from_secs(3), policy.entered.notified())
+                    .await
+                    .unwrap();
+                if case == "policy_intents" {
+                    manager.set_event_intents(BTreeSet::new()).unwrap();
+                } else {
+                    let change = manager
+                        .configuration_plan(
+                            &ACTOR,
+                            &guild,
+                            &module,
+                            None,
+                            json!({"level":9}),
+                            Duration::from_secs(60),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        manager
+                            .configuration_apply(&ACTOR, &guild, &module, &change.id)
+                            .await
+                            .unwrap()
+                            .stored_revision,
+                        2
+                    );
+                }
+                policy.release.add_permits(1);
+                wait_health(&manager, |_, dropped| dropped == 1).await;
+                assert!(transport.sent.lock().unwrap().is_empty());
+            }
             "intents" => {
                 manager.set_event_intents(BTreeSet::new()).unwrap();
                 transport.ready.add_permits(1);
@@ -556,7 +617,7 @@ async fn run(case: &'static str) {
         let restarted =
             ModuleManager::new(reopened.clone(), core, scratch.join("artifacts")).unwrap();
         restarted
-            .set_configuration_services(reopened.clone(), Arc::new(Policy))
+            .set_configuration_services(reopened.clone(), Arc::new(Policy::default()))
             .unwrap();
         let no_resend = Arc::new(Transport {
             entered: Notify::new(),
@@ -630,4 +691,15 @@ fn remove_tree(path: &Path) {
     } else {
         let _ = std::fs::remove_file(path);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires ORACLE_EVENT_PROBE built with configuration-probe --features events"]
+async fn notification_rechecks_configuration_changed_during_policy_read() {
+    run("policy_configuration").await;
+}
+#[tokio::test]
+#[ignore = "requires ORACLE_EVENT_PROBE built with configuration-probe --features events"]
+async fn notification_rechecks_intents_changed_during_policy_read() {
+    run("policy_intents").await;
 }

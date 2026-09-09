@@ -214,9 +214,53 @@ impl Module for Logger {
         let config = self.config.lock().await.get(context.guild()).cloned();
         let (mut state, revision) = Self::state(&context).await?;
         match operation {
-            "status" => Ok(
-                json!({"effective_configuration":config,"configured":config.is_some(),"requested_event_subscriptions":self.manifest().subscriptions,"subscription_health":"host_readback_required","missing_intents":"host_readback_required","destination_permissions":"host_readback_required","delivery_backlog":state.pending.len(),"delivered":state.delivered,"dropped":state.dropped,"observed_metadata_events":state.observed,"last_error":state.last_error,"retention_days":14,"retention_last_run_ms":state.retention_last_run,"end_to_end_probe_verified":state.probe_verified && config.as_ref().is_some_and(|c|Some(c.revision)==state.probe_revision&&c.values["destination"].as_str()==state.probe_destination.as_deref()),"real_moderation_event_observed":state.moderation_observed>0}),
-            ),
+            "status" => {
+                let host = context.host_health().await;
+                let (
+                    host,
+                    ready,
+                    effective_subscriptions,
+                    missing_intents,
+                    destination_permissions,
+                ) = match host {
+                    Ok(host) => {
+                        let ready = host.configuration.verified
+                            && host.configuration.stored.as_ref() == config.as_ref()
+                            && host.subscriptions.ready
+                            && host.destination.verified;
+                        let effective = host.subscriptions.effective.clone();
+                        let missing = host.subscriptions.missing_intents.clone();
+                        let destination =
+                            serde_json::to_value(&host.destination).map_err(|_| invalid())?;
+                        (
+                            serde_json::to_value(host).map_err(|_| invalid())?,
+                            ready,
+                            effective,
+                            missing,
+                            destination,
+                        )
+                    }
+                    Err(_) => (
+                        json!({"state":"unavailable","error":"host_health_readback_failed"}),
+                        false,
+                        vec![],
+                        vec![],
+                        json!({"verified":false,"error":"host_health_readback_failed"}),
+                    ),
+                };
+                Ok(
+                    json!({"state":if ready&&state.last_error.is_none(){"ready"}else{"degraded"},"host":host,
+                    "effective_configuration":config,"configured":config.is_some(),"requested_event_subscriptions":self.manifest().subscriptions,
+                    "effective_event_subscriptions":effective_subscriptions,"missing_intents":missing_intents,"destination_permissions":destination_permissions,
+                    "delivery_backlog":state.pending.len(),"delivered":state.delivered,"dropped":state.dropped,"observed_metadata_records":state.observed,
+                    "observed_metadata_events":state.observed,"unknown_origin_observations":state.unknown_origin_observations,
+                    "unattributed_administrative_observations":state.unattributed_administrative_observations,"unknown_audit_actor_events":state.unknown_audit_actor_events,
+                    "attribution_state":if state.unknown_audit_actor_events==0{"no_audit_actor_gap_observed"}else{"audit_actor_gap_observed"},
+                    "last_error":state.last_error,"retention_days":14,"retention_last_run_ms":state.retention_last_run,
+                    "end_to_end_probe_verified":state.probe_verified&&config.as_ref().is_some_and(|c|Some(c.revision)==state.probe_revision&&c.values["destination"].as_str()==state.probe_destination.as_deref()),
+                    "real_moderation_event_observed":state.moderation_observed>0}),
+                )
+            }
             "probe" => {
                 let config = config.ok_or_else(invalid)?;
                 let destination = config.values["destination"].as_str().ok_or_else(invalid)?;

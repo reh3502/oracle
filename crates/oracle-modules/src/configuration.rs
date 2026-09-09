@@ -6,6 +6,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[async_trait]
 pub trait ConfigurationPolicy: Send + Sync {
+    /// Fresh host prerequisite checks, including audit-log visibility where needed.
+    /// Existing policies must explicitly opt in to nonempty subscriptions.
+    async fn validate_subscriptions(
+        &self,
+        _actor: &PolicyContext,
+        _guild: &GuildId,
+        _module: &ModuleId,
+        subscriptions: &[GuildEventKind],
+    ) -> Result<()> {
+        if subscriptions.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorCode::ForbiddenPermission))
+        }
+    }
+
     /// Recheck real host prerequisites and any destination. Returning Ok only
     /// authorizes these exact values; it does not assert successful delivery.
     async fn validate(
@@ -235,6 +251,8 @@ impl ModuleManager {
         {
             return Err(err(ErrorCode::QuotaExceeded));
         }
+        self.validate_subscription_policy(actor, guild, &generation)
+            .await?;
         services
             .policy
             .validate(actor, guild, module, &values)
@@ -298,6 +316,8 @@ impl ModuleManager {
         {
             return Err(err(ErrorCode::ForbiddenScope));
         }
+        self.validate_subscription_policy(actor, guild, &generation)
+            .await?;
         services
             .policy
             .validate(actor, guild, module, &bound.plan.values)
@@ -426,6 +446,8 @@ impl ModuleManager {
         crate::package::schema_validator(&descriptor.schema)?
             .validate(&candidate.values)
             .map_err(|_| err(ErrorCode::SchemaInvalid))?;
+        self.validate_subscription_policy(actor, guild, generation)
+            .await?;
         services
             .policy
             .validate(actor, guild, module, &candidate.values)
@@ -470,6 +492,8 @@ impl ModuleManager {
                 return Err(err(ErrorCode::ForbiddenScope));
             }
             self.core.authorize_module(actor, guild).await?;
+            self.validate_subscription_policy(actor, guild, generation)
+                .await?;
             services
                 .policy
                 .validate(actor, guild, module, &candidate.values)
@@ -500,6 +524,8 @@ impl ModuleManager {
             );
         }
         self.core.authorize_module(actor, guild).await?;
+        self.validate_subscription_policy(actor, guild, generation)
+            .await?;
         services
             .policy
             .validate(actor, guild, module, &candidate.values)
@@ -691,10 +717,19 @@ impl ModuleManager {
             return Err(unavailable());
         }
         let values = saved.values.ok_or_else(unavailable)?;
+        self.validate_subscription_policy(actor, guild, generation)
+            .await?;
         services
             .policy
             .validate(actor, guild, module, &values)
             .await?;
+        let after = services
+            .repository
+            .workflow_get(guild, WorkflowKind::Configuration, module.as_str())
+            .await?;
+        if record.as_ref().map(|r| r.revision) != after.as_ref().map(|r| r.revision) {
+            return Err(err(ErrorCode::Conflict));
+        }
         Ok(EffectiveConfiguration {
             revision: saved.revision,
             values,
@@ -752,5 +787,85 @@ impl ModuleManager {
             effective,
             receipt: saved.receipt,
         })
+    }
+}
+
+impl ModuleManager {
+    pub(super) async fn validate_subscription_policy(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        generation: &Generation,
+    ) -> Result<()> {
+        let manifest = &generation.installed.package.manifest;
+        if manifest.subscriptions.is_empty() {
+            return Ok(());
+        }
+        self.config_services()?
+            .policy
+            .validate_subscriptions(actor, guild, &manifest.id, &manifest.subscriptions)
+            .await?;
+        self.require_event_intents(generation)
+    }
+    /// Read durable acknowledgement and fresh host policy only. Calling the module's
+    /// effective hook here would recurse into an outstanding module invocation.
+    pub(super) async fn configuration_host_health(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        generation: &Generation,
+    ) -> Result<(HostConfigurationHealth, HostDestinationHealth)> {
+        let services = self.config_services()?;
+        let module = &generation.installed.package.manifest.id;
+        let before = services
+            .repository
+            .workflow_get(guild, WorkflowKind::Configuration, module.as_str())
+            .await?;
+        let saved = decode(before.as_ref())?;
+        let mut configuration = HostConfigurationHealth {
+            stored: saved.values.clone().map(|values| EffectiveConfiguration {
+                revision: saved.revision,
+                values,
+            }),
+            receipt_state: saved.receipt.as_ref().map(|receipt| receipt.state.clone()),
+            verified: saved.values.is_some()
+                && saved.effective_session.as_deref() == Some(generation.session.as_str()),
+            error: None,
+        };
+        if !configuration.verified {
+            configuration.error = Some(ErrorCode::ModuleUnavailable);
+        }
+        let mut destination = HostDestinationHealth {
+            id: saved
+                .values
+                .as_ref()
+                .and_then(|v| v.get("destination"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            verified: false,
+            error: Some(ErrorCode::ModuleUnavailable),
+        };
+        if let Some(values) = &saved.values {
+            match services.policy.validate(actor, guild, module, values).await {
+                Ok(()) => {
+                    destination.verified = true;
+                    destination.error = None;
+                }
+                Err(error) => {
+                    destination.error = Some(error.code);
+                }
+            }
+        }
+        let after = services
+            .repository
+            .workflow_get(guild, WorkflowKind::Configuration, module.as_str())
+            .await?;
+        if before.as_ref().map(|r| r.revision) != after.as_ref().map(|r| r.revision) {
+            configuration.verified = false;
+            configuration.error = Some(ErrorCode::Conflict);
+            destination.verified = false;
+            destination.error = Some(ErrorCode::Conflict);
+        }
+        Ok((configuration, destination))
     }
 }

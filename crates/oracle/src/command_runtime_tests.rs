@@ -75,6 +75,16 @@ impl CommandBackend for Backend {
 struct Policy;
 #[async_trait]
 impl oracle_modules::ConfigurationPolicy for Policy {
+    async fn validate_subscriptions(
+        &self,
+        _: &PolicyContext,
+        _: &GuildId,
+        _: &ModuleId,
+        _: &[oracle_core::GuildEventKind],
+    ) -> Result<()> {
+        // This fixture has no live Gateway; its event prerequisites are supplied by the test.
+        Ok(())
+    }
     async fn validate(
         &self,
         _: &PolicyContext,

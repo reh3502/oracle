@@ -150,6 +150,10 @@ impl CallContext {
         )
         .await
     }
+    /// Read host prerequisites for this exact invocation, without recursive module RPC.
+    pub async fn host_health(&self) -> Result<oracle_contracts::ModuleHostHealth> {
+        self.host("host.health", json!({})).await
+    }
     pub async fn contract_invoke(&self, contract: &str, input: Value) -> Result<Value> {
         self.host(
             "host.contract_invoke",

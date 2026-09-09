@@ -37,7 +37,9 @@
       },
       "timeout_ms": 30000,
       "capabilities": [
-        "storage.own"
+        "storage.own",
+        "config.own",
+        "events.guild"
       ]
     },
     {

@@ -90,6 +90,7 @@ impl NotificationCheck for FreshCheck {
         let configuration = manager
             .configuration_verified(&self.request.actor, &self.request.guild, &generation)
             .await?;
+        manager.require_event_intents(&generation)?;
         if configuration.revision != self.request.configuration_revision {
             return Err(Error::new(ErrorCode::Conflict));
         }
@@ -462,5 +463,113 @@ async fn event_worker(
     receiver.close();
     while receiver.try_recv().is_ok() {
         stats.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl ModuleManager {
+    pub(super) async fn invocation_host_health(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        number: u64,
+        authority: &Authority,
+    ) -> Result<ModuleHostHealth> {
+        self.core
+            .authorize_module(&authority.actor, &authority.guild)
+            .await?;
+        let generation = self.get(module)?;
+        let identity_matches = |current: &Generation| {
+            current.session == session
+                && current.number == number
+                && current.process().is_alive()
+                && current.gate.is_active(&authority.guild, authority.epoch)
+        };
+        if !identity_matches(&generation) {
+            return Err(unavailable());
+        }
+        let subscription_error = self
+            .validate_subscription_policy(&authority.actor, &authority.guild, &generation)
+            .await
+            .err()
+            .map(|error| error.code);
+        let (configuration, destination) = match self
+            .configuration_host_health(&authority.actor, &authority.guild, &generation)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => (
+                HostConfigurationHealth {
+                    stored: None,
+                    receipt_state: None,
+                    verified: false,
+                    error: Some(error.code),
+                },
+                HostDestinationHealth {
+                    id: None,
+                    verified: false,
+                    error: Some(error.code),
+                },
+            ),
+        };
+        // Prerequisite reads may yield across configuration or lifecycle changes.
+        let current = self.get(module)?;
+        if !identity_matches(&current) {
+            return Err(unavailable());
+        }
+        let manifest = &current.installed.package.manifest;
+        let available = self.event_intents();
+        let missing_intents: Vec<_> = manifest
+            .required_intents
+            .iter()
+            .filter(|name| !available.contains(*name))
+            .cloned()
+            .collect();
+        let error = subscription_error
+            .or_else(|| (!missing_intents.is_empty()).then_some(ErrorCode::ForbiddenPermission));
+        let ready = error.is_none() && configuration.verified && destination.verified;
+        let queue = self
+            .event_queues
+            .lock()
+            .unwrap()
+            .get(&(module.clone(), authority.guild.clone()))
+            .filter(|queue| {
+                queue.generation.session == session
+                    && queue.generation.number == number
+                    && queue.epoch == authority.epoch
+            })
+            .map(|queue| HostEventQueueHealth {
+                accepting: ready && !queue.sender.is_closed() && !queue.cancel.is_cancelled(),
+                queued: queue.sender.max_capacity() - queue.sender.capacity(),
+                delivered: queue.stats.delivered.load(Ordering::Relaxed),
+                dropped: queue.stats.dropped.load(Ordering::Relaxed),
+                last_error: *queue.stats.last_error.lock().unwrap(),
+            });
+        Ok(ModuleHostHealth {
+            module: module.clone(),
+            guild: authority.guild.clone(),
+            session: session.into(),
+            generation: number,
+            epoch: authority.epoch,
+            observed_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            configuration,
+            destination,
+            subscriptions: HostSubscriptionHealth {
+                declared: manifest.subscriptions.clone(),
+                effective: if ready {
+                    manifest.subscriptions.clone()
+                } else {
+                    vec![]
+                },
+                missing_intents,
+                ready,
+                error,
+            },
+            queue,
+        })
     }
 }

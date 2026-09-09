@@ -1,6 +1,9 @@
 use oracle_contracts::{GuildEvent, GuildEventKind, GuildEventOrigin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+fn unknown_origin() -> GuildEventOrigin {
+    GuildEventOrigin::Unknown
+}
 pub const HOUR: u64 = 3_600_000;
 pub const RETENTION: u64 = 14 * 24 * HOUR;
 pub fn moderate() -> Value {
@@ -34,6 +37,8 @@ pub fn valid_config(value: &Value) -> bool {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Metadata {
+    #[serde(default = "unknown_origin")]
+    pub origin: GuildEventOrigin,
     pub id: String,
     pub kind: GuildEventKind,
     pub at: u64,
@@ -73,6 +78,9 @@ pub struct State {
     pub observed: u64,
     pub clock: u64,
     pub moderation_observed: u64,
+    pub unknown_origin_observations: u64,
+    pub unknown_audit_actor_events: u64,
+    pub unattributed_administrative_observations: u64,
     pub joined: u64,
     pub left: u64,
     pub membership_start: Option<u64>,
@@ -118,6 +126,7 @@ impl State {
             return;
         }
         bucket.records.push(Metadata {
+            origin: event.origin,
             id: event.id.clone(),
             kind: event.kind,
             at: event.occurred_at_ms,
@@ -126,6 +135,20 @@ impl State {
             related: event.related_id.clone(),
         });
         self.observed = self.observed.saturating_add(1);
+        if event.origin == GuildEventOrigin::Unknown {
+            self.unknown_origin_observations = self.unknown_origin_observations.saturating_add(1);
+            if event.kind == GuildEventKind::ModerationAudit {
+                self.unknown_audit_actor_events = self.unknown_audit_actor_events.saturating_add(1);
+            } else if !matches!(
+                event.kind,
+                GuildEventKind::MemberJoined | GuildEventKind::MemberLeft
+            ) {
+                self.unattributed_administrative_observations = self
+                    .unattributed_administrative_observations
+                    .saturating_add(1);
+            }
+        }
+
         if matches!(
             event.kind,
             GuildEventKind::ModerationAudit | GuildEventKind::Ban | GuildEventKind::Unban
@@ -142,6 +165,11 @@ impl State {
                 self.left = self.left.saturating_add(1);
             }
             _ => {
+                // Unattributed raw changes may be Oracle's own effects. Retain their
+                // metadata separately; only authoritative external admin events notify.
+                if event.origin != GuildEventOrigin::External {
+                    return;
+                }
                 let key = format!(
                     "{:?}:{}",
                     event.kind,
@@ -188,7 +216,7 @@ impl State {
                 purpose: format!("membership:{start}"),
                 key: "membership".into(),
                 text: format!(
-                    "Membership summary: {} joined, {} left",
+                    "Membership observations (cause not attributed): {} joined, {} left",
                     self.joined, self.left
                 ),
                 count: 1,
@@ -296,7 +324,10 @@ mod tests {
         s.maintenance(899_999);
         assert!(s.pending.is_empty());
         s.maintenance(900_000);
-        assert_eq!(s.pending[0].text, "Membership summary: 1 joined, 1 left");
+        assert_eq!(
+            s.pending[0].text,
+            "Membership observations (cause not attributed): 1 joined, 1 left"
+        );
     }
     #[test]
     fn retention_exact_boundary_and_serialization_bounds() {

@@ -142,6 +142,20 @@ impl Drop for RetainStopping<'_> {
 struct Router(Weak<ModuleManager>);
 #[async_trait]
 impl ContractRouter for Router {
+    async fn host_health(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        generation: u64,
+        authority: Authority,
+    ) -> Result<ModuleHostHealth> {
+        self.0
+            .upgrade()
+            .ok_or_else(unavailable)?
+            .invocation_host_health(module, session, generation, &authority)
+            .await
+    }
+
     async fn notify(
         &self,
         module: &ModuleId,
@@ -551,6 +565,8 @@ impl ModuleManager {
             validate_command_admission(manifest, &grants, &active_commands)?;
             if !manifest.subscriptions.is_empty() {
                 self.require_event_intents(&generation)?;
+                self.validate_subscription_policy(context, &desired.guild, &generation)
+                    .await?;
             }
             if grants.iter().any(|c| !manifest.capabilities.contains(c)) {
                 return Err(Error::new(ErrorCode::ForbiddenPermission));
@@ -586,6 +602,8 @@ impl ModuleManager {
             // Admission becomes visible only after activation intent and restored
             // configuration have both been verified.
             // Keep this publication synchronous with disarming cancellation cleanup.
+            self.validate_subscription_policy(context, &desired.guild, &generation)
+                .await?;
             generation.publish_activation(&desired.guild)?;
             provisional.0 = None;
             self.publish_counts();

@@ -5,8 +5,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use oracle_core::{
-    DocumentWrite, Error, ErrorCode, GuildEvent, GuildId, InstalledModule, ModuleId,
-    ModuleManifest, ModuleRepository, PolicyContext, Result,
+    DocumentWrite, Error, ErrorCode, GuildEvent, GuildId, InstalledModule, ModuleHostHealth,
+    ModuleId, ModuleManifest, ModuleRepository, PolicyContext, Result,
 };
 use oracle_process::{ModuleProcess, ProcessRuntime, RuntimeError, StopReport};
 use oracle_rpc::{RpcError, RpcHandler, RpcPeer};
@@ -30,6 +30,14 @@ pub(crate) struct Activation {
 }
 #[async_trait]
 pub(crate) trait ContractRouter: Send + Sync {
+    async fn host_health(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        generation: u64,
+        authority: Authority,
+    ) -> Result<ModuleHostHealth>;
+
     #[allow(clippy::too_many_arguments)] // Explicit scope, lease and notification body cross one trusted boundary.
     async fn notify(
         &self,
@@ -544,6 +552,31 @@ impl Generation {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         match method {
+            "host.health" => {
+                let request: HealthRequest = decode(params)?;
+                let authority = self.gate.authority(&request.invocation)?;
+                if !["config.own", "events.guild"]
+                    .iter()
+                    .all(|cap| authority.capabilities.contains(*cap))
+                {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                let health = self
+                    .bounded(
+                        &request.invocation,
+                        &authority,
+                        &cancel,
+                        self.router.host_health(
+                            &self.installed.package.manifest.id,
+                            &self.session,
+                            self.number,
+                            authority.clone(),
+                        ),
+                    )
+                    .await?;
+                self.gate.authority(&request.invocation)?;
+                encode(health)
+            }
             "host.notify" => {
                 let request: Notification = decode(params)?;
                 let authority = self.gate.authority(&request.invocation)?;
@@ -774,4 +807,10 @@ impl RpcHandler for Callbacks {
             .await
             .map_err(|error| RpcError::Remote(format!("{:?}", error.code)))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthRequest {
+    invocation: String,
 }

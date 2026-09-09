@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -21,9 +24,27 @@ use tokio_util::sync::CancellationToken;
 const ACTOR: PolicyContext = PolicyContext::LocalOperator;
 const HOUR: u64 = 3_600_000;
 const RETENTION: u64 = 14 * 24 * HOUR;
-struct Policy;
+#[derive(Default)]
+struct Policy {
+    denied: AtomicBool,
+    subscriptions_denied: AtomicBool,
+}
 #[async_trait::async_trait]
 impl ConfigurationPolicy for Policy {
+    async fn validate_subscriptions(
+        &self,
+        _: &PolicyContext,
+        _: &GuildId,
+        _: &ModuleId,
+        _: &[GuildEventKind],
+    ) -> Result<()> {
+        if self.subscriptions_denied.load(Ordering::SeqCst) {
+            Err(Error::new(ErrorCode::ForbiddenPermission))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn validate(
         &self,
         _: &PolicyContext,
@@ -31,7 +52,7 @@ impl ConfigurationPolicy for Policy {
         _: &ModuleId,
         values: &Value,
     ) -> Result<()> {
-        if values["destination"] == "456" {
+        if values["destination"] == "456" && !self.denied.load(Ordering::SeqCst) {
             Ok(())
         } else {
             Err(Error::new(ErrorCode::ForbiddenPermission))
@@ -171,27 +192,35 @@ async fn delivered(manager: &ModuleManager, count: usize) {
     .unwrap();
 }
 async fn status(manager: &ModuleManager, module: &ModuleId, guild: &GuildId) -> Value {
-    manager
-        .invoke(&ACTOR, module, guild, "status", json!({}))
-        .await
-        .unwrap()
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.invoke(&ACTOR, module, guild, "status", json!({})),
+    )
+    .await
+    .expect("status must not recursively wait on the module RPC lock")
+    .unwrap()
 }
 #[tokio::test]
 #[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
 async fn real_activity_log_configures_delivers_deduplicates_reloads_and_expires_metadata() {
-    run(false, false).await;
+    run(false, false, false).await;
 }
 #[tokio::test]
 #[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
 async fn real_activity_log_does_not_verify_or_replay_uncertain_delivery() {
-    run(true, false).await;
+    run(true, false, false).await;
 }
 #[tokio::test]
 #[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
 async fn real_activity_log_maintenance_removes_expired_metadata() {
-    run(false, true).await;
+    run(false, true, false).await;
 }
-async fn run(mismatch: bool, retention_only: bool) {
+#[tokio::test]
+#[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
+async fn real_activity_log_reports_fresh_host_health_and_preserves_event_attribution() {
+    run(false, false, true).await;
+}
+async fn run(mismatch: bool, retention_only: bool, health_and_origin: bool) {
     let scratch =
         std::env::temp_dir().join(format!("oracle-activity-log-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&scratch).unwrap();
@@ -215,8 +244,9 @@ async fn run(mismatch: bool, retention_only: bool) {
         }],
     ));
     let manager = ModuleManager::new(storage.clone(), core, scratch.join("artifacts")).unwrap();
+    let policy = Arc::new(Policy::default());
     manager
-        .set_configuration_services(storage.clone(), Arc::new(Policy))
+        .set_configuration_services(storage.clone(), policy.clone())
         .unwrap();
     let (transport, server) = Transport::start(mismatch).await;
     manager
@@ -295,6 +325,183 @@ async fn run(mismatch: bool, retention_only: bool) {
         assert_eq!(initial["effective_configuration"]["values"], plan.values);
         assert_eq!(initial["end_to_end_probe_verified"], false);
         assert_eq!(initial["real_moderation_event_observed"], false);
+        assert_eq!(initial["state"], "ready");
+        assert_eq!(
+            initial["host"]["configuration"]["stored"],
+            initial["effective_configuration"]
+        );
+        assert_eq!(initial["host"]["configuration"]["verified"], true);
+        assert_eq!(
+            initial["host"]["configuration"]["receipt_state"],
+            "effective"
+        );
+        assert_eq!(initial["destination_permissions"]["id"], "456");
+        assert_eq!(initial["destination_permissions"]["verified"], true);
+        assert_eq!(
+            initial["effective_event_subscriptions"],
+            initial["requested_event_subscriptions"]
+        );
+        assert!(
+            !initial["effective_event_subscriptions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        if health_and_origin {
+            policy.denied.store(true, Ordering::SeqCst);
+            let denied = status(&manager, &module, &guild).await;
+            assert_eq!(denied["state"], "degraded");
+            assert_eq!(denied["destination_permissions"]["verified"], false);
+            assert_eq!(denied["host"]["configuration"]["verified"], true);
+            assert_eq!(denied["effective_event_subscriptions"], json!([]));
+            policy.denied.store(false, Ordering::SeqCst);
+            policy.subscriptions_denied.store(true, Ordering::SeqCst);
+            let denied = status(&manager, &module, &guild).await;
+            assert_eq!(denied["state"], "degraded");
+            assert_eq!(denied["host"]["subscriptions"]["ready"], false);
+            assert_eq!(denied["destination_permissions"]["verified"], true);
+            policy.subscriptions_denied.store(false, Ordering::SeqCst);
+            manager
+                .set_event_intents(BTreeSet::from(["guilds".into(), "guild_members".into()]))
+                .unwrap();
+            let missing = status(&manager, &module, &guild).await;
+            assert_eq!(missing["state"], "degraded");
+            assert_eq!(missing["missing_intents"], json!(["guild_moderation"]));
+            assert_eq!(missing["effective_event_subscriptions"], json!([]));
+            manager
+                .set_event_intents(BTreeSet::from([
+                    "guilds".into(),
+                    "guild_members".into(),
+                    "guild_moderation".into(),
+                ]))
+                .unwrap();
+            assert_eq!(status(&manager, &module, &guild).await["state"], "ready");
+            let at = 2 * HOUR;
+            let mut unknown = event("raw-unknown", GuildEventKind::ChannelChanged, at);
+            unknown.origin = GuildEventOrigin::Unknown;
+            unknown.actor_id = None;
+            manager.deliver_event(&guild, unknown).await.unwrap();
+            delivered(&manager, 1).await;
+            let mut own = event("own-audit", GuildEventKind::ModerationAudit, at);
+            own.origin = GuildEventOrigin::Oracle;
+            manager.deliver_event(&guild, own).await.unwrap();
+            delivered(&manager, 2).await;
+            manager
+                .deliver_event(
+                    &guild,
+                    event("flush-unknown", GuildEventKind::Maintenance, at + 30_000),
+                )
+                .await
+                .unwrap();
+            delivered(&manager, 3).await;
+            let unknown_status = status(&manager, &module, &guild).await;
+            assert_eq!(unknown_status["observed_metadata_events"], 1);
+            assert_eq!(unknown_status["unknown_origin_observations"], 1);
+            assert_eq!(
+                unknown_status["unattributed_administrative_observations"],
+                1
+            );
+            assert_eq!(unknown_status["real_moderation_event_observed"], false);
+            assert!(transport.state.lock().unwrap().messages.is_empty());
+            let bucket = storage
+                .document_get(&module, &guild, "logging", "hour:2")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bucket.value["records"].as_array().unwrap().len(), 1);
+            assert_eq!(bucket.value["records"][0]["origin"], "unknown");
+            manager
+                .deliver_event(
+                    &guild,
+                    event(
+                        "external-audit",
+                        GuildEventKind::ModerationAudit,
+                        at + 30_000,
+                    ),
+                )
+                .await
+                .unwrap();
+            delivered(&manager, 4).await;
+            manager
+                .deliver_event(
+                    &guild,
+                    event("flush-external", GuildEventKind::Maintenance, at + 60_000),
+                )
+                .await
+                .unwrap();
+            delivered(&manager, 5).await;
+            let observed = status(&manager, &module, &guild).await;
+            assert_eq!(observed["observed_metadata_events"], 2);
+            assert_eq!(observed["real_moderation_event_observed"], true);
+            assert_eq!(observed["delivered"], 1);
+            assert_eq!(transport.state.lock().unwrap().messages.len(), 1);
+            assert_eq!(transport.state.lock().unwrap().readbacks, 1);
+            // Persist the pre-attribution document shape, then load it through the
+            // separate module executable rather than a domain-only serde test.
+            let saved = storage
+                .document_get(&module, &guild, "logging", "state")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut legacy_state = saved.value;
+            for field in [
+                "unknown_origin_observations",
+                "unattributed_administrative_observations",
+                "unknown_audit_actor_events",
+            ] {
+                legacy_state.as_object_mut().unwrap().remove(field);
+            }
+            let bucket = storage
+                .document_get(&module, &guild, "logging", "hour:2")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut legacy_bucket = bucket.value;
+            for record in legacy_bucket["records"].as_array_mut().unwrap() {
+                record.as_object_mut().unwrap().remove("origin");
+            }
+            storage
+                .document_batch(
+                    &module,
+                    &guild,
+                    1,
+                    &[
+                        DocumentWrite {
+                            collection: "logging".into(),
+                            key: "state".into(),
+                            expected_revision: Some(saved.revision),
+                            value: Some(legacy_state),
+                        },
+                        DocumentWrite {
+                            collection: "logging".into(),
+                            key: "hour:2".into(),
+                            expected_revision: Some(bucket.revision),
+                            value: Some(legacy_bucket),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            manager
+                .unload(&module, Duration::from_secs(2))
+                .await
+                .unwrap();
+            manager.load(&installed.digest).await.unwrap();
+            let compatible = status(&manager, &module, &guild).await;
+            assert_eq!(compatible["state"], "ready");
+            assert_eq!(compatible["observed_metadata_events"], 2);
+            assert_eq!(compatible["unknown_origin_observations"], 0);
+            manager
+                .deliver_event(
+                    &guild,
+                    event("legacy-flush", GuildEventKind::Maintenance, at + 90_000),
+                )
+                .await
+                .unwrap();
+            delivered(&manager, 1).await;
+            assert_eq!(transport.state.lock().unwrap().messages.len(), 1);
+            return;
+        }
         let probe = manager
             .invoke(&ACTOR, &module, &guild, "probe", json!({}))
             .await;

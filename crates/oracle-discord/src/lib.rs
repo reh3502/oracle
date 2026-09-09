@@ -170,6 +170,7 @@ struct GatewayRuntime {
     bot: AtomicU64,
     connected: std::sync::atomic::AtomicBool,
     member_role_gaps: AtomicU64,
+    unknown_origins: AtomicU64,
 }
 pub struct DiscordBootstrap {
     core: Arc<CoreService>,
@@ -212,6 +213,7 @@ impl DiscordBootstrap {
             bot: AtomicU64::new(0),
             connected: std::sync::atomic::AtomicBool::new(false),
             member_role_gaps: AtomicU64::new(0),
+            unknown_origins: AtomicU64::new(0),
         });
         Ok(bootstrap)
     }
@@ -234,10 +236,10 @@ impl DiscordBootstrap {
     pub fn event_coverage(&self) -> serde_json::Value {
         match &self.runtime {
             Some(runtime) => {
-                serde_json::json!({"connected":runtime.connected.load(Ordering::SeqCst),"configured_intents":runtime.intents,"member_role_observation_gaps":runtime.member_role_gaps.load(Ordering::Relaxed)})
+                serde_json::json!({"connected":runtime.connected.load(Ordering::SeqCst),"configured_intents":runtime.intents,"member_role_observation_gaps":runtime.member_role_gaps.load(Ordering::Relaxed),"unknown_origin_observations":runtime.unknown_origins.load(Ordering::Relaxed)})
             }
             None => {
-                serde_json::json!({"connected":false,"configured_intents":[],"member_role_observation_gaps":0})
+                serde_json::json!({"connected":false,"configured_intents":[],"member_role_observation_gaps":0,"unknown_origin_observations":0})
             }
         }
     }
@@ -484,7 +486,23 @@ impl discord::EventHandler for DiscordBootstrap {
                 .try_into()
                 .unwrap_or(u64::MAX);
             match gateway_events::normalize(event, runtime.bot.load(Ordering::SeqCst), now) {
+                gateway_events::Normalized::Audit(guild, events) => {
+                    if events
+                        .first()
+                        .is_some_and(|event| event.origin == oracle_core::GuildEventOrigin::Unknown)
+                    {
+                        runtime.unknown_origins.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for event in events {
+                        if runtime.modules.deliver_event(&guild, event).await.is_err() {
+                            self.failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 gateway_events::Normalized::Event(guild, event) => {
+                    if event.origin == oracle_core::GuildEventOrigin::Unknown {
+                        runtime.unknown_origins.fetch_add(1, Ordering::Relaxed);
+                    }
                     if runtime.modules.deliver_event(&guild, event).await.is_err() {
                         self.failures.fetch_add(1, Ordering::Relaxed);
                     }

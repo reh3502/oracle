@@ -24,6 +24,26 @@ impl DispatchFence for ModuleFence {
 }
 #[async_trait]
 impl ConfigurationPolicy for DiscordOperations {
+    async fn validate_subscriptions(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        _module: &ModuleId,
+        subscriptions: &[oracle_core::GuildEventKind],
+    ) -> Result<()> {
+        if subscriptions.is_empty() {
+            return Ok(());
+        }
+        let snapshot = self.mutation_authority(actor, guild).await?;
+        let bits = oracle_operations::permissions::guild_permissions(
+            guild.as_str(),
+            &snapshot.owner,
+            &snapshot.roles,
+            &snapshot.bot,
+        )?;
+        subscription_permissions(bits, subscriptions)
+    }
+
     async fn validate(
         &self,
         actor: &PolicyContext,
@@ -42,6 +62,24 @@ impl ConfigurationPolicy for DiscordOperations {
         }
         Ok(())
     }
+}
+// Gateway intent selection does not confer these guild permissions.
+fn subscription_permissions(
+    bits: u64,
+    subscriptions: &[oracle_core::GuildEventKind],
+) -> Result<()> {
+    use oracle_core::GuildEventKind as K;
+    let audit = discord::Permissions::VIEW_AUDIT_LOG.bits();
+    let ban = discord::Permissions::BAN_MEMBERS.bits();
+    if subscriptions.contains(&K::ModerationAudit) && bits & audit == 0
+        || subscriptions
+            .iter()
+            .any(|kind| matches!(kind, K::Ban | K::Unban))
+            && bits & (audit | ban) == 0
+    {
+        return Err(Error::new(ErrorCode::ForbiddenPermission));
+    }
+    Ok(())
 }
 struct NotificationFresh<'a> {
     adapter: &'a DiscordOperations,
@@ -114,6 +152,18 @@ impl NotificationTransport for DiscordOperations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audit_permission_is_required_and_revocation_is_observed() {
+        use oracle_core::GuildEventKind as K;
+        let audit = discord::Permissions::VIEW_AUDIT_LOG.bits();
+        let ban = discord::Permissions::BAN_MEMBERS.bits();
+        assert!(subscription_permissions(audit, &[K::ModerationAudit, K::Ban]).is_ok());
+        assert!(subscription_permissions(0, &[K::ModerationAudit]).is_err());
+        assert!(subscription_permissions(ban, &[K::ModerationAudit]).is_err());
+        assert!(subscription_permissions(ban, &[K::Ban, K::Unban]).is_ok());
+        assert!(subscription_permissions(0, &[K::Ban]).is_err());
+        assert!(subscription_permissions(0, &[K::ChannelChanged]).is_ok());
+    }
     #[test]
     fn notification_mentions_are_disabled_and_size_is_unicode_bounded() {
         let body = message_body("@everyone <@123> hello").unwrap();

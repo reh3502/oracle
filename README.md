@@ -136,9 +136,13 @@ Production crates separate value contracts, policy/orchestration, SQL repositori
 ```sh
 cargo test --locked --workspace
 python3 scripts/check-stage1.py --postgres-bin /usr/lib/postgresql/18/bin
+python3 scripts/check-stage2.py --postgres-bin /usr/lib/postgresql/18/bin
+python3 scripts/check-stage3.py --require-postgres --postgres-bin /usr/lib/postgresql/18/bin
 ```
 
 The acceptance drill creates and stops a disposable PostgreSQL cluster and exercises both backends, native backups, isolated restores and the actual running host. Supply `--postgres-share` and `--postgres-lib` when using an extracted PostgreSQL installation. The ordinary Cargo suite skips its PostgreSQL contract unless `ORACLE_TEST_POSTGRES_URL` and `ORACLE_TEST_POSTGRES_RESTORE_URL` name disposable databases; the acceptance drill supplies both.
+
+The Stage 2 runner covers process loading, activation, effects, upgrades, and developer reloads. The Stage 3 runner builds isolated configuration, event, collision, and logging fixtures; verifies command identities and both database backends; and checks Rust 1.95, Clippy, and formatting. Its reports stay under ignored `target/`.
 
 The `prototypes/` directory contains process, effect-boundary, Discord, storage, Gemini and scenario experiments. They are development fixtures, not bundled feature modules. Its separate local suite is `python3 scripts/check-stage0.py --offline-only`; live checks require separately supplied credentials. No routine test sends paid provider requests or changes a Discord guild.
 

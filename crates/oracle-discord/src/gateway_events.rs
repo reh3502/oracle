@@ -20,6 +20,7 @@ pub(super) fn intents(names: &BTreeSet<String>) -> oracle_core::Result<discord::
 }
 pub(super) enum Normalized {
     Event(GuildId, GuildEvent),
+    Audit(GuildId, Vec<GuildEvent>),
     MemberRolesGap(GuildId),
     Ignored,
 }
@@ -51,10 +52,10 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             entry.user_id.map(|id| id.to_string()),
             None,
             Some(format!("audit:{}", entry.id)),
-            if entry.user_id.is_some_and(|id| id.get() == bot) {
-                GuildEventOrigin::Oracle
-            } else {
-                GuildEventOrigin::External
+            match entry.user_id {
+                Some(id) if id.get() == bot => GuildEventOrigin::Oracle,
+                Some(_) => GuildEventOrigin::External,
+                None => GuildEventOrigin::Unknown,
             },
             u64::try_from(entry.id.created_at().unix_timestamp_millis()).unwrap_or(received_at_ms),
         ),
@@ -73,7 +74,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             channel.parent_id.map(|id| id.to_string()),
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildRoleCreate { new: role, .. } | F::GuildRoleUpdate { new: role, .. } => (
@@ -83,7 +84,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             None,
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildRoleDelete {
@@ -97,7 +98,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             None,
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildBanAddition {
@@ -111,7 +112,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             None,
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildBanRemoval {
@@ -125,7 +126,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             None,
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildMemberAddition { new_member, .. } => (
@@ -135,7 +136,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             None,
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildMemberRemoval { guild_id, user, .. } => (
@@ -145,7 +146,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
             None,
             None,
             None,
-            GuildEventOrigin::External,
+            GuildEventOrigin::Unknown,
             received_at_ms,
         ),
         F::GuildMemberUpdate {
@@ -180,7 +181,7 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
                 None,
                 None,
                 None,
-                GuildEventOrigin::External,
+                GuildEventOrigin::Unknown,
                 received_at_ms,
             )
         }
@@ -191,18 +192,36 @@ pub(super) fn normalize(event: &discord::FullEvent, bot: u64, received_at_ms: u6
     };
     // Audit IDs survive replay. Other FullEvent variants expose no Gateway sequence;
     // assign one host envelope ID and preserve it through all queue/retry operations.
-    Normalized::Event(
-        guild,
-        GuildEvent {
-            id: stable.unwrap_or_else(|| format!("gateway:{}", OperationId::generate())),
-            kind,
-            occurred_at_ms: at.max(1),
-            origin,
-            subject_id: subject,
-            actor_id: actor,
-            related_id: related,
-        },
-    )
+    let envelope = GuildEvent {
+        id: stable.unwrap_or_else(|| format!("gateway:{}", OperationId::generate())),
+        kind,
+        occurred_at_ms: at.max(1),
+        origin,
+        subject_id: subject,
+        actor_id: actor,
+        related_id: related,
+    };
+    if let F::GuildAuditLogEntryCreate { entry, .. } = event {
+        let typed = match entry.action.num() {
+            10..=15 => Some(K::ChannelChanged),
+            30..=32 => Some(K::RoleAccessChanged),
+            25 => Some(K::MemberRolesChanged),
+            22 => Some(K::Ban),
+            23 => Some(K::Unban),
+            _ => None,
+        };
+        // The general audit subscription and the typed subscription receive separate
+        // projections with stable IDs. Neither projection invents an absent actor.
+        let mut events = vec![envelope];
+        if let Some(kind) = typed {
+            let mut category = events[0].clone();
+            category.id.push_str(":category");
+            category.kind = kind;
+            events.push(category);
+        }
+        return Normalized::Audit(guild, events);
+    }
+    Normalized::Event(guild, envelope)
 }
 #[cfg(test)]
 mod tests {
@@ -222,12 +241,16 @@ mod tests {
             "GUILD_AUDIT_LOG_ENTRY_CREATE",
             json!({"guild_id":"101","id":"1000000000000000000","action_type":22,"target_id":"303","user_id":"505","reason":"PRIVATE_REASON","changes":[]}),
         );
-        let Normalized::Event(guild, one) = normalize(&input, 505, 1000) else {
+        let Normalized::Audit(guild, first) = normalize(&input, 505, 1000) else {
             panic!("missingevent");
         };
-        let Normalized::Event(_, two) = normalize(&input, 505, 2000) else {
+        let Normalized::Audit(_, second) = normalize(&input, 505, 2000) else {
             panic!("missingevent");
         };
+        let one = &first[0];
+        let two = &second[0];
+        assert_eq!(first[1].kind, GuildEventKind::Ban);
+        assert_eq!(first[1].origin, GuildEventOrigin::Oracle);
         assert_eq!(guild.as_str(), "101");
         assert_eq!(one.id, two.id);
         assert_eq!(one.origin, GuildEventOrigin::Oracle);
@@ -235,6 +258,71 @@ mod tests {
         let text = serde_json::to_string(&one).unwrap();
         assert!(!text.contains("PRIVATE_REASON"));
         assert!(!text.contains("changes"));
+    }
+    #[test]
+    fn audit_origin_requires_explicit_actor_and_preserves_typed_categories() {
+        for (actor, expected) in [
+            (None, GuildEventOrigin::Unknown),
+            (Some("505"), GuildEventOrigin::Oracle),
+            (Some("606"), GuildEventOrigin::External),
+        ] {
+            let input = event(
+                "GUILD_AUDIT_LOG_ENTRY_CREATE",
+                json!({"guild_id":"101","id":"1000000000000000000","action_type":10,"target_id":"202","user_id":actor,"changes":[]}),
+            );
+            let Normalized::Audit(_, events) = normalize(&input, 505, 1000) else {
+                panic!("missing audit");
+            };
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].kind, GuildEventKind::ModerationAudit);
+            assert_eq!(events[1].kind, GuildEventKind::ChannelChanged);
+            assert_ne!(events[0].id, events[1].id);
+            assert!(events.iter().all(|event| event.origin == expected));
+        }
+    }
+    #[test]
+    fn audit_categories_preserve_coverage_without_duplicate_membership_totals() {
+        use GuildEventKind as K;
+        for (action, kind) in [
+            (10, Some(K::ChannelChanged)),
+            (15, Some(K::ChannelChanged)),
+            (30, Some(K::RoleAccessChanged)),
+            (32, Some(K::RoleAccessChanged)),
+            (25, Some(K::MemberRolesChanged)),
+            (22, Some(K::Ban)),
+            (23, Some(K::Unban)),
+            (20, None),
+            (21, None),
+        ] {
+            let input = event(
+                "GUILD_AUDIT_LOG_ENTRY_CREATE",
+                json!({"guild_id":"101","id":"1000000000000000000","action_type":action,"target_id":"202","user_id":"606","changes":[]}),
+            );
+            let Normalized::Audit(_, events) = normalize(&input, 505, 1000) else {
+                panic!("missing audit");
+            };
+            assert_eq!(events[0].kind, K::ModerationAudit);
+            assert_eq!(events.get(1).map(|event| event.kind), kind);
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.origin == GuildEventOrigin::External)
+            );
+        }
+    }
+    #[test]
+    fn concurrent_raw_channel_observations_remain_unknown_at_any_time() {
+        let raw = event(
+            "CHANNEL_CREATE",
+            json!({"guild_id":"101","id":"202","type":0,"name":"name","permission_overwrites":[]}),
+        );
+        for at in [1000, 1_000_000] {
+            let Normalized::Event(_, output) = normalize(&raw, 505, at) else {
+                panic!("missing observation");
+            };
+            assert_eq!(output.origin, GuildEventOrigin::Unknown);
+            assert_eq!(output.actor_id, None);
+        }
     }
     #[test]
     fn channel_metadata_excludes_names_topics_and_guild_is_exact() {
