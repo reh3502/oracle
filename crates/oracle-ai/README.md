@@ -47,6 +47,6 @@ Operations are hidden from the model unless their installed manifest explicitly 
 "ai": { "kind": "inspection", "success_pointer": null }
 ```
 
-`verification` also requires `discord.notify` and a JSON pointer to a boolean result postcondition. Inspection cannot declare `discord.notify`; neither projection can declare `contracts.invoke` or `host.echo`. The host still checks current capability grants, actor/guild scope, session, generation, activation epoch and canonical schemas. These descriptors describe reviewed native code; they do not sandbox module code or grant new authority.
+`verification` also requires `discord.notify` and a JSON pointer to a boolean result postcondition. Inspection postconditions must accept an empty input object for fresh host readback. Inspection cannot declare `discord.notify`; neither projection can declare `contracts.invoke` or `host.echo`. The host still checks current capability grants, actor/guild scope, session, generation, activation epoch and canonical schemas. These descriptors describe reviewed native code; they do not sandbox module code or grant new authority.
 
 A verification result must include `receipt.host_effect_id` from the host notification API. The host checks the real effect state, purpose, destination and delivery receipt, then refreshes configuration, subscriptions and destination policy. A module's boolean alone cannot prove delivery. The logging example declares separate inspection and verification projections; it remains an optional installed artifact.

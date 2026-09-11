@@ -289,6 +289,9 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                 || (ai.kind == ModuleAiOperationKind::Verification
                     && (!operation.capabilities.iter().any(|c| c == "discord.notify")
                         || ai.success_pointer.is_none()))
+                || (ai.kind == ModuleAiOperationKind::Inspection
+                    && ai.success_pointer.is_some()
+                    && !schema_validator(&operation.input_schema)?.is_valid(&serde_json::json!({})))
                 || ai.success_pointer.as_ref().is_some_and(|pointer| {
                     !pointer.starts_with('/')
                         || pointer.len() > 256
@@ -904,6 +907,15 @@ mod tests {
             success_pointer: None,
         });
         validate_manifest(manifest).unwrap();
+        manifest.operations[0].ai.as_mut().unwrap().success_pointer = Some("/ready".into());
+        manifest.operations[0].input_schema["required"] = json!(["id"]);
+        assert!(validate_manifest(manifest).is_err());
+        manifest.operations[0]
+            .input_schema
+            .as_object_mut()
+            .unwrap()
+            .remove("required");
+        manifest.operations[0].ai.as_mut().unwrap().success_pointer = None;
         manifest.operations[0].capabilities = vec!["discord.notify".into()];
         assert!(validate_manifest(manifest).is_err());
         manifest.operations[0].ai.as_mut().unwrap().kind = ModuleAiOperationKind::Verification;
