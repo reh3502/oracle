@@ -1044,6 +1044,10 @@ mod tests;
 #[path = "ai_logging_tests.rs"]
 mod logging_tests;
 
+#[cfg(test)]
+#[path = "ai_b02_tests.rs"]
+mod b02_tests;
+
 fn constant_schema(fixed: &Value, depth: usize) -> Result<Value> {
     if depth > 24 {
         return Err(invalid());

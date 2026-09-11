@@ -264,7 +264,10 @@ fn coordinator(host: &Arc<Host>, destination: &str) -> Coordinator {
         }),
     )
 }
-fn coordinator_with_provider(host: &Arc<Host>, provider: Arc<dyn ModelProvider>) -> Coordinator {
+pub(super) fn coordinator_with_provider(
+    host: &Arc<Host>,
+    provider: Arc<dyn ModelProvider>,
+) -> Coordinator {
     Coordinator::new(
         provider,
         Arc::new(RunStore::new(host.core.clone(), host.storage.clone())),

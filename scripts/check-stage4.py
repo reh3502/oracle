@@ -63,6 +63,10 @@ LOGGING_TESTS = [
     "agent_logging_missing_inactive_and_unloaded_catalogs_never_authorize_stale_apply",
     "agent_malicious_module_guide_cannot_read_or_exfiltrate_host_secret",
 ]
+B02_TESTS = [
+    "no_named_preset_uses_discovered_typed_configuration_and_verifies_delivery",
+    "no_configuration_capability_reports_missing_support_without_effects",
+]
 
 
 def isolated_environment(source):
@@ -135,6 +139,8 @@ def main():
         fixtures = {
             "ORACLE_ACTIVITY_LOG": q.fixture("activity-log", "oracle-example-activity-log", "", "ORACLE_ACTIVITY_LOG"),
             "ORACLE_ACTIVITY_LOG_INJECTION": q.fixture("activity-log-injection", "oracle-example-activity-log", "injection-fixture", "ORACLE_ACTIVITY_LOG_INJECTION"),
+            "ORACLE_ACTIVITY_LOG_TYPED_CONFIG": q.fixture("activity-log-typed-config", "oracle-example-activity-log", "typed-config-fixture", "ORACLE_ACTIVITY_LOG_TYPED_CONFIG"),
+            "ORACLE_ACTIVITY_LOG_NO_CONFIG": q.fixture("activity-log-no-config", "oracle-example-activity-log", "no-config-fixture", "ORACLE_ACTIVITY_LOG_NO_CONFIG"),
         }
         q.command("architecture", [sys.executable, ROOT / "scripts/check-architecture.py"])
         q.command("gate-tests", [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests"])
@@ -151,6 +157,8 @@ def main():
         q.test("catalog-projection-fails-closed", "oracle", "ai::recovery_tests::catalog_unprojectable_or_colliding_module_tools_cannot_remove_core_operations")
         for test in LOGGING_TESTS:
             q.test("sqlite-" + test, "oracle", "ai::logging_tests::" + test, fixtures, ignored=True)
+        for test in B02_TESTS:
+            q.test("sqlite-" + test, "oracle", "ai::b02_tests::" + test, fixtures, ignored=True)
         if pg:
             for name in ["initdb", "pg_ctl", "postgres", "createdb", "pg_dump", "pg_restore"]:
                 if not (pg / name).is_file():
@@ -184,6 +192,7 @@ def main():
             cases += [("oracle", "ai::tests::" + test, False) for test in HOST_TESTS]
             cases += [("oracle", "ai::recovery_tests::" + test, False) for test in RECOVERY_TESTS]
             cases += [("oracle", "ai::logging_tests::" + test, True) for test in LOGGING_TESTS]
+            cases += [("oracle", "ai::b02_tests::" + test, True) for test in B02_TESTS]
             for index, (package, test, ignored) in enumerate(cases):
                 database = f"scenario_{index}"
                 q.command("create-" + database, [pg / "createdb", "-h", socket, "-p", "55444", database], timeout=60)
