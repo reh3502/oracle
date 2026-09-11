@@ -192,6 +192,50 @@ async fn run(case: &'static str) {
                     .await
                     .unwrap();
                 assert_eq!(retry.stored_revision, 1);
+                let unchanged = manager
+                    .configuration_plan(&ACTOR, &guild, &module, None, json!({}), TTL)
+                    .await
+                    .unwrap();
+                let repeated = manager
+                    .configuration_apply(&ACTOR, &guild, &module, &unchanged.id)
+                    .await
+                    .unwrap();
+                assert_eq!(repeated.plan, unchanged.id);
+                assert_eq!(repeated.state, "effective");
+                assert_eq!(
+                    repeated.stored_revision, 1,
+                    "unchanged desired values must not create another revision"
+                );
+                assert_eq!(repeated.effective_revision, Some(1));
+                assert_eq!(
+                    manager
+                        .configuration_inspect(&ACTOR, &guild, &module)
+                        .await
+                        .unwrap()
+                        .receipt
+                        .unwrap()
+                        .plan,
+                    unchanged.id
+                );
+                let third = manager
+                    .configuration_plan(&ACTOR, &guild, &module, None, json!({}), TTL)
+                    .await
+                    .unwrap();
+                let third_receipt = manager
+                    .configuration_apply(&ACTOR, &guild, &module, &third.id)
+                    .await
+                    .unwrap();
+                assert_eq!(third_receipt.plan, third.id);
+                assert_eq!(third_receipt.state, "effective");
+                assert_eq!(third_receipt.stored_revision, 1);
+                let recovered = manager
+                    .configuration_recover(&ACTOR, &guild, &module)
+                    .await
+                    .unwrap();
+                assert_eq!(recovered.plan, third.id);
+                assert_eq!(recovered.state, "effective");
+                assert_eq!(recovered.stored_revision, 1);
+                assert_eq!(recovered.effective_revision, Some(1));
                 let stale = manager
                     .configuration_plan(&ACTOR, &guild, &module, None, json!({"level":3}), TTL)
                     .await
@@ -281,7 +325,18 @@ async fn run(case: &'static str) {
                     .configuration_plan(&ACTOR, &guild, &module, None, json!({"level":4}), TTL)
                     .await
                     .unwrap();
+                let unchanged = manager
+                    .configuration_plan(&ACTOR, &guild, &module, None, json!({}), TTL)
+                    .await
+                    .unwrap();
                 policy.0.store(false, Ordering::SeqCst);
+                assert!(
+                    manager
+                        .configuration_apply(&ACTOR, &guild, &module, &unchanged.id)
+                        .await
+                        .is_err(),
+                    "unchanged configuration still needs current authorization"
+                );
                 assert!(
                     manager
                         .configuration_apply(&ACTOR, &guild, &module, &plan.id)
@@ -414,6 +469,21 @@ async fn run(case: &'static str) {
                     Some("effective_config_mismatch")
                 );
                 assert_eq!(receipt.effective_revision, None);
+                let unchanged = manager
+                    .configuration_plan(&ACTOR, &guild, &module, None, json!({}), TTL)
+                    .await
+                    .unwrap();
+                let retried = manager
+                    .configuration_apply(&ACTOR, &guild, &module, &unchanged.id)
+                    .await
+                    .unwrap();
+                assert_eq!(retried.plan, unchanged.id);
+                assert_eq!(retried.stored_revision, receipt.stored_revision);
+                assert_eq!(
+                    retried.state, "unknown",
+                    "unchanged desired values cannot certify a mismatched active configuration"
+                );
+                assert_eq!(retried.effective_revision, None);
             }
             "crash" => {
                 let plan = manager

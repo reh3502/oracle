@@ -355,10 +355,16 @@ impl ModuleManager {
             actor: principal(actor),
             deployment,
             schema_version: bound.plan.schema_version,
-            revision: saved
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| err(ErrorCode::QuotaExceeded))?,
+            revision: if saved.schema_version == Some(bound.plan.schema_version)
+                && saved.values.as_ref() == Some(&bound.plan.values)
+            {
+                saved.revision
+            } else {
+                saved
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| err(ErrorCode::QuotaExceeded))?
+            },
             values: bound.plan.values,
         });
         saved.receipt = Some(ConfigurationReceipt {
@@ -458,6 +464,48 @@ impl ModuleManager {
             .ok_or_else(|| err(ErrorCode::InvalidInput))?;
         if receipt.state == "rejected" {
             return Ok(receipt);
+        }
+        // A fresh plan can describe values that are already active. Keep its
+        // own durable receipt, but do not mint a new configuration revision or
+        // repeat mutation hooks when current-session readback proves the intent.
+        if !service_restore
+            && saved.revision == candidate.revision
+            && saved.schema_version == Some(candidate.schema_version)
+            && saved.values.as_ref() == Some(&candidate.values)
+            && let Ok(actual) = self.configuration_ready(actor, guild, generation).await
+            && actual.revision == candidate.revision
+            && actual.values == candidate.values
+        {
+            self.core.authorize_module(actor, guild).await?;
+            self.validate_subscription_policy(actor, guild, generation)
+                .await?;
+            services
+                .policy
+                .validate(actor, guild, module, &candidate.values)
+                .await?;
+            let (current, epoch) = self.config_generation(module, guild)?;
+            if !generation.gate.is_active(guild, epoch)
+                || generation.number != current.number
+                || generation.session != current.session
+            {
+                return Err(err(ErrorCode::ForbiddenScope));
+            }
+            receipt.state = "effective".into();
+            receipt.stored_revision = candidate.revision;
+            receipt.effective_revision = Some(candidate.revision);
+            receipt.problem = None;
+            saved.receipt = Some(receipt.clone());
+            self.config_save(services, guild, module, record.as_ref(), &saved)
+                .await?;
+            return Ok(receipt);
+        }
+        if saved.revision == candidate.revision && saved.effective_session.take().is_some() {
+            // Readback did not confirm the previously verified session. Do not
+            // keep advertising that acknowledgement while activation is retried.
+            record = Some(
+                self.config_save(services, guild, module, record.as_ref(), &saved)
+                    .await?,
+            );
         }
         if generation
             .configuration_for_activation(
