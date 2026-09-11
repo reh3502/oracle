@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Write,
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -189,9 +190,25 @@ struct Metrics {
 struct Campaign {
     limits: (u64, u64, u64),
     metrics: Mutex<Metrics>,
+    ledger: Mutex<std::fs::File>,
+}
+struct Admission {
+    id: u64,
+    cost: u64,
 }
 impl Campaign {
-    fn admit(&self, prepared: &PreparedTurn) -> std::result::Result<(), ProviderError> {
+    fn record(&self, value: Value) -> std::result::Result<(), ProviderError> {
+        let mut ledger = self.ledger.lock().unwrap();
+        writeln!(ledger, "{value}")
+            .and_then(|()| ledger.flush())
+            .and_then(|()| ledger.sync_all())
+            .map_err(|_| ProviderError::Cancelled)
+    }
+    fn admit(
+        &self,
+        prepared: &PreparedTurn,
+        fixture: &str,
+    ) -> std::result::Result<Admission, ProviderError> {
         let tokens = prepared
             .input_token_reservation
             .checked_add(u64::from(prepared.output_token_reservation))
@@ -208,9 +225,35 @@ impl Campaign {
             metrics.cap_rejections += 1;
             return Err(ProviderError::Cancelled);
         }
+        let id = metrics.provider_attempts + 1;
+        self.record(json!({"kind":"admitted","id":id,"fixture":fixture,"reserved_tokens":tokens,"reserved_cost_micros":cost,"charged_total_micros":total}))?;
         metrics.provider_attempts += 1;
         metrics.reserved_tokens = metrics.reserved_tokens.saturating_add(tokens);
         metrics.reserved_cost_micros = total;
+        Ok(Admission { id, cost })
+    }
+    fn settle(
+        &self,
+        admission: Admission,
+        total_tokens: Option<u64>,
+    ) -> std::result::Result<(), ProviderError> {
+        let mut metrics = self.metrics.lock().unwrap();
+        let charge = total_tokens.map_or(admission.cost, |tokens| {
+            u64::try_from((u128::from(tokens) * u128::from(self.limits.2)).div_ceil(1_000_000))
+                .unwrap_or(u64::MAX)
+        });
+        let total = metrics
+            .reserved_cost_micros
+            .saturating_sub(admission.cost)
+            .saturating_add(charge);
+        // Persist settlement before releasing capacity. An interrupted/failed write retains the reservation.
+        self.record(json!({"kind":"settled","id":admission.id,"total_tokens":total_tokens,"charged_cost_micros":charge,"charged_total_micros":total}))?;
+        metrics.reserved_cost_micros = total;
+        if let Some(tokens) = total_tokens {
+            metrics.reported_tokens = metrics.reported_tokens.saturating_add(tokens);
+        } else {
+            metrics.unknown_usage += 1;
+        }
         Ok(())
     }
 }
@@ -279,42 +322,25 @@ impl ModelProvider for Candidate {
             }
             _ => {}
         }
-        self.campaign.admit(&request)?;
-        let reserved_tokens = request
-            .input_token_reservation
-            .saturating_add(u64::from(request.output_token_reservation));
-        let reserved_cost =
-            (u128::from(reserved_tokens) * u128::from(self.campaign.limits.2)).div_ceil(1_000_000);
+        let admission = self.campaign.admit(&request, &self.case.id)?;
         let started = Instant::now();
         let response = self.provider.send(request, cancel).await;
         {
             let mut metrics = self.campaign.metrics.lock().unwrap();
             metrics.attempts.push(json!({"fixture":self.case.id,"successful_response":response.is_ok(),"tool_result_continuation":self.continuation.load(Ordering::SeqCst),"duration_ms":started.elapsed().as_millis(),"model":response.as_ref().ok().and_then(|turn|turn.model.as_ref()),"usage":response.as_ref().ok().map(|turn|&turn.usage),"error":response.as_ref().err().map(|error|format!("{error:?}"))}));
-            if response.is_err() {
-                metrics.unknown_usage += 1;
-            }
-            if let Some(total) = response
+        }
+        self.campaign.settle(
+            admission,
+            response
                 .as_ref()
                 .ok()
-                .and_then(|turn| turn.usage.total_tokens)
-            {
-                let actual =
-                    (u128::from(total) * u128::from(self.campaign.limits.2)).div_ceil(1_000_000);
-                metrics.reserved_cost_micros = metrics.reserved_cost_micros.saturating_add(
-                    u64::try_from(actual.saturating_sub(reserved_cost)).unwrap_or(u64::MAX),
-                );
-            }
-        }
+                .and_then(|turn| turn.usage.total_tokens),
+        )?;
         let mut turn = response?;
         {
             let mut metrics = self.campaign.metrics.lock().unwrap();
             if let Some(model) = &turn.model {
                 metrics.models.insert(model.clone());
-            }
-            if let Some(total) = turn.usage.total_tokens {
-                metrics.reported_tokens = metrics.reported_tokens.saturating_add(total);
-            } else {
-                metrics.unknown_usage += 1;
             }
             metrics.forbidden_call_attempts += turn
                 .calls
@@ -442,6 +468,39 @@ fn required_u64(name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} must be positive"))
 }
 
+fn selected_cases(
+    split: &str,
+    mode: &str,
+    ids: Option<&str>,
+) -> std::result::Result<Vec<Scenario>, String> {
+    let mut cases: Vec<_> = corpus()
+        .into_iter()
+        .filter(|case| {
+            if mode == "smoke" {
+                case.id == "A01"
+            } else {
+                split == "all" || case.split == split
+            }
+        })
+        .collect();
+    if let Some(ids) = ids {
+        if split != "train" || mode != "campaign" {
+            return Err("fixture selection is available only for training campaigns".into());
+        }
+        let requested: Vec<_> = ids.split(',').collect();
+        let unique: BTreeSet<_> = requested.iter().copied().collect();
+        if unique.len() != requested.len()
+            || unique
+                .iter()
+                .any(|id| !cases.iter().any(|case| &case.id == id))
+        {
+            return Err("selection must contain unique existing training fixture IDs".into());
+        }
+        cases.retain(|case| unique.contains(case.id.as_str()));
+    }
+    Ok(cases)
+}
+
 #[test]
 fn frozen_corpus_has_eighty_independent_scopes_and_twenty_held_out_cases() {
     let cases = corpus();
@@ -487,6 +546,7 @@ fn global_paid_cap_rejects_before_another_provider_dispatch() {
     let campaign = Campaign {
         limits: (2, 25, 1_000_000),
         metrics: Mutex::new(Metrics::default()),
+        ledger: Mutex::new(tempfile::tempfile().unwrap()),
     };
     let request = PreparedTurn {
         provider_metadata: None,
@@ -496,9 +556,84 @@ fn global_paid_cap_rejects_before_another_provider_dispatch() {
         max_response_bytes: 1000,
         timeout_ms: 10,
     };
-    assert!(campaign.admit(&request).is_ok());
-    assert!(campaign.admit(&request).is_err());
+    assert!(campaign.admit(&request, "A01").is_ok());
+    assert!(campaign.admit(&request, "A01").is_err());
     assert_eq!(campaign.metrics.lock().unwrap().provider_attempts, 1);
+}
+
+#[test]
+fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
+    let ledger = tempfile::NamedTempFile::new().unwrap();
+    let campaign = Campaign {
+        limits: (10, 100, 4_000_000),
+        metrics: Mutex::new(Metrics::default()),
+        ledger: Mutex::new(ledger.reopen().unwrap()),
+    };
+    let request = PreparedTurn {
+        provider_metadata: None,
+        body: String::new(),
+        input_token_reservation: 10,
+        output_token_reservation: 10,
+        max_response_bytes: 1000,
+        timeout_ms: 10,
+    };
+    let first = campaign.admit(&request, "A01").unwrap();
+    let admitted = std::fs::read_to_string(ledger.path()).unwrap();
+    assert!(
+        admitted.contains("admitted"),
+        "charge is durable before dispatch"
+    );
+    assert!(campaign.admit(&request, "A01").is_err());
+    campaign.settle(first, Some(3)).unwrap();
+    assert_eq!(campaign.metrics.lock().unwrap().reserved_cost_micros, 12);
+    let second = campaign.admit(&request, "A01").unwrap();
+    campaign.settle(second, None).unwrap();
+    assert_eq!(campaign.metrics.lock().unwrap().reserved_cost_micros, 92);
+    assert_eq!(campaign.metrics.lock().unwrap().unknown_usage, 1);
+    assert!(campaign.admit(&request, "A01").is_err());
+    let records: Vec<Value> = std::fs::read_to_string(ledger.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[1]["charged_total_micros"], 12);
+    assert_eq!(records[3]["charged_total_micros"], 92);
+    assert_eq!(records[3]["total_tokens"], Value::Null);
+    let overrun = Campaign {
+        limits: (10, 100, 4_000_000),
+        metrics: Mutex::new(Metrics::default()),
+        ledger: Mutex::new(tempfile::tempfile().unwrap()),
+    };
+    let admission = overrun.admit(&request, "A01").unwrap();
+    overrun.settle(admission, Some(30)).unwrap();
+    assert_eq!(overrun.metrics.lock().unwrap().reserved_cost_micros, 120);
+    assert!(overrun.admit(&request, "A01").is_err());
+}
+
+#[test]
+fn training_selection_is_explicit_unique_and_cannot_select_heldout_cases() {
+    let cases = selected_cases("train", "campaign", Some("A01,B01")).unwrap();
+    assert_eq!(
+        cases
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<Vec<_>>(),
+        ["A01", "B01"]
+    );
+    for ids in ["", "A01,A01", "missing"] {
+        assert!(selected_cases("train", "campaign", Some(ids)).is_err());
+    }
+    let heldout = corpus()
+        .into_iter()
+        .find(|case| case.split == "holdout")
+        .unwrap()
+        .id;
+    assert!(selected_cases("train", "campaign", Some(&heldout)).is_err());
+    assert!(selected_cases("holdout", "campaign", Some("A01")).is_err());
+    assert!(selected_cases("all", "campaign", Some("A01")).is_err());
+    assert!(selected_cases("train", "smoke", Some("A01")).is_err());
+    assert_eq!(selected_cases("all", "campaign", None).unwrap().len(), 80);
 }
 
 #[tokio::test]
@@ -545,6 +680,12 @@ async fn live_candidate_five_trials_and_repeat() {
         std::env::var_os("ORACLE_TEST_AI_POSTGRES_URL").is_none(),
         "paid campaign uses a fresh isolated SQLite host per trial"
     );
+    let selected = selected_cases(
+        &split,
+        &mode,
+        std::env::var("ORACLE_AI_EVAL_FIXTURES").ok().as_deref(),
+    )
+    .unwrap();
     let module_bytes =
         std::fs::read(std::env::var_os("ORACLE_ACTIVITY_LOG").expect("build native fixture first"))
             .unwrap();
@@ -559,6 +700,24 @@ async fn live_candidate_five_trials_and_repeat() {
         )
         .unwrap(),
     );
+    let output = std::path::PathBuf::from(
+        std::env::var("ORACLE_AI_EVAL_OUTPUT")
+            .expect("explicit ignored/local report path required"),
+    );
+    assert!(!output.exists(), "never overwrite an evaluation report");
+    let billing_output = output.with_extension("billing.jsonl");
+    for path in [&output, &billing_output] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("check-ignore")
+                .arg("-q")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success(),
+            "evaluation and billing reports must be ignored local material"
+        );
+    }
     let campaign = Arc::new(Campaign {
         limits: (
             required_u64("ORACLE_AI_EVAL_MAX_REQUESTS"),
@@ -566,22 +725,15 @@ async fn live_candidate_five_trials_and_repeat() {
             required_u64("ORACLE_AI_EVAL_RATE_MICROS_PER_MILLION"),
         ),
         metrics: Mutex::new(Metrics::default()),
+        ledger: Mutex::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&billing_output)
+                .unwrap(),
+        ),
     });
-    let output = std::path::PathBuf::from(
-        std::env::var("ORACLE_AI_EVAL_OUTPUT")
-            .expect("explicit ignored/local report path required"),
-    );
-    assert!(!output.exists(), "never overwrite an evaluation report");
-    assert!(
-        std::process::Command::new("git")
-            .arg("check-ignore")
-            .arg("-q")
-            .arg(&output)
-            .status()
-            .unwrap()
-            .success(),
-        "evaluation report must be ignored local material"
-    );
+    campaign.record(json!({"kind":"manifest","host_commit":commit,"conservative_rate":campaign.limits.2,"max_cost_micros":campaign.limits.1,"report":output})).unwrap();
     if mode == "smoke" {
         assert!(
             campaign.limits.0 <= 3,
@@ -593,8 +745,7 @@ async fn live_candidate_five_trials_and_repeat() {
         .create_new(true)
         .open(&output)
         .unwrap();
-    use std::io::Write;
-    writeln!(report,"{}",json!({"kind":"manifest","level":"live_gemini_simulated_discord","host_commit":commit,"profile":profile,"corpus_hash":digest(CORPUS),"module_digest":digest(module_bytes),"split":split,"mode":mode,"trials":trials,"repeat_requests":repeats,"global_max_requests":campaign.limits.0,"global_max_cost_micros":campaign.limits.1,"conservative_rate":campaign.limits.2})).unwrap();
+    writeln!(report,"{}",json!({"kind":"manifest","level":"live_gemini_simulated_discord","host_commit":commit,"profile":profile,"corpus_hash":digest(CORPUS),"module_digest":digest(module_bytes),"split":split,"selected_fixtures":selected.iter().map(|case|&case.id).collect::<Vec<_>>(),"mode":mode,"trials":trials,"repeat_requests":repeats,"global_max_requests":campaign.limits.0,"global_max_cost_micros":campaign.limits.1,"conservative_rate":campaign.limits.2})).unwrap();
     assert!(
         campaign.limits.0 <= 8000,
         "campaign exceeds the maximum 80*5*2*10 requests"
@@ -603,24 +754,8 @@ async fn live_candidate_five_trials_and_repeat() {
     let mut last_reported_attempt = 0;
     let mut failure_reasons = BTreeMap::<String, usize>::new();
     let mut latencies = Vec::<u128>::new();
-    let planned_trials = corpus()
-        .iter()
-        .filter(|case| {
-            if mode == "smoke" {
-                case.id == "A01"
-            } else {
-                split == "all" || case.split == split
-            }
-        })
-        .count()
-        * trials;
-    'campaign: for case in corpus().into_iter().filter(|case| {
-        if mode == "smoke" {
-            case.id == "A01"
-        } else {
-            split == "all" || case.split == split
-        }
-    }) {
+    let planned_trials = selected.len() * trials;
+    'campaign: for case in selected {
         for trial in 0..trials {
             let (root, host, world) = tests::fixture().await;
             initialize(&world, &case);
