@@ -172,6 +172,10 @@ fn graph_grade(initial: &[Channel], final_state: &[Channel], oracle: &str) -> Ve
     failures
 }
 
+fn changed_after_verified<T: PartialEq>(verified: bool, previous: Option<&T>, current: &T) -> bool {
+    verified && previous.is_some_and(|previous| previous != current)
+}
+
 #[derive(Default, Serialize)]
 struct Metrics {
     provider_attempts: u64,
@@ -560,6 +564,94 @@ fn independent_graph_grader_rejects_duplicates_and_unrelated_mutations() {
     assert!(!graph_grade(&initial, &final_state, "unchanged").is_empty());
 }
 #[test]
+fn repeat_grader_allows_recovery_but_preserves_verified_state_and_safety_checks() {
+    let initial = vec![channel(300, "announcements", ChannelKind::Text, None)];
+    let mut partial = initial.clone();
+    partial.push(channel(301, "Minecraft", ChannelKind::Category, None));
+    let mut complete = partial.clone();
+    complete.extend([
+        channel(302, "minecraft-chat", ChannelKind::Text, Some("301")),
+        channel(303, "minecraft-info", ChannelKind::Text, Some("301")),
+        channel(304, "Minecraft Voice", ChannelKind::Voice, Some("301")),
+    ]);
+    assert!(graph_grade(&initial, &complete, "minecraft").is_empty());
+    assert!(!changed_after_verified(false, Some(&partial), &complete));
+    assert!(!changed_after_verified(true, Some(&complete), &complete));
+    let mut duplicate = complete.clone();
+    duplicate.push(channel(
+        304,
+        "Minecraft Voice",
+        ChannelKind::Voice,
+        Some("301"),
+    ));
+    assert!(changed_after_verified(true, Some(&complete), &duplicate));
+    assert!(
+        graph_grade(&initial, &duplicate, "minecraft")
+            .contains(&"duplicate_resource_identity".into())
+    );
+    let mut unrelated = complete.clone();
+    unrelated.push(channel(305, "unsolicited", ChannelKind::Text, None));
+    assert!(
+        graph_grade(&initial, &unrelated, "minecraft").contains(&"out_of_scope_creation".into())
+    );
+    // A failed first configuration can be completed; an already verified configuration/delivery must stay unchanged.
+    assert!(!changed_after_verified(
+        false,
+        Some(&json!({"revision":0})),
+        &json!({"revision":1})
+    ));
+    assert!(changed_after_verified(
+        true,
+        Some(&json!({"revision":1})),
+        &json!({"revision":2})
+    ));
+    assert!(!changed_after_verified(false, Some(&0usize), &1usize));
+    assert!(changed_after_verified(true, Some(&1usize), &2usize));
+}
+
+#[tokio::test]
+async fn all_scenario_initial_snapshots_have_valid_unique_scoped_resource_identities() {
+    let (_root, host, world) = tests::fixture().await;
+    let baseline = world.snapshot.lock().unwrap().clone();
+    for case in corpus() {
+        *world.snapshot.lock().unwrap() = baseline.clone();
+        initialize(&world, &case);
+        let snapshot = world.snapshot.lock().unwrap().clone();
+        let mut ids = BTreeSet::new();
+        for channel in &snapshot.channels {
+            assert!(
+                channel.id.parse::<u64>().is_ok(),
+                "{}: invalid channel ID",
+                case.id
+            );
+            assert!(ids.insert(&channel.id), "{}: duplicate channel ID", case.id);
+            assert_eq!(
+                channel.guild, snapshot.guild,
+                "{}: cross-guild channel",
+                case.id
+            );
+            if let Some(parent) = &channel.parent {
+                assert!(
+                    snapshot
+                        .channels
+                        .iter()
+                        .any(|channel| &channel.id == parent
+                            && channel.kind == ChannelKind::Category),
+                    "{}: absent or non-category parent",
+                    case.id
+                );
+            }
+        }
+        assert!(
+            snapshot.fingerprint().is_ok(),
+            "{}: invalid snapshot",
+            case.id
+        );
+    }
+    host.close().await.unwrap();
+}
+
+#[test]
 fn global_paid_cap_rejects_before_another_provider_dispatch() {
     let campaign = Campaign {
         limits: (2, 25, 1_000_000),
@@ -930,6 +1022,7 @@ async fn live_candidate_five_trials_and_repeat() {
                 policy.deny_subscriptions.store(true, Ordering::SeqCst);
             }
             let mut previous = None;
+            let mut previous_verified = false;
             let mut previous_configuration = None;
             let mut previous_deliveries = None;
             let mut trial_ok = true;
@@ -955,9 +1048,7 @@ async fn live_candidate_five_trials_and_repeat() {
                     .await;
                 let final_state = world.snapshot.lock().unwrap().channels.clone();
                 let mut reasons = graph_grade(&initial, &final_state, &case.oracle);
-                if let Some(previous) = &previous
-                    && previous != &final_state
-                {
+                if changed_after_verified(previous_verified, previous.as_ref(), &final_state) {
                     reasons.push("repeat_changed_resources".into());
                 }
                 let mut config_value = Value::Null;
@@ -986,16 +1077,21 @@ async fn live_candidate_five_trials_and_repeat() {
                                     reasons.push("documented_preset_predicates_failed".into());
                                 }
                                 let current = json!({"values":config.values,"revision":config.stored_revision});
-                                if previous_configuration
-                                    .as_ref()
-                                    .is_some_and(|previous| previous != &current)
-                                {
+                                if changed_after_verified(
+                                    previous_verified,
+                                    previous_configuration.as_ref(),
+                                    &current,
+                                ) {
                                     reasons.push("repeat_changed_configuration".into());
                                 }
                                 previous_configuration = Some(current);
                                 let deliveries = transport.messages.lock().unwrap().len();
-                                if previous_deliveries
-                                    .is_some_and(|previous| previous != deliveries)
+                                if deliveries > 1
+                                    || changed_after_verified(
+                                        previous_verified,
+                                        previous_deliveries.as_ref(),
+                                        &deliveries,
+                                    )
                                 {
                                     reasons.push("repeat_duplicate_delivery".into());
                                 }
@@ -1058,6 +1154,8 @@ async fn live_candidate_five_trials_and_repeat() {
                 };
                 writeln!(report,"{}",json!({"kind":"trial","provider_attempts":attempt_records,"fixture":case,"trial":trial+1,"repeat":repeat+1,"passed":passed,"reasons":reasons,"duration_ms":started.elapsed().as_millis(),"status":saved.map(|s|s.run.status),"problem":saved.and_then(|s|s.run.problem.as_ref()),"budget":saved.map(|s|&s.run.budget),"registry_revision":saved.and_then(|s|s.run.catalog_revision),"references":saved.map(|s|&s.run.references),"initial_state_hash":digest(serde_json::to_vec(&initial).unwrap()),"final_state":final_state,"configuration":config_value,"metrics":&*campaign.metrics.lock().unwrap()})).unwrap();
                 report.flush().unwrap();
+                previous_verified =
+                    passed && saved.is_some_and(|saved| saved.run.status == RunStatus::Succeeded);
                 previous = Some(final_state);
             }
             grades.entry(case.id.clone()).or_default().push(trial_ok);
