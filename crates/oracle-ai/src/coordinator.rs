@@ -51,7 +51,13 @@ pub struct HostOutcome {
     pub references: Vec<String>,
     pub wait: Option<RunStatus>,
 }
+pub struct ResolvedCall {
+    pub call_id: String,
+    pub value: Value,
+    pub is_error: bool,
+}
 pub struct Reconciliation {
+    pub resolved_calls: Vec<ResolvedCall>,
     /// Host-recovered references from durable call results, never model claims.
     pub references: Vec<String>,
     pub value: Value,
@@ -94,11 +100,13 @@ fn integrity() -> Error {
 struct Active<'a> {
     active: &'a Mutex<BTreeMap<String, CancellationToken>>,
     key: String,
+    guild_key: String,
 }
 impl Drop for Active<'_> {
     fn drop(&mut self) {
         if let Ok(mut active) = self.active.lock() {
             active.remove(&self.key);
+            active.remove(&self.guild_key);
         }
     }
 }
@@ -250,18 +258,61 @@ impl Coordinator {
         guild: &GuildId,
         id: &OperationId,
     ) -> Result<SavedRun> {
+        let saved = self.inspect(context, guild, id).await?;
         let cancel = CancellationToken::new();
-        {
+        let guild_key = format!("guild:{guild}");
+        let guild_busy = {
             let mut active = self.active.lock().map_err(|_| integrity())?;
             if active.contains_key(id.as_str()) {
                 return Err(Error::new(ErrorCode::Conflict));
             }
-            active.insert(id.to_string(), cancel.clone());
+            let busy = active.contains_key(&guild_key);
+            if !busy {
+                active.insert(id.to_string(), cancel.clone());
+                active.insert(guild_key.clone(), cancel.clone());
+            }
+            busy
+        };
+        if guild_busy {
+            if saved.run.status.terminal() {
+                return Ok(saved);
+            }
+            return self
+                .stop(saved, RunStatus::Paused, "guild_run_already_active")
+                .await;
         }
         let _guard = Active {
             active: &self.active,
             key: id.to_string(),
+            guild_key,
         };
+        match self.resume_inner(context, guild, id, cancel).await {
+            Ok(saved) => Ok(saved),
+            Err(error) => {
+                let Ok(mut latest) = self.inspect(context, guild, id).await else {
+                    return Err(error);
+                };
+                if latest.run.status.terminal() {
+                    return Ok(latest);
+                }
+                self.recover_spend(&mut latest).await?;
+                let recovered = self.runs.recover(context, guild, id, now()).await?;
+                self.stop(
+                    recovered,
+                    RunStatus::Paused,
+                    &format!("host_error:{:?}", error.code),
+                )
+                .await
+            }
+        }
+    }
+    async fn resume_inner(
+        &self,
+        context: &PolicyContext,
+        guild: &GuildId,
+        id: &OperationId,
+        cancel: CancellationToken,
+    ) -> Result<SavedRun> {
         let mut saved = self.inspect(context, guild, id).await?;
         self.runs.authorize(context, &saved).await?;
         if saved.run.status.terminal() {
@@ -300,12 +351,9 @@ impl Coordinator {
     }
     async fn recover_spend(&self, saved: &mut SavedRun) -> Result<()> {
         if let Some(pending) = saved.run.pending_spend.clone() {
-            match self.spend.settle(&saved.run.guild, &pending, None).await {
-                Ok(()) => {}
-                // Missing = admission never happened; conflict = already settled before crash.
-                Err(error) if matches!(error.code, ErrorCode::NotFound | ErrorCode::Conflict) => {}
-                Err(error) => return Err(error),
-            }
+            self.spend
+                .recover_reservation(&saved.run.guild, &pending)
+                .await?;
             saved.run.pending_spend = None;
             self.runs.save(saved, now()).await?;
         }
@@ -347,6 +395,26 @@ impl Coordinator {
             > 32 * 1024
         {
             return Err(integrity());
+        }
+        if evidence.resolved_calls.len() > 30 {
+            return Err(integrity());
+        }
+        for resolution in &evidence.resolved_calls {
+            let mut record = self
+                .runs
+                .calls(saved)
+                .await?
+                .into_iter()
+                .find(|record| record.call.call_id == resolution.call_id)
+                .ok_or_else(integrity)?;
+            self.runs
+                .resolve_call(
+                    saved,
+                    &mut record,
+                    resolution.value.clone(),
+                    resolution.is_error,
+                )
+                .await?;
         }
         if evidence.references.len() > 64
             || evidence
@@ -528,7 +596,7 @@ impl Coordinator {
                     .budget
                     .settle(&reservation, None)
                     .map_err(|_| integrity())?;
-                saved.run.pending_spend = None;
+                // Keep the intent: a storage error may have happened after daily CAS committed.
                 return self
                     .stop(saved, RunStatus::Paused, "daily_spend_admission_failed")
                     .await;

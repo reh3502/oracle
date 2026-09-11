@@ -322,6 +322,25 @@ impl RunStore {
         Ok(())
     }
 
+    /// Only the host reconciliation port may replace an unknown outcome with freshly verified receipt facts.
+    pub(crate) async fn resolve_call(
+        &self,
+        run: &SavedRun,
+        saved: &mut SavedCall,
+        result: Value,
+        is_error: bool,
+    ) -> Result<()> {
+        if saved.call.state != CallState::Unknown {
+            return Err(Error::new(ErrorCode::Conflict));
+        }
+        // Preserve the durable revision and original invocation binding; only its outcome changes.
+        saved.call.state = CallState::Admitted;
+        let outcome = self.finish_call(run, saved, result, is_error, false).await;
+        if outcome.is_err() {
+            saved.call.state = CallState::Unknown;
+        }
+        outcome
+    }
     pub async fn calls(&self, run: &SavedRun) -> Result<Vec<SavedCall>> {
         let prefix = format!("{}:", run.run.id);
         let mut cursor = prefix.clone();
