@@ -278,6 +278,26 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         {
             return Err(err(ErrorCode::InvalidInput));
         }
+        if let Some(ai) = &operation.ai {
+            use oracle_core::ModuleAiOperationKind;
+            if operation
+                .capabilities
+                .iter()
+                .any(|c| c == "contracts.invoke" || c == "host.echo")
+                || (ai.kind == ModuleAiOperationKind::Inspection
+                    && operation.capabilities.iter().any(|c| c == "discord.notify"))
+                || (ai.kind == ModuleAiOperationKind::Verification
+                    && (!operation.capabilities.iter().any(|c| c == "discord.notify")
+                        || ai.success_pointer.is_none()))
+                || ai.success_pointer.as_ref().is_some_and(|pointer| {
+                    !pointer.starts_with('/')
+                        || pointer.len() > 256
+                        || pointer.chars().any(char::is_control)
+                })
+            {
+                return Err(err(ErrorCode::InvalidInput));
+            }
+        }
         schema_validator(&operation.input_schema)?;
         schema_validator(&operation.output_schema)?;
     }
@@ -863,6 +883,39 @@ mod tests {
         );
         assert!(!marker.exists());
         assert_eq!(fs::read_dir(store.root()).unwrap().count(), 0);
+    }
+    #[test]
+    fn ai_projection_cannot_disguise_notification_or_contract_capabilities() {
+        use oracle_core::{ModuleAiOperation, ModuleAiOperationKind};
+        let (_, mut package) = fixture();
+        let manifest = &mut package.manifest;
+        manifest.configuration = Some(oracle_core::ModuleConfiguration {
+            schema_version: 1,
+            schema: json!({"type":"object"}),
+            presets: Default::default(),
+        });
+        manifest.capabilities.extend([
+            "config.own".into(),
+            "discord.notify".into(),
+            "contracts.invoke".into(),
+        ]);
+        manifest.operations[0].ai = Some(ModuleAiOperation {
+            kind: ModuleAiOperationKind::Inspection,
+            success_pointer: None,
+        });
+        validate_manifest(manifest).unwrap();
+        manifest.operations[0].capabilities = vec!["discord.notify".into()];
+        assert!(validate_manifest(manifest).is_err());
+        manifest.operations[0].ai.as_mut().unwrap().kind = ModuleAiOperationKind::Verification;
+        assert!(validate_manifest(manifest).is_err());
+        manifest.operations[0].ai.as_mut().unwrap().success_pointer = Some("/verified".into());
+        validate_manifest(manifest).unwrap();
+        manifest.operations[0]
+            .capabilities
+            .push("contracts.invoke".into());
+        assert!(validate_manifest(manifest).is_err());
+        manifest.operations[0].capabilities.clear();
+        assert!(validate_manifest(manifest).is_err());
     }
     #[test]
     fn schemas_are_offline_validated_and_enforced() {

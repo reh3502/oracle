@@ -40,7 +40,11 @@
         "storage.own",
         "config.own",
         "events.guild"
-      ]
+      ],
+      "ai": {
+        "kind": "inspection",
+        "success_pointer": "/end_to_end_probe_verified"
+      }
     },
     {
       "name": "probe",
@@ -57,7 +61,11 @@
       "capabilities": [
         "storage.own",
         "discord.notify"
-      ]
+      ],
+      "ai": {
+        "kind": "verification",
+        "success_pointer": "/verified"
+      }
     }
   ],
   "collections": [

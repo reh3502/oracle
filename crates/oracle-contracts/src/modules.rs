@@ -39,6 +39,9 @@ pub struct ModuleManifest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleOperation {
+    /// Optional reviewed projection; absence keeps the operation out of model tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<ModuleAiOperation>,
     pub name: String,
     pub description: String,
     pub input_schema: Value,
@@ -46,6 +49,21 @@ pub struct ModuleOperation {
     pub timeout_ms: u64,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+/// This metadata cannot grant capabilities or bypass host policy. Native artifacts
+/// remain operator-trusted; arbitrary mutations have no AI projection in v1.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleAiOperation {
+    pub kind: ModuleAiOperationKind,
+    /// Boolean postcondition in the typed result, checked alongside host receipts.
+    pub success_pointer: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleAiOperationKind {
+    Inspection,
+    Verification,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

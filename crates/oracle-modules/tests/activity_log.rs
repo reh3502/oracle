@@ -529,7 +529,17 @@ async fn run(mismatch: bool, retention_only: bool, health_and_origin: bool) {
             assert_eq!(recovery[0].state, EffectState::Unknown);
             return;
         }
-        assert_eq!(probe.unwrap()["verified"], true);
+        let probe = probe.unwrap();
+        assert_eq!(probe["verified"], true);
+        let effect_id =
+            EffectId::new(probe["receipt"]["host_effect_id"].as_str().unwrap()).unwrap();
+        let verified_effect = storage.effect(&guild, &effect_id).await.unwrap();
+        assert_eq!(verified_effect.state, EffectState::Verified);
+        assert!(
+            verified_effect
+                .purpose
+                .starts_with(&format!("module:{module}:notify:"))
+        );
         manager
             .invoke(&ACTOR, &module, &guild, "probe", json!({}))
             .await

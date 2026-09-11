@@ -387,11 +387,16 @@ impl ModuleManager {
                 _=shutdown.cancelled()=>{cancel.cancel();operation.await},
                 _=tokio::time::sleep_until(authority.deadline)=>{cancel.cancel();operation.await},
                 result=&mut operation=>result,
-            }.and_then(|effect|effect.receipt.ok_or_else(||Error::new(ErrorCode::Integrity)))
-                .and_then(|value| {
-                    if value["destination"] != expected_destination || value["text_digest"] != expected_text { return Err(Error::new(ErrorCode::Conflict)); }
-                    Ok(value["delivery"].clone())
-                });
+            }.and_then(|effect| {
+                let value = effect.receipt.ok_or_else(||Error::new(ErrorCode::Integrity))?;
+                if value["destination"] != expected_destination || value["text_digest"] != expected_text { return Err(Error::new(ErrorCode::Conflict)); }
+                // The host supplies this identity after durable verification. A module
+                // boolean alone is never evidence that an external effect succeeded.
+                let mut delivery = value["delivery"].clone();
+                if !delivery.is_object() { delivery = json!({"delivery":delivery}); }
+                delivery["host_effect_id"] = json!(effect.id);
+                Ok(delivery)
+            });
             let _=reply.send(result); Ok(())
         }).map_err(|_|unavailable())?;
         receive.await.map_err(|_| unavailable())?
@@ -474,26 +479,45 @@ impl ModuleManager {
         number: u64,
         authority: &Authority,
     ) -> Result<ModuleHostHealth> {
-        self.core
-            .authorize_module(&authority.actor, &authority.guild)
-            .await?;
+        self.ai_host_health(
+            &authority.actor,
+            &authority.guild,
+            module,
+            session,
+            number,
+            authority.epoch,
+        )
+        .await
+    }
+    /// Fresh host policy and delivery prerequisites for an exact catalog identity.
+    /// This shares the module RPC health implementation without trusting module prose.
+    pub async fn ai_host_health(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+        module: &ModuleId,
+        session: &str,
+        number: u64,
+        epoch: u64,
+    ) -> Result<ModuleHostHealth> {
+        self.core.authorize_module(actor, guild).await?;
         let generation = self.get(module)?;
         let identity_matches = |current: &Generation| {
             current.session == session
                 && current.number == number
                 && current.process().is_alive()
-                && current.gate.is_active(&authority.guild, authority.epoch)
+                && current.gate.is_active(guild, epoch)
         };
         if !identity_matches(&generation) {
             return Err(unavailable());
         }
         let subscription_error = self
-            .validate_subscription_policy(&authority.actor, &authority.guild, &generation)
+            .validate_subscription_policy(actor, guild, &generation)
             .await
             .err()
             .map(|error| error.code);
         let (configuration, destination) = match self
-            .configuration_host_health(&authority.actor, &authority.guild, &generation)
+            .configuration_host_health(actor, guild, &generation)
             .await
         {
             Ok(value) => value,
@@ -531,11 +555,11 @@ impl ModuleManager {
             .event_queues
             .lock()
             .unwrap()
-            .get(&(module.clone(), authority.guild.clone()))
+            .get(&(module.clone(), guild.clone()))
             .filter(|queue| {
                 queue.generation.session == session
                     && queue.generation.number == number
-                    && queue.epoch == authority.epoch
+                    && queue.epoch == epoch
             })
             .map(|queue| HostEventQueueHealth {
                 accepting: ready && !queue.sender.is_closed() && !queue.cancel.is_cancelled(),
@@ -546,10 +570,10 @@ impl ModuleManager {
             });
         Ok(ModuleHostHealth {
             module: module.clone(),
-            guild: authority.guild.clone(),
+            guild: guild.clone(),
             session: session.into(),
             generation: number,
-            epoch: authority.epoch,
+            epoch,
             observed_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
