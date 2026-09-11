@@ -249,6 +249,7 @@ mod tests {
     }
     fn turn(input: u64, output: u32) -> PreparedTurn {
         PreparedTurn {
+            provider_metadata: None,
             body: String::new(),
             input_token_reservation: input,
             output_token_reservation: output,

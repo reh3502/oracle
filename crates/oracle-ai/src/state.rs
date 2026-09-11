@@ -517,6 +517,7 @@ mod tests {
             .unwrap();
         let mut stale = saved.clone();
         let prepared = PreparedTurn {
+            provider_metadata: None,
             body: String::new(),
             input_token_reservation: 100,
             output_token_reservation: 100,

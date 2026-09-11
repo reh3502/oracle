@@ -89,6 +89,8 @@ pub struct ModelTurn {
 
 /// Prepared bytes are provider-owned and must never be logged. Reserve before send.
 pub struct PreparedTurn {
+    /// Provider-private preparation context; never included in the HTTP body or logs.
+    pub provider_metadata: Option<String>,
     pub body: String,
     pub input_token_reservation: u64,
     pub output_token_reservation: u32,

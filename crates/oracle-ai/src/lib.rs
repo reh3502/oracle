@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod budget;
 pub mod catalog;
+pub mod gemini;
 pub mod provider;
 pub mod spend;
 pub mod state;

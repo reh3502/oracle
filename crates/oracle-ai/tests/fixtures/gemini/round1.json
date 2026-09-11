@@ -1,0 +1,1 @@
+{"id":"synthetic-1","model":"gemini-3.7-flash","status":"requires_action","steps":[{"type":"thought", "signature":"AAEC/w==", "future_metadata":{"number":1.2300e+20}}, {"type":"function_call","id":"call-1","name":"oracle_probe","arguments":{"round":1,"prior":"none"}}],"usage":{"total_tokens":23}}

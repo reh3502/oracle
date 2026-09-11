@@ -1,0 +1,1 @@
+{"id":"synthetic-truncated","status":"incomplete","steps":[{"type":"function_call","id":"not-admissible","name":"oracle_probe","arguments":{"round":1,"prior":"none"}}]}

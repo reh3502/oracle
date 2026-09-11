@@ -1,6 +1,6 @@
 # Contributing to Oracle
 
-Oracle currently implements stages 1–3: the durable host, trusted native module runtime, and shared human operations. Feature modules are separately installed. AI orchestration is later work.
+Oracle currently implements stages 1–3: the durable host, trusted native module runtime, and shared human operations. Feature modules are separately installed. Stage 4 is in progress: `oracle-ai` contains provider, discovery, usage-accounting and durable-run foundations; the host agent loop and human controls are not yet integrated.
 
 ## Local workflow
 
@@ -38,6 +38,7 @@ This runs Stage 2 qualification (including Stage 1) and Stage 3 qualification, u
 | `oracle-operations` | Structure planning/execution and durable command reconciliation |
 | `oracle-storage` | SQL adapters, migrations and native backups |
 | `oracle-discord` | Discord ingress, presentation, observation and fenced transport |
+| `oracle-ai` | Gemini provider boundary, bounded discovery, usage accounting and agent run state |
 | `oracle` | CLI, local control and concrete host composition |
 
 `scripts/check-architecture.py` checks production and build dependencies, including target-specific and renamed dependencies. Adapter dependencies used only by tests are allowed. When introducing a crate or moving a boundary, update the checker deliberately and explain the dependency direction in the change.
