@@ -808,13 +808,13 @@ impl Coordinator {
                         .min(saved.run.limits.deadline_ms)
                         .saturating_sub(now());
                     let result = tokio::select! {
-                        _ = cancel.cancelled() => None,
-                        result = tokio::time::timeout(Duration::from_millis(remaining), self.host.execute(context, &saved.run, tool, call, &tool_cancel)) => result.ok().and_then(std::result::Result::ok),
+                        _ = cancel.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+                        result = tokio::time::timeout(Duration::from_millis(remaining), self.host.execute(context, &saved.run, tool, call, &tool_cancel)) => result.unwrap_or_else(|_| Err(Error::new(ErrorCode::UnknownOutcome))),
                     };
                     tool_cancel.cancel();
-                    result.unwrap_or(HostOutcome {
+                    result.unwrap_or_else(|error| HostOutcome {
                         search_query: None,
-                        value: json!({"error":"unknown_tool_outcome"}),
+                        value: json!({"error":"unknown_tool_outcome","host_error_code":error.code}),
                         is_error: true,
                         unknown: true,
                         progress: false,

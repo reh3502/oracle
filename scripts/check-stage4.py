@@ -37,6 +37,7 @@ COORDINATOR_TESTS = [
     "overlarge_tool_batch_rejects_every_effect",
     "final_effect_is_verified_even_without_budget_for_another_model_turn",
     "operational_failure_is_a_durable_paused_diagnostic",
+    "uncertain_tool_errors_preserve_safe_codes_without_retrying",
     "host_receipt_resolves_unknown_call_without_redispatch",
 ]
 HOST_TESTS = [

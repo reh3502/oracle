@@ -77,6 +77,7 @@ impl ModelProvider for Provider {
 }
 struct Host {
     effects: AtomicUsize,
+    failure: Mutex<Option<ErrorCode>>,
     verification_query: Mutex<Option<String>>,
     required: usize,
     unknown: AtomicBool,
@@ -112,6 +113,12 @@ impl ToolHost for Host {
         _: &ToolCall,
         cancel: &CancellationToken,
     ) -> Result<HostOutcome> {
+        if let Some(code) = *self.failure.lock().unwrap() {
+            return Err(Error::with_source(
+                code,
+                std::io::Error::other("PRIVATE HOST DATA"),
+            ));
+        }
         self.effects.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         if self.block {
@@ -220,6 +227,7 @@ async fn setup(
     });
     let host = Arc::new(Host {
         effects: AtomicUsize::new(0),
+        failure: Mutex::new(None),
         verification_query: Mutex::new(None),
         required,
         unknown: AtomicBool::new(unknown),
@@ -715,6 +723,40 @@ async fn host_receipt_resolves_unknown_call_without_redispatch() {
     assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
     assert_eq!(host.effects.load(Ordering::SeqCst), 1);
 }
+#[tokio::test]
+async fn uncertain_tool_errors_preserve_safe_codes_without_retrying() {
+    for code in [
+        ErrorCode::ForbiddenScope,
+        ErrorCode::Conflict,
+        ErrorCode::StorageUnavailable,
+    ] {
+        let (_folder, _storage, coordinator, provider, host, guild) =
+            setup(vec![vec![call("failed")]], 1, false, false, false, 4).await;
+        *host.failure.lock().unwrap() = Some(code);
+        let saved = coordinator
+            .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
+            .await
+            .unwrap();
+        assert_eq!(saved.run.status, RunStatus::Paused);
+        assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(host.effects.load(Ordering::SeqCst), 0);
+        let calls = coordinator.runs.calls(&saved).await.unwrap();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0].call;
+        assert_eq!(call.state, CallState::Unknown);
+        assert!(call.is_error);
+        assert_eq!(
+            call.result.as_ref().unwrap()["host_error_code"],
+            json!(code)
+        );
+        assert!(
+            !serde_json::to_string(call)
+                .unwrap()
+                .contains("PRIVATE HOST DATA")
+        );
+    }
+}
+
 #[tokio::test]
 async fn operational_failure_is_a_durable_paused_diagnostic() {
     let (_folder, _storage, coordinator, provider, _, guild) =

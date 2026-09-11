@@ -1561,8 +1561,8 @@ async fn live_candidate_five_trials_and_repeat() {
                 let passed = reasons.is_empty();
                 trial_ok &= passed;
                 let saved = result.as_ref().ok();
-                // Host ledger order makes repeated discovery/planning and failed
-                // verification diagnosable without recording private argument text.
+                // Ledger enumeration is not chronological. Preserve safe error
+                // categories without recording private arguments or error sources.
                 let tool_trace = if let Some(saved) = saved {
                     RunStore::new(host.core.clone(), host.storage.clone())
                         .calls(saved)
@@ -1571,7 +1571,10 @@ async fn live_candidate_five_trials_and_repeat() {
                         .into_iter()
                         .map(|saved| {
                             let call = saved.call;
-                            json!({"name":call.name,"binding":call.binding,"state":call.state,"is_error":call.is_error})
+                            let host_error_code = call.result.as_ref()
+                                .and_then(|result| result.get("host_error_code"))
+                                .and_then(|code| serde_json::from_value::<ErrorCode>(code.clone()).ok());
+                            json!({"name":call.name,"binding":call.binding,"state":call.state,"is_error":call.is_error,"host_error_code":host_error_code})
                         })
                         .collect::<Vec<_>>()
                 } else {
