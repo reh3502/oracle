@@ -17,6 +17,7 @@ use std::sync::{
 pub(super) struct World {
     pub(super) snapshot: Mutex<Snapshot>,
     pub(super) writes: AtomicUsize,
+    revoke_after_first: std::sync::atomic::AtomicBool,
 }
 #[async_trait::async_trait]
 impl StructureBackend for World {
@@ -38,6 +39,13 @@ impl StructureBackend for World {
         mutation: &ChannelMutation,
         guard: &SendGuard,
     ) -> Result<Channel> {
+        // Revoke after the first effect has returned and its receipt has been
+        // persisted, immediately before the next transport dispatch check.
+        if self.writes.load(Ordering::SeqCst) > 0
+            && self.revoke_after_first.swap(false, Ordering::SeqCst)
+        {
+            self.snapshot.lock().unwrap().roles[0].permissions = VIEW_CHANNEL | SEND_MESSAGES;
+        }
         if self.inspect(context, guild).await?.fingerprint()? != mutation.expected_fingerprint {
             return Err(Error::new(ErrorCode::Conflict));
         }
@@ -106,6 +114,7 @@ pub(super) async fn fixture() -> (tempfile::TempDir, Arc<Host>, Arc<World>) {
             observed_at: now(),
         }),
         writes: AtomicUsize::new(0),
+        revoke_after_first: std::sync::atomic::AtomicBool::new(false),
     });
     assert!(
         host.operations
@@ -483,5 +492,147 @@ async fn agent_receipt_gate_detects_drift_after_completed_operation() {
         !evidence.complete,
         "stored Complete alone cannot prove current postconditions"
     );
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_permission_revoked_after_first_write_preserves_only_completed_effect() {
+    let (_root, host, world) = fixture().await;
+    world.revoke_after_first.store(true, Ordering::SeqCst);
+    let saved = coordinator(&host, None)
+        .ask(
+            &PolicyContext::LocalOperator,
+            GuildId::new("100").unwrap(),
+            "Set up Minecraft".into(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(saved.run.status, RunStatus::Succeeded);
+    assert_eq!(world.writes.load(Ordering::SeqCst), 1);
+    assert_eq!(world.snapshot.lock().unwrap().channels.len(), 1);
+    assert_eq!(saved.run.references.len(), 1);
+    let plan = host
+        .operations
+        .get()
+        .unwrap()
+        .read_plan(
+            &PolicyContext::LocalOperator,
+            &saved.run.guild,
+            saved.run.references[0].strip_prefix("structure:").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        plan.state,
+        oracle_operations::executor::PlanState::Partial
+    ));
+    assert!(plan.last_error.is_some());
+    assert_eq!(plan.receipts.len(), 1);
+    assert_eq!(
+        plan.receipts[0].channel.id,
+        world.snapshot.lock().unwrap().channels[0].id
+    );
+    host.close().await.unwrap();
+}
+
+struct ConflictingPlans {
+    step: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl ModelProvider for ConflictingPlans {
+    fn profile(&self) -> &ModelProfile {
+        static PROFILE: std::sync::OnceLock<ModelProfile> = std::sync::OnceLock::new();
+        PROFILE.get_or_init(profile)
+    }
+    fn prepare(&self, request: ModelRequest) -> std::result::Result<PreparedTurn, ProviderError> {
+        Script {
+            step: AtomicUsize::new(0),
+            attack: None,
+        }
+        .prepare(request)
+    }
+    async fn send(
+        &self,
+        request: PreparedTurn,
+        _: &CancellationToken,
+    ) -> std::result::Result<ModelTurn, ProviderError> {
+        let step = self.step.fetch_add(1, Ordering::SeqCst);
+        let input: Value = serde_json::from_str(&request.body).unwrap();
+        let calls = match step {
+            0 => vec![ToolCall {
+                id: "search".into(),
+                name: "core_tools_search_v1".into(),
+                arguments: json!({"query":"guild structure plan apply channels"}),
+            }],
+            1 => (0..2)
+                .map(|i| ToolCall {
+                    id: format!("plan-{i}"),
+                    name: "core_discord_plan_v1".into(),
+                    arguments: desired(),
+                })
+                .collect(),
+            2 => (0..2)
+                .map(|i| ToolCall {
+                    id: format!("apply-{i}"),
+                    name: "core_discord_apply_v1".into(),
+                    arguments: json!({"reference":input["results"][i]["value"]["reference"]}),
+                })
+                .collect(),
+            _ => vec![],
+        };
+        Ok(ModelTurn {
+            stop: if calls.is_empty() {
+                StopReason::Completed
+            } else {
+                StopReason::ToolCalls
+            },
+            calls,
+            visible_text: None,
+            continuation: Continuation {
+                profile: "script/v1".into(),
+                opaque: step.to_string(),
+            },
+            usage: Usage {
+                total_tokens: Some(100),
+                ..Default::default()
+            },
+            model: None,
+        })
+    }
+}
+#[tokio::test]
+async fn agent_conflicting_parallel_applies_serialize_and_preserve_receipts() {
+    let (_root, host, world) = fixture().await;
+    let saved = coordinator_with_provider(
+        &host,
+        Arc::new(ConflictingPlans {
+            step: AtomicUsize::new(0),
+        }),
+    )
+    .ask(
+        &PolicyContext::LocalOperator,
+        GuildId::new("100").unwrap(),
+        "Set up Minecraft".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(world.writes.load(Ordering::SeqCst), 4);
+    assert_eq!(world.snapshot.lock().unwrap().channels.len(), 4);
+    assert_eq!(saved.run.references.len(), 2);
+    let store = RunStore::new(host.core.clone(), host.storage.clone());
+    let calls = store.calls(&saved).await.unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.call.name == "core_discord_apply_v1" && !c.call.is_error)
+            .count(),
+        1
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.call.name == "core_discord_apply_v1" && c.call.is_error)
+    );
+    assert_ne!(saved.run.status, RunStatus::Succeeded);
     host.close().await.unwrap();
 }
