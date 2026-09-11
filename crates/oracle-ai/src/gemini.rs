@@ -650,13 +650,16 @@ fn check_call(
     seen: &mut BTreeSet<String>,
 ) -> Result<(), ProviderError> {
     if call.id.is_empty() || !seen.insert(call.id.clone()) || !call.arguments.is_object() {
-        return Err(ProviderError::ProtocolMismatch);
+        return Err(ProviderError::InvalidToolCall);
     }
     let tool = tools
         .iter()
         .find(|t| t.name == call.name)
-        .ok_or(ProviderError::ProtocolMismatch)?;
-    schema::validate(&tool.parameters, &call.arguments)
+        .ok_or(ProviderError::InvalidToolCall)?;
+    schema::validate(&tool.parameters, &call.arguments).map_err(|error| match error {
+        ProviderError::ProtocolMismatch => ProviderError::InvalidToolCall,
+        error => error,
+    })
 }
 #[derive(Default)]
 struct History {
@@ -686,7 +689,10 @@ fn check_history(input: &[Box<RawValue>], tools: &[NativeTool]) -> Result<Histor
                     name,
                     arguments,
                 };
-                check_call(&call, tools, &mut h.seen)?;
+                check_call(&call, tools, &mut h.seen).map_err(|error| match error {
+                    ProviderError::InvalidToolCall => ProviderError::InvalidRequest,
+                    error => error,
+                })?;
                 h.pending.push(call);
             }
             Step::FunctionResult {

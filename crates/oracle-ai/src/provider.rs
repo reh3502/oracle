@@ -114,6 +114,9 @@ pub enum ProviderError {
     ContextExceeded,
     #[error("provider protocol mismatch")]
     ProtocolMismatch,
+    /// A parsed model response proposed a call outside its advertised contract.
+    #[error("provider returned an invalid tool call")]
+    InvalidToolCall,
     #[error("provider request cancelled")]
     Cancelled,
 }

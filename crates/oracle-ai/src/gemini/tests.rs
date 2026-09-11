@@ -231,6 +231,8 @@ fn invalid_calls_reject_whole_batch_and_duplicate_ids_across_rounds() {
         json!({"round":"1","prior":"none"}),
         json!({"round":1,"prior":"none","extra":true}),
         json!({"prior":"none"}),
+        json!({"round":3,"prior":"none"}),
+        json!([]),
     ] {
         let mut v: Value = serde_json::from_str(FIRST).unwrap();
         let mut invalid = v["steps"][1].clone();
@@ -239,18 +241,62 @@ fn invalid_calls_reject_whole_batch_and_duplicate_ids_across_rounds() {
         v["steps"].as_array_mut().unwrap().push(invalid);
         assert!(matches!(
             decode(&p, p.prepare(request()).unwrap(), &v.to_string()),
-            Err(ProviderError::ProtocolMismatch)
+            Err(ProviderError::InvalidToolCall)
         ));
     }
     for field in ["id", "name"] {
         let mut v: Value = serde_json::from_str(FIRST).unwrap();
         v["steps"][1][field] = json!("");
-        assert!(decode(&p, p.prepare(request()).unwrap(), &v.to_string()).is_err());
+        assert!(matches!(
+            decode(&p, p.prepare(request()).unwrap(), &v.to_string()),
+            Err(ProviderError::InvalidToolCall)
+        ));
     }
     let prepared = p
         .prepare(resume(first(&p), vec![result("call-1")]))
         .unwrap();
-    assert!(decode(&p, prepared, FIRST).is_err());
+    assert!(matches!(
+        decode(&p, prepared, FIRST),
+        Err(ProviderError::InvalidToolCall)
+    ));
+}
+
+#[test]
+fn invalid_proposals_do_not_release_text_or_valid_prefix_and_wire_errors_stay_distinct() {
+    let p = provider();
+    for bad in [
+        json!({"type":"function_call","id":"bad","name":"unadvertised","arguments":{}}),
+        json!({"type":"function_call","id":"call-1","name":"oracle_probe","arguments":{"round":1,"prior":"none"}}),
+        json!({"type":"function_call","id":"","name":"oracle_probe","arguments":{"round":1,"prior":"none"}}),
+    ] {
+        let mut wire: Value = serde_json::from_str(FIRST).unwrap();
+        wire["steps"].as_array_mut().unwrap().push(json!({"type":"model_output","content":[{"type":"text","text":"Must not escape with invalid proposal"}]}));
+        wire["steps"].as_array_mut().unwrap().push(bad);
+        // An Err has no ModelTurn, so neither the earlier valid call nor text
+        // can reach the coordinator or create a continuation to replay.
+        assert!(matches!(
+            decode(&p, p.prepare(request()).unwrap(), &wire.to_string()),
+            Err(ProviderError::InvalidToolCall)
+        ));
+    }
+    for (key, value) in [
+        ("status", json!("unknown")),
+        ("model", json!("wrong-model")),
+        ("steps", json!([{"type":"unrecognized_wire_step"}])),
+    ] {
+        let mut wire: Value = serde_json::from_str(FIRST).unwrap();
+        wire[key] = value;
+        assert!(matches!(
+            decode(&p, p.prepare(request()).unwrap(), &wire.to_string()),
+            Err(ProviderError::ProtocolMismatch)
+        ));
+    }
+    let mut malformed = request();
+    malformed.tools[0].parameters = json!({"type":"object","properties":false});
+    assert!(matches!(
+        p.prepare(malformed),
+        Err(ProviderError::InvalidRequest)
+    ));
 }
 
 #[test]
@@ -729,7 +775,7 @@ fn retired_tools_and_old_ids_are_not_callable_after_discovery() {
     // Valid schema for an old alias still must not authorize a new response call.
     assert!(matches!(
         decode(&p, make(), SECOND),
-        Err(ProviderError::ProtocolMismatch)
+        Err(ProviderError::InvalidToolCall)
     ));
     // A newly authorized alias cannot reuse a historical call ID either.
     let raw = SECOND
@@ -737,7 +783,7 @@ fn retired_tools_and_old_ids_are_not_callable_after_discovery() {
         .replace("call-2", "call-1");
     assert!(matches!(
         decode(&p, make(), &raw),
-        Err(ProviderError::ProtocolMismatch)
+        Err(ProviderError::InvalidToolCall)
     ));
     let mut r = resume(first(&p), vec![]);
     r.tools.clear();
