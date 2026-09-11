@@ -848,7 +848,10 @@ impl ToolHost for HostTools {
                 .iter()
                 .any(|resolved| resolved.call_id == call.call_id)
         });
+        let verification_query = (!unresolved && !pending_verification.is_empty())
+            .then(|| pending_verification.join(" "));
         Ok(Reconciliation {
+            verification_query,
             resolved_calls,
             references: recovered,
             value: json!({"receipts":receipts,"pending_verification":pending_verification,"scope":"verified_planned_changes"}),

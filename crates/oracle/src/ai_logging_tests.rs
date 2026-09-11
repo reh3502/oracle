@@ -211,8 +211,11 @@ impl ModelProvider for Script {
                 "community_activity_log_config_apply_v1",
                 json!({"reference":input["results"][0]["value"]["reference"]}),
             )),
-            4 => Some(("community_activity_log_probe_v1", json!({}))),
-            5 => Some(("community_activity_log_status_v1", json!({}))),
+            // Premature completion after stored/active configuration readback
+            // must trigger the host's bounded verification follow-up.
+            4 => None,
+            5 => Some(("community_activity_log_probe_v1", json!({}))),
+            6 => Some(("community_activity_log_status_v1", json!({}))),
             _ => None,
         };
         let calls = proposal
