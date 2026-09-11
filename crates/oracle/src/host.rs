@@ -12,6 +12,7 @@ use oracle_storage::{PgTools, Storage};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 pub(crate) struct Host {
+    pub(crate) ai: std::sync::OnceLock<Arc<oracle_ai::coordinator::Coordinator>>,
     pub(crate) operations: std::sync::OnceLock<Arc<oracle_operations::executor::StructureExecutor>>,
     pub(crate) command_sync:
         std::sync::OnceLock<Arc<oracle_operations::commands::CommandReconciler>>,
@@ -71,6 +72,7 @@ impl Host {
             }
         };
         Ok(Self {
+            ai: std::sync::OnceLock::new(),
             operations: std::sync::OnceLock::new(),
             command_sync: std::sync::OnceLock::new(),
             command_status: std::sync::Mutex::new(BTreeMap::new()),
@@ -188,6 +190,7 @@ impl Host {
                 let object = status
                     .as_object_mut()
                     .ok_or_else(|| Error::new(ErrorCode::Integrity))?;
+                object.insert("ai_available".into(), value(self.ai.get().is_some())?);
                 object.insert("module_events".into(), value(events)?);
                 let commands: BTreeMap<_, _> = self
                     .command_status

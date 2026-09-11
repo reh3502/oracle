@@ -281,7 +281,7 @@ fn descriptor_has_bootstrap_controls_and_scoped_operation_groups() {
     let definition = serde_json::to_value(oracle_command()).unwrap();
     assert_eq!(definition["name"], "oracle");
     assert_eq!(definition["default_member_permissions"], "32");
-    assert_eq!(definition["options"].as_array().unwrap().len(), 4);
+    assert_eq!(definition["options"].as_array().unwrap().len(), 5);
     assert_eq!(
         definition["options"][1]["options"][0]["choices"],
         json!([{"name":"pause","value":"pause"},{"name":"resume","value":"resume"}])
@@ -803,4 +803,50 @@ async fn published_commands_require_exactly_one_subcommand_and_share_cancellatio
             .unwrap()
             .contains("timed out")
     );
+}
+
+#[test]
+fn agent_controls_use_authenticated_identity_and_exact_arguments() {
+    use oracle_operations::ingress::{AgentRequest, OperationRequest};
+    let interaction = operation_interaction(
+        "agent",
+        "approve",
+        json!([
+            {"name":"run","type":3,"value":"run-one"},
+            {"name":"plan","type":3,"value":"plan-one"},
+            {"name":"hash","type":3,"value":"exact-hash"}
+        ]),
+    );
+    let (context, guild, request) = interaction_ops::parse(&interaction).unwrap();
+    assert!(matches!(context, PolicyContext::Discord { .. }));
+    assert_eq!(guild.as_str(), "101");
+    assert!(
+        matches!(request, OperationRequest::Agent { request: AgentRequest::Approve { run, plan, hash } } if run == "run-one" && plan == "plan-one" && hash == "exact-hash")
+    );
+    let forged = operation_interaction(
+        "agent",
+        "ask",
+        json!([
+            {"name":"goal","type":3,"value":"Create channels"},
+            {"name":"guild","type":3,"value":"foreign"}
+        ]),
+    );
+    assert!(interaction_ops::parse(&forged).is_err());
+    let question = operation_interaction(
+        "agent",
+        "resume",
+        json!([
+            {"name":"run","type":3,"value":"run-one"},
+            {"name":"clarification","type":3,"value":"Use the existing private category"}
+        ]),
+    );
+    assert!(matches!(
+        interaction_ops::parse(&question).unwrap().2,
+        OperationRequest::Agent {
+            request: AgentRequest::Resume {
+                clarification: Some(_),
+                ..
+            }
+        }
+    ));
 }

@@ -9,6 +9,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationRequest {
+    Agent {
+        request: AgentRequest,
+    },
     InvokePublished {
         command_id: String,
         command_name: String,
@@ -48,6 +51,9 @@ pub enum OperationRequest {
 
 #[async_trait]
 pub trait HumanOperations: Send + Sync {
+    fn ai_available(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         context: &PolicyContext,
@@ -55,4 +61,29 @@ pub trait HumanOperations: Send + Sync {
         request: OperationRequest,
         cancel: &CancellationToken,
     ) -> Result<Value>;
+}
+
+/// Authenticated human controls. These requests are never model tools.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentRequest {
+    Ask {
+        goal: String,
+    },
+    Inspect {
+        run: String,
+    },
+    Cancel {
+        run: String,
+    },
+    Resume {
+        run: String,
+        #[serde(default)]
+        clarification: Option<String>,
+    },
+    Approve {
+        run: String,
+        plan: String,
+        hash: String,
+    },
 }

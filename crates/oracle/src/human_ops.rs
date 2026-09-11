@@ -11,6 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait::async_trait]
 impl HumanOperations for Host {
+    fn ai_available(&self) -> bool {
+        self.ai.get().is_some()
+    }
     async fn execute(
         &self,
         context: &PolicyContext,
@@ -18,6 +21,9 @@ impl HumanOperations for Host {
         request: OperationRequest,
         cancel: &CancellationToken,
     ) -> Result<serde_json::Value> {
+        if let OperationRequest::Agent { request } = request {
+            return crate::ai::human(self, context, guild, request).await;
+        }
         let structure = self.operations.get().cloned();
         let commands = self.command_sync.get().cloned();
         let modules = self.modules.clone();
@@ -71,6 +77,7 @@ async fn dispatch(
             .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))
     };
     match request {
+        OperationRequest::Agent { .. } => Err(Error::new(ErrorCode::InvalidInput)),
         request @ OperationRequest::InvokePublished { .. } => {
             let commands = commands.ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
             tokio::select! { biased;

@@ -15,6 +15,8 @@ pub struct Config {
     pub database: Database,
     pub guilds: Vec<GuildPolicy>,
     pub discord: Option<Discord>,
+    #[serde(default)]
+    pub ai: Option<crate::ai::AiConfig>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
@@ -71,6 +73,9 @@ impl Config {
                 return Err(Error::new(ErrorCode::InvalidInput));
             }
         }
+        if let Some(ai) = &config.ai {
+            ai.validate()?;
+        }
         Ok(config)
     }
     pub fn database(&self) -> Result<DatabaseConfig> {
@@ -96,7 +101,7 @@ impl Config {
             .map_err(|e| Error::with_source(ErrorCode::Io, e))
     }
 }
-fn validate_env(name: &str) -> Result<()> {
+pub(crate) fn validate_env(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
             .bytes()
@@ -129,6 +134,7 @@ pub fn initialize(path: &Path, postgres_env: Option<String>) -> Result<()> {
         },
         guilds: vec![],
         discord: None,
+        ai: None,
     };
     let mut file = std::fs::OpenOptions::new()
         .write(true)

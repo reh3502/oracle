@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 [dependencies]
+oracle-ai = { path = "../oracle-ai" }
 async-trait.workspace = true
 oracle-operations = { path = "../oracle-operations" }
 oracle-core = { path = "../oracle-core" }

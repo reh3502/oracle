@@ -65,6 +65,7 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
         host.modules
             .set_configuration_services(host.storage.clone(), Arc::new(cli_ops::OfflinePolicy))?;
     }
+    crate::ai::configure(&host, config.ai.as_ref())?;
     let mut stopped = None;
     let result: Result<()> = async {
         let socket = config.socket();
@@ -239,8 +240,13 @@ async fn run(
                 }
             }
         }).map_err(|_| Error::new(ErrorCode::Cancelled))?;
+    let mut status = host
+        .core
+        .status(&PolicyContext::LocalOperator, None)
+        .await?;
+    status.ai_available = host.ai.get().is_some();
     output(
-        serde_json::json!({"event":"ready","discord_connected":gateway.is_some(),"status":host.core.status(&PolicyContext::LocalOperator,None).await?}),
+        serde_json::json!({"event":"ready","discord_connected":gateway.is_some(),"status":status}),
     )?;
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     loop {

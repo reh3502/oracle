@@ -276,7 +276,7 @@ impl DiscordBootstrap {
         }
         if interaction_ops::is_operation(interaction) {
             return self
-                .handle_operation(interaction, responder, Duration::from_secs(30))
+                .handle_operation(interaction, responder, Duration::from_secs(310))
                 .await;
         }
         let (context, guild, action) = match authenticated_request(interaction) {
@@ -303,7 +303,11 @@ impl DiscordBootstrap {
                     if state.paused { "paused" } else { "running" },
                     status.modules_loaded,
                     status.recovery_required,
-                    if status.ai_available {
+                    if self
+                        .operations
+                        .as_ref()
+                        .is_some_and(|operations| operations.ai_available())
+                    {
                         "available"
                     } else {
                         "unavailable"

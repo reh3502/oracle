@@ -1614,6 +1614,7 @@ dependencies = [
  "async-trait",
  "clap",
  "fs2",
+ "oracle-ai",
  "oracle-core",
  "oracle-discord",
  "oracle-modules",

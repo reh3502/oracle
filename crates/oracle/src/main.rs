@@ -1,5 +1,6 @@
 //! Host composition root. Feature modules enter only through runtime installation.
 #![forbid(unsafe_code)]
+mod ai;
 mod cli;
 mod cli_ops;
 mod command_runtime;
@@ -68,6 +69,7 @@ async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
     match cli.command {
         Command::Serve => serve(config, tools).await,
+        Command::Agent(args) => output(control::send(&config.socket(), args.request()).await?),
         Command::Restore { backup } => {
             config.prepare_state_dir()?;
             let restored = Storage::restore(config.database()?, &backup, &tools).await?;

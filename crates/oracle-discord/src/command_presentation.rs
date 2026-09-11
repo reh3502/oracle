@@ -182,11 +182,42 @@ fn string(
     discord::CreateCommandOption::new(discord::CommandOptionType::String, name, description)
         .required(required)
 }
-pub(super) fn descriptors() -> [discord::CreateCommandOption<'static>; 2] {
+pub(super) fn descriptors() -> [discord::CreateCommandOption<'static>; 3] {
     let sub = |name, description| {
         discord::CreateCommandOption::new(discord::CommandOptionType::SubCommand, name, description)
     };
     [
+        discord::CreateCommandOption::new(
+            discord::CommandOptionType::SubCommandGroup,
+            "agent",
+            "Ask and control the configured assistant",
+        )
+        .add_sub_option(
+            sub("ask", "Start a scoped assistant run").add_sub_option(string(
+                "goal",
+                "Requested result",
+                true,
+            )),
+        )
+        .add_sub_option(
+            sub("inspect", "Inspect a saved run").add_sub_option(string("run", "Run ID", true)),
+        )
+        .add_sub_option(sub("cancel", "Cancel a run").add_sub_option(string("run", "Run ID", true)))
+        .add_sub_option(
+            sub("resume", "Resume a saved run")
+                .add_sub_option(string("run", "Run ID", true))
+                .add_sub_option(string(
+                    "clarification",
+                    "Answer the requested clarification",
+                    false,
+                )),
+        )
+        .add_sub_option(
+            sub("approve", "Approve an exact reviewed structure plan")
+                .add_sub_option(string("run", "Run ID", true))
+                .add_sub_option(string("plan", "Plan ID", true))
+                .add_sub_option(string("hash", "Exact reviewed plan hash", true)),
+        ),
         discord::CreateCommandOption::new(
             discord::CommandOptionType::SubCommandGroup,
             "structure",

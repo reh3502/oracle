@@ -6,11 +6,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub(super) fn is_operation(interaction: &discord::CommandInteraction) -> bool {
-    interaction
-        .data
-        .options
-        .first()
-        .is_some_and(|option| matches!(option.name.as_str(), "structure" | "module-config"))
+    interaction.data.options.first().is_some_and(|option| {
+        matches!(
+            option.name.as_str(),
+            "structure" | "module-config" | "agent"
+        )
+    })
 }
 pub(super) fn parse(
     interaction: &discord::CommandInteraction,
@@ -56,6 +57,31 @@ pub(super) fn parse(
         serde_json::from_str(value).map_err(|_| Error::InvalidInteraction)
     }
     let request = match (group.name.as_str(), command.name.as_str()) {
+        ("agent", action) => {
+            use oracle_operations::ingress::AgentRequest;
+            let request = match action {
+                "ask" => AgentRequest::Ask {
+                    goal: required(&mut args, "goal")?,
+                },
+                "inspect" => AgentRequest::Inspect {
+                    run: required(&mut args, "run")?,
+                },
+                "cancel" => AgentRequest::Cancel {
+                    run: required(&mut args, "run")?,
+                },
+                "resume" => AgentRequest::Resume {
+                    run: required(&mut args, "run")?,
+                    clarification: args.remove("clarification"),
+                },
+                "approve" => AgentRequest::Approve {
+                    run: required(&mut args, "run")?,
+                    plan: required(&mut args, "plan")?,
+                    hash: required(&mut args, "hash")?,
+                },
+                _ => return Err(Error::InvalidInteraction),
+            };
+            OperationRequest::Agent { request }
+        }
         ("structure", "inspect") => OperationRequest::Inspect,
         ("structure", "plan") => OperationRequest::Plan {
             request: serde_json::from_value(json(&required(&mut args, "request")?)?)

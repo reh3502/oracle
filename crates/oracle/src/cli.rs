@@ -18,6 +18,8 @@ pub(crate) struct Cli {
 }
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Run or control the opt-in Gemini assistant through the running host.
+    Agent(AgentArgs),
     Structure(cli_ops::StructureArgs),
     #[command(name = "module-config")]
     Configuration(cli_ops::ConfigurationArgs),
@@ -185,4 +187,91 @@ impl ModuleCommand {
 pub(crate) enum Action {
     Pause,
     Resume,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct AgentArgs {
+    #[arg(long)]
+    guild: GuildId,
+    #[command(subcommand)]
+    command: AgentCommand,
+}
+#[derive(Subcommand)]
+enum AgentCommand {
+    Ask {
+        goal: String,
+    },
+    Inspect {
+        run: String,
+    },
+    Cancel {
+        run: String,
+    },
+    Resume {
+        run: String,
+        #[arg(long)]
+        clarification: Option<String>,
+    },
+    Approve {
+        run: String,
+        plan: String,
+        hash: String,
+    },
+}
+impl AgentArgs {
+    pub(crate) fn request(self) -> crate::control::Request {
+        use oracle_operations::ingress::{AgentRequest, OperationRequest};
+        let request = match self.command {
+            AgentCommand::Ask { goal } => AgentRequest::Ask { goal },
+            AgentCommand::Inspect { run } => AgentRequest::Inspect { run },
+            AgentCommand::Cancel { run } => AgentRequest::Cancel { run },
+            AgentCommand::Resume { run, clarification } => {
+                AgentRequest::Resume { run, clarification }
+            }
+            AgentCommand::Approve { run, plan, hash } => AgentRequest::Approve { run, plan, hash },
+        };
+        crate::control::Request::Operation {
+            guild: self.guild,
+            request: OperationRequest::Agent { request },
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+    #[test]
+    fn agent_controls_are_exact_private_socket_requests() {
+        let cli = Cli::try_parse_from([
+            "oracle", "agent", "--guild", "123", "approve", "run-id", "plan-id", "hash",
+        ])
+        .unwrap();
+        let Command::Agent(args) = cli.command else {
+            panic!("agent command");
+        };
+        assert_eq!(
+            serde_json::to_value(args.request()).unwrap(),
+            serde_json::json!({"command":"operation","guild":"123","request":{"action":"agent","request":{"action":"approve","run":"run-id","plan":"plan-id","hash":"hash"}}})
+        );
+        let cli = Cli::try_parse_from([
+            "oracle",
+            "agent",
+            "--guild",
+            "123",
+            "resume",
+            "run-id",
+            "--clarification",
+            "Private category",
+        ])
+        .unwrap();
+        let Command::Agent(args) = cli.command else {
+            panic!("agent command");
+        };
+        let wire = serde_json::to_value(args.request()).unwrap();
+        assert_eq!(
+            wire["request"]["request"]["clarification"],
+            "Private category"
+        );
+        assert!(Cli::try_parse_from(["oracle", "agent", "ask", "do something"]).is_err());
+    }
 }

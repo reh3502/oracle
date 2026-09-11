@@ -24,7 +24,12 @@ pub fn legacy_definition() -> Result<Value> {
     Ok(definition)
 }
 pub fn known_definitions() -> Result<Vec<Value>> {
-    Ok(vec![current_definition()?, legacy_definition()?])
+    let mut stage3 = current_definition()?;
+    stage3["options"]
+        .as_array_mut()
+        .ok_or_else(|| Error::new(ErrorCode::Integrity))?
+        .retain(|option| option["name"] != "agent");
+    Ok(vec![current_definition()?, stage3, legacy_definition()?])
 }
 pub fn desired() -> Result<DesiredCommand> {
     Ok(DesiredCommand {
@@ -48,7 +53,7 @@ mod tests {
         let current = desired().unwrap();
         assert_eq!(current.owner.as_str(), "oracle.bootstrap");
         assert!(current.route.is_none());
-        assert_eq!(current.definition["options"].as_array().unwrap().len(), 4);
+        assert_eq!(current.definition["options"].as_array().unwrap().len(), 5);
     }
     #[test]
     fn known_definitions_match_real_discord_command_readback() {
