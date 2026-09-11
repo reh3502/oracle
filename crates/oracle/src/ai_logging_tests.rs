@@ -203,19 +203,19 @@ impl ModelProvider for Script {
                 json!({"query":"community.activity-log configuration inspect plan apply"}),
             )),
             1 => Some(("community_activity_log_config_inspect_v1", json!({}))),
-            2 => Some((
+            2 | 4 => Some((
                 "community_activity_log_config_plan_v1",
                 json!({"preset":"moderate/v1","values":{"destination":self.destination,"operator_note":"preserve unrelated operator choices"}}),
             )),
-            3 if input["results"][0]["value"]["reference"].is_string() => Some((
+            3 | 5 if input["results"][0]["value"]["reference"].is_string() => Some((
                 "community_activity_log_config_apply_v1",
                 json!({"reference":input["results"][0]["value"]["reference"]}),
             )),
             // Premature completion after stored/active configuration readback
             // must trigger the host's bounded verification follow-up.
-            4 => None,
-            5 => Some(("community_activity_log_probe_v1", json!({}))),
-            6 => Some(("community_activity_log_status_v1", json!({}))),
+            6 => None,
+            7 => Some(("community_activity_log_probe_v1", json!({}))),
+            8 => Some(("community_activity_log_status_v1", json!({}))),
             _ => None,
         };
         let calls = proposal
@@ -365,6 +365,145 @@ async fn agent_logging_moderate_verifies_native_configuration_delivery_and_curre
         config.stored_revision
     );
     assert_eq!(config.receipt.as_ref().unwrap().state, "effective");
+    assert_eq!(config.stored_revision, 1);
+    let config_refs: Vec<_> = run
+        .run
+        .references
+        .iter()
+        .filter(|reference| reference.starts_with("config:"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        config_refs.len(),
+        2,
+        "the historical plan ledger must remain intact"
+    );
+    let tools = HostTools {
+        host: Arc::downgrade(&host),
+    };
+    for reference in &config_refs {
+        let observed = tools
+            .inspect_reference(&PolicyContext::LocalOperator, &run.run, reference)
+            .await
+            .unwrap();
+        assert_eq!(observed["receipt"]["state"], "effective");
+        assert_eq!(observed["effective"]["revision"], 1);
+        if !reference.ends_with(&config.receipt.as_ref().unwrap().plan) {
+            assert_eq!(observed["equivalent_intent"], true);
+            assert_eq!(
+                observed["verified_via_plan"],
+                config.receipt.as_ref().unwrap().plan
+            );
+            assert_eq!(
+                observed["requested_plan"],
+                reference.rsplit(':').next().unwrap()
+            );
+        }
+    }
+    let store = RunStore::new(host.core.clone(), host.storage.clone());
+    let saved = store
+        .inspect(&PolicyContext::LocalOperator, &guild, &run.run.id)
+        .await
+        .unwrap();
+    let calls: Vec<_> = store
+        .calls(&saved)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|saved| saved.call)
+        .collect();
+    let previous = config_refs
+        .iter()
+        .find(|reference| !reference.ends_with(&config.receipt.as_ref().unwrap().plan))
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap();
+    let previous_index = calls
+        .iter()
+        .position(|call| {
+            call.result
+                .as_ref()
+                .is_some_and(|result| result["plan"]["id"] == previous)
+        })
+        .unwrap();
+    let binding = &calls[previous_index].binding;
+    assert!(
+        equivalent_configuration_intent(
+            &run.run,
+            &calls,
+            module.as_str(),
+            previous,
+            binding,
+            &config
+        )
+        .is_some()
+    );
+    for failure in [
+        "values",
+        "schema",
+        "binding",
+        "unknown",
+        "error",
+        "foreign",
+        "not_host_plan",
+    ] {
+        let mut changed = calls.clone();
+        let call = &mut changed[previous_index];
+        match failure {
+            "values" => {
+                call.result.as_mut().unwrap()["plan"]["values"]["retention_days"] = json!(30)
+            }
+            "schema" => call.result.as_mut().unwrap()["plan"]["schema_version"] = json!(999),
+            "binding" => call.binding.push_str(":different"),
+            "unknown" => call.state = oracle_ai::state::CallState::Unknown,
+            "error" => call.is_error = true,
+            "foreign" => call.run = OperationId::generate(),
+            "not_host_plan" => call.name = "community_activity_log_status_v1".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            equivalent_configuration_intent(
+                &run.run,
+                &changed,
+                module.as_str(),
+                previous,
+                binding,
+                &config
+            )
+            .is_none(),
+            "must reject {failure}"
+        );
+    }
+    let mut unverified = config.clone();
+    unverified.receipt.as_mut().unwrap().state = "unknown".into();
+    assert!(
+        equivalent_configuration_intent(
+            &run.run,
+            &calls,
+            module.as_str(),
+            previous,
+            binding,
+            &unverified
+        )
+        .is_none()
+    );
+    let mut foreign_reference = run.run.clone();
+    foreign_reference
+        .references
+        .retain(|reference| !reference.ends_with(&config.receipt.as_ref().unwrap().plan));
+    assert!(
+        equivalent_configuration_intent(
+            &foreign_reference,
+            &calls,
+            module.as_str(),
+            previous,
+            binding,
+            &config
+        )
+        .is_none()
+    );
+
     let status = host
         .modules
         .invoke(
@@ -421,6 +560,17 @@ async fn agent_logging_moderate_verifies_native_configuration_delivery_and_curre
             .unwrap()
             .complete
     );
+
+    // A different run's current receipt cannot discharge this run's historical plans.
+    for reference in &config_refs {
+        assert_eq!(
+            tools
+                .inspect_reference(&PolicyContext::LocalOperator, &run.run, reference)
+                .await
+                .unwrap()["verified"],
+            false
+        );
+    }
 
     // B08: a successful synthetic delivery does not override current subscription failure.
     policy.deny_subscriptions.store(true, Ordering::SeqCst);

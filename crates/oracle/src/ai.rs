@@ -190,6 +190,58 @@ fn require_reference(run: &Run, reference: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Match only host-issued plans in this run's finished configuration ledger.
+/// Equal current intent is evidence of equivalent state, never evidence that an
+/// earlier apply happened or that a plan from another run was authorized here.
+fn equivalent_configuration_intent(
+    run: &Run,
+    calls: &[CallRecord],
+    module: &str,
+    requested: &str,
+    binding: &str,
+    status: &oracle_modules::ConfigurationStatus,
+) -> Option<String> {
+    let receipt = status.receipt.as_ref()?;
+    let effective = status.effective.as_ref()?;
+    if receipt.state != "effective"
+        || receipt.stored_revision != status.stored_revision
+        || receipt.effective_revision != Some(status.stored_revision)
+        || effective.revision != status.stored_revision
+        || status.values.as_ref() != Some(&effective.values)
+    {
+        return None;
+    }
+    let plan_for = |id: &str| -> Option<oracle_modules::ConfigurationPlan> {
+        let reference = format!("config:{module}:{id}");
+        if !run.references.contains(&reference) {
+            return None;
+        }
+        calls.iter().find_map(|call| {
+            if call.run != run.id
+                || call.state != oracle_ai::state::CallState::Finished
+                || call.is_error
+                || call.binding != binding
+                || call.name != format!("{}_config_plan_v1", module.replace(['.', '-'], "_"))
+            {
+                return None;
+            }
+            let result = call.result.as_ref()?;
+            if result["reference"].as_str() != Some(reference.as_str()) {
+                return None;
+            }
+            let plan: oracle_modules::ConfigurationPlan =
+                serde_json::from_value(result["plan"].clone()).ok()?;
+            (plan.id == id
+                && Some(plan.schema_version) == status.schema_version
+                && plan.values == effective.values)
+                .then_some(plan)
+        })
+    };
+    let previous = plan_for(requested)?;
+    let current = plan_for(&receipt.plan)?;
+    (previous.schema_version == current.schema_version && previous.values == current.values)
+        .then(|| receipt.plan.clone())
+}
 fn object(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
@@ -347,6 +399,58 @@ impl HostTools {
                 .is_some_and(|receipt| receipt.plan == plan)
             {
                 return value(status);
+            }
+            let store = RunStore::new(host.core.clone(), host.storage.clone());
+            let saved = store.inspect(context, &run.guild, &run.id).await?;
+            let calls: Vec<_> = store
+                .calls(&saved)
+                .await?
+                .into_iter()
+                .map(|saved| saved.call)
+                .collect();
+            let snapshot = host
+                .modules
+                .ai_catalog_snapshot(context, &run.guild)
+                .await?;
+            if let Some(current) = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.module.as_str() == module)
+            {
+                let binding = format!(
+                    "config:{}:{}:{}:{}:{}:plan",
+                    current.module,
+                    current.session,
+                    current.generation,
+                    current.epoch,
+                    current.artifact_digest
+                );
+                if let Some(verified_via) =
+                    equivalent_configuration_intent(run, &calls, module, plan, &binding, &status)
+                {
+                    let health = host
+                        .modules
+                        .ai_host_health(
+                            context,
+                            &run.guild,
+                            &current.module,
+                            &current.session,
+                            current.generation,
+                            current.epoch,
+                        )
+                        .await?;
+                    if health.configuration.verified
+                        && health.configuration.stored == status.effective
+                        && health.destination.verified
+                        && health.subscriptions.ready
+                    {
+                        let mut observed = value(status)?;
+                        observed["equivalent_intent"] = json!(true);
+                        observed["requested_plan"] = json!(plan);
+                        observed["verified_via_plan"] = json!(verified_via);
+                        return Ok(observed);
+                    }
+                }
             }
             return Ok(
                 json!({"reference":reference,"state":"planned_or_expired","verified":false}),
