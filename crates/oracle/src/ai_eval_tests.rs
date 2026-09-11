@@ -1561,13 +1561,29 @@ async fn live_candidate_five_trials_and_repeat() {
                 let passed = reasons.is_empty();
                 trial_ok &= passed;
                 let saved = result.as_ref().ok();
+                // Host ledger order makes repeated discovery/planning and failed
+                // verification diagnosable without recording private argument text.
+                let tool_trace = if let Some(saved) = saved {
+                    RunStore::new(host.core.clone(), host.storage.clone())
+                        .calls(saved)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|saved| {
+                            let call = saved.call;
+                            json!({"name":call.name,"binding":call.binding,"state":call.state,"is_error":call.is_error})
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 let attempt_records = {
                     let metrics = campaign.metrics.lock().unwrap();
                     let records = metrics.attempts[last_reported_attempt..].to_vec();
                     last_reported_attempt = metrics.attempts.len();
                     records
                 };
-                writeln!(report,"{}",json!({"kind":"trial","provider_attempts":attempt_records,"fixture":case,"trial":trial+1,"repeat":repeat+1,"passed":passed,"reasons":reasons,"duration_ms":started.elapsed().as_millis(),"status":saved.map(|s|s.run.status),"problem":saved.and_then(|s|s.run.problem.as_ref()),"budget":saved.map(|s|&s.run.budget),"registry_revision":saved.and_then(|s|s.run.catalog_revision),"references":saved.map(|s|&s.run.references),"initial_state_hash":digest(serde_json::to_vec(&initial).unwrap()),"final_state":final_state,"configuration":config_value,"metrics":&*campaign.metrics.lock().unwrap()})).unwrap();
+                writeln!(report,"{}",json!({"kind":"trial","provider_attempts":attempt_records,"tool_trace":tool_trace,"fixture":case,"trial":trial+1,"repeat":repeat+1,"passed":passed,"reasons":reasons,"duration_ms":started.elapsed().as_millis(),"status":saved.map(|s|s.run.status),"problem":saved.and_then(|s|s.run.problem.as_ref()),"budget":saved.map(|s|&s.run.budget),"registry_revision":saved.and_then(|s|s.run.catalog_revision),"references":saved.map(|s|&s.run.references),"initial_state_hash":digest(serde_json::to_vec(&initial).unwrap()),"final_state":final_state,"configuration":config_value,"metrics":&*campaign.metrics.lock().unwrap()})).unwrap();
                 report.flush().unwrap();
                 previous_verified =
                     passed && saved.is_some_and(|saved| saved.run.status == RunStatus::Succeeded);
