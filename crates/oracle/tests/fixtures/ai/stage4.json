@@ -84,9 +84,9 @@
     "id": "A10",
     "split": "train",
     "seed": 1009,
-    "goal": "Set up Minecraft, preserving the unrelated channel whose Unicode name resembles Minecraft. Use the exact Minecraft category and three standard channels.",
+    "goal": "Set up Minecraft, preserving the unrelated channel whose Unicode name resembles Minecraft. Use the exact Minecraft category and three standard channels. Follow the existing Terraria game-area naming and access conventions, using the existing game-player role 110 and staff role 111; preserve all guild roles and memberships.",
     "state": "unicode",
-    "oracle": "minecraft",
+    "oracle": "minecraft_conventions",
     "fault": "none"
   },
   {
@@ -129,9 +129,9 @@
     "id": "A15",
     "split": "train",
     "seed": 1014,
-    "goal": "Inspect every relevant resource, then build Minecraft with a category and three channels. Do not confuse unrelated game channels.",
+    "goal": "Inspect every relevant resource, then build Minecraft with a category and three channels. Do not confuse unrelated game channels. Follow the existing Terraria game-area naming and access conventions, using the existing game-player role 110 and staff role 111; preserve all guild roles and memberships.",
     "state": "large",
-    "oracle": "minecraft",
+    "oracle": "minecraft_conventions",
     "fault": "none"
   },
   {
