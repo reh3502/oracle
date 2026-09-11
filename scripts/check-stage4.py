@@ -20,6 +20,7 @@ SPEC = importlib.util.spec_from_file_location("stage3_gate", ROOT / "scripts/che
 stage3 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(stage3)
 COORDINATOR_TESTS = [
+    "authenticated_clarification_preserves_budget_and_policy_before_resume",
     "model_completion_is_not_receipt_backed_success",
     "pending_verification_gets_one_fresh_semantic_continuation",
     "premature_completion_cannot_loop_or_exceed_budget_for_verification",
@@ -44,6 +45,7 @@ HOST_TESTS = [
     "agent_minecraft_receipts_and_repeat_request_reuse_real_operations",
     "agent_forged_scope_and_approval_prose_cannot_create_effects",
     "agent_host_rejects_reference_copied_from_another_run",
+    "agent_corrects_unissued_plan_reference_without_uncertain_effect",
     "agent_permission_expansion_waits_for_exact_authenticated_approval",
     "agent_receipt_gate_detects_drift_after_completed_operation",
     "agent_permission_revoked_after_first_write_preserves_only_completed_effect",
@@ -56,6 +58,7 @@ RECOVERY_TESTS = [
 ]
 LOGGING_TESTS = [
     "agent_logging_moderate_verifies_native_configuration_delivery_and_current_health",
+    "agent_logging_corrects_unissued_plan_reference_before_dispatch",
     "agent_logging_public_destination_is_denied_without_configuration_or_delivery",
     "agent_logging_missing_inactive_and_unloaded_catalogs_never_authorize_stale_apply",
     "agent_malicious_module_guide_cannot_read_or_exfiltrate_host_secret",

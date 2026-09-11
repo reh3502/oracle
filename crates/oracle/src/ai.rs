@@ -190,6 +190,28 @@ fn require_reference(run: &Run, reference: &str) -> Result<()> {
     }
     Ok(())
 }
+
+fn plan_reference<'a>(run: &Run, reference: &'a str, prefix: &str) -> Option<&'a str> {
+    require_reference(run, reference).ok()?;
+    reference.strip_prefix(prefix).filter(|id| !id.is_empty())
+}
+
+// This rejection occurs before dispatch, so there is no effect to reconcile.
+fn rejected_plan_reference() -> HostOutcome {
+    HostOutcome {
+        value: json!({
+            "error":"invalid_plan_reference",
+            "host_error_code":ErrorCode::ForbiddenScope,
+            "next_action":"Use the exact reference returned by planning in this run. Inspect or plan again if needed."
+        }),
+        is_error: true,
+        unknown: false,
+        progress: false,
+        references: vec![],
+        wait: None,
+        search_query: None,
+    }
+}
 /// Match only host-issued plans in this run's finished configuration ledger.
 /// Equal current intent is evidence of equivalent state, never evidence that an
 /// earlier apply happened or that a plan from another run was authorized here.
@@ -625,11 +647,9 @@ impl ToolHost for HostTools {
             }
             "core_discord_apply_v1" => {
                 let reference: Reference = decode(call.arguments.clone())?;
-                require_reference(run, &reference.reference)?;
-                let plan = reference
-                    .reference
-                    .strip_prefix("structure:")
-                    .ok_or_else(invalid)?;
+                let Some(plan) = plan_reference(run, &reference.reference, "structure:") else {
+                    return Ok(rejected_plan_reference());
+                };
                 outcome(
                     host.execute(
                         context,
@@ -747,18 +767,18 @@ impl ToolHost for HostTools {
                     }
                     "apply" => {
                         let reference: Reference = decode(call.arguments.clone())?;
-                        require_reference(run, &reference.reference)?;
                         let prefix = format!("config:{module}:");
-                        let plan = reference
-                            .reference
-                            .strip_prefix(&prefix)
-                            .ok_or_else(invalid)?
-                            .to_owned();
+                        let Some(plan) = plan_reference(run, &reference.reference, &prefix) else {
+                            return Ok(rejected_plan_reference());
+                        };
                         outcome(
                             host.execute(
                                 context,
                                 &run.guild,
-                                OperationRequest::ConfigurationApply { module, plan },
+                                OperationRequest::ConfigurationApply {
+                                    module,
+                                    plan: plan.into(),
+                                },
                                 cancel,
                             )
                             .await?,

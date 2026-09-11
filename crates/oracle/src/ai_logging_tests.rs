@@ -299,6 +299,55 @@ fn coordinator_with_provider(host: &Arc<Host>, provider: Arc<dyn ModelProvider>)
 
 #[tokio::test]
 #[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
+async fn agent_logging_corrects_unissued_plan_reference_before_dispatch() {
+    let (root, host, _) = super::tests::fixture().await;
+    let (_policy, transport) = services(&host).await;
+    let module = install(root.path(), &host, true).await;
+    let guild = GuildId::new("100").unwrap();
+    let provider = super::tests::typo_provider(Arc::new(Script {
+        step: AtomicUsize::new(0),
+        destination: "456".into(),
+    }));
+    let saved = coordinator_with_provider(&host, provider)
+        .ask(
+            &PolicyContext::LocalOperator,
+            guild.clone(),
+            "Set up moderate logging and verify delivery".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.run.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        saved.run.problem
+    );
+    let config = host
+        .modules
+        .configuration_inspect(&PolicyContext::LocalOperator, &guild, &module)
+        .await
+        .unwrap();
+    assert_eq!(config.stored_revision, 1);
+    assert_eq!(config.effective.unwrap().revision, 1);
+    assert_eq!(transport.messages.lock().unwrap().len(), 1);
+    let calls = RunStore::new(host.core.clone(), host.storage.clone())
+        .calls(&saved)
+        .await
+        .unwrap();
+    assert!(
+        calls
+            .iter()
+            .all(|record| record.call.state == oracle_ai::state::CallState::Finished)
+    );
+    assert_eq!(
+        calls.iter().filter(|record| record.call.is_error).count(),
+        1
+    );
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
 async fn agent_logging_moderate_verifies_native_configuration_delivery_and_current_health() {
     let (root, host, _) = super::tests::fixture().await;
     let (policy, transport) = services(&host).await;

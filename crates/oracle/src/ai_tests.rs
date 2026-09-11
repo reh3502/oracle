@@ -252,6 +252,112 @@ fn coordinator(host: &Arc<Host>, attack: Option<Value>) -> Coordinator {
         }),
     )
 }
+
+pub(super) fn typo_provider(inner: Arc<dyn ModelProvider>) -> Arc<dyn ModelProvider> {
+    Arc::new(ReferenceTypo {
+        inner,
+        injected: std::sync::atomic::AtomicBool::new(false),
+        correction: Mutex::new(None),
+    })
+}
+
+struct ReferenceTypo {
+    inner: Arc<dyn ModelProvider>,
+    injected: std::sync::atomic::AtomicBool,
+    correction: Mutex<Option<ToolCall>>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ReferenceTypo {
+    fn profile(&self) -> &ModelProfile {
+        self.inner.profile()
+    }
+    fn prepare(&self, request: ModelRequest) -> std::result::Result<PreparedTurn, ProviderError> {
+        self.inner.prepare(request)
+    }
+    async fn send(
+        &self,
+        request: PreparedTurn,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<ModelTurn, ProviderError> {
+        if let Some(mut correction) = self.correction.lock().unwrap().take() {
+            let input: Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(input["results"][0]["is_error"], true);
+            assert_eq!(
+                input["results"][0]["value"]["error"],
+                "invalid_plan_reference"
+            );
+            correction.id.push_str("-corrected");
+            return Ok(ModelTurn {
+                calls: vec![correction],
+                stop: StopReason::ToolCalls,
+                visible_text: None,
+                continuation: Continuation {
+                    profile: self.profile().id.clone(),
+                    opaque: "corrected".into(),
+                },
+                usage: Usage {
+                    total_tokens: Some(100),
+                    ..Default::default()
+                },
+                model: None,
+            });
+        }
+        let mut turn = self.inner.send(request, cancel).await?;
+        if let Some(call) = turn
+            .calls
+            .iter_mut()
+            .find(|call| call.name.ends_with("_apply_v1"))
+            && !self.injected.swap(true, Ordering::SeqCst)
+        {
+            *self.correction.lock().unwrap() = Some(call.clone());
+            call.arguments["reference"] = json!(format!(
+                "{}-typo",
+                call.arguments["reference"].as_str().unwrap()
+            ));
+        }
+        Ok(turn)
+    }
+}
+
+#[tokio::test]
+async fn agent_corrects_unissued_plan_reference_without_uncertain_effect() {
+    let (_root, host, world) = fixture().await;
+    let provider = typo_provider(Arc::new(Script {
+        step: AtomicUsize::new(0),
+        attack: None,
+    }));
+    let saved = coordinator_with_provider(&host, provider)
+        .ask(
+            &PolicyContext::LocalOperator,
+            GuildId::new("100").unwrap(),
+            "Set up Minecraft".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.run.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        saved.run.problem
+    );
+    assert_eq!(world.writes.load(Ordering::SeqCst), 4);
+    let calls = RunStore::new(host.core.clone(), host.storage.clone())
+        .calls(&saved)
+        .await
+        .unwrap();
+    assert!(
+        calls
+            .iter()
+            .all(|record| record.call.state == oracle_ai::state::CallState::Finished)
+    );
+    assert_eq!(
+        calls.iter().filter(|record| record.call.is_error).count(),
+        1
+    );
+    host.close().await.unwrap();
+}
+
 pub(super) fn coordinator_with_provider(
     host: &Arc<Host>,
     provider: Arc<dyn ModelProvider>,
@@ -392,9 +498,15 @@ async fn agent_host_rejects_reference_copied_from_another_run() {
             &CancellationToken::new(),
         )
         .await
-        .err()
         .unwrap();
-    assert_eq!(error.code, ErrorCode::ForbiddenScope);
+    assert!(error.is_error);
+    assert!(!error.unknown);
+    assert!(!error.progress);
+    assert_eq!(
+        error.value["host_error_code"],
+        json!(ErrorCode::ForbiddenScope)
+    );
+    assert!(error.references.is_empty());
     assert_eq!(world.writes.load(Ordering::SeqCst), 4);
     host.close().await.unwrap();
 }
