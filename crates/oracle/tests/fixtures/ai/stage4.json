@@ -572,7 +572,7 @@
     "id": "R02",
     "split": "train",
     "seed": 1061,
-    "goal": "Set up the Minecraft area after one short provider rate limit.",
+    "goal": "Set up Minecraft: one Minecraft category, minecraft-chat and minecraft-info text channels, and Minecraft Voice. Complete this setup after one short provider rate limit.",
     "state": "empty",
     "oracle": "minecraft",
     "fault": "rate_limit_once"
@@ -644,7 +644,7 @@
     "id": "R10",
     "split": "train",
     "seed": 1069,
-    "goal": "Set up Minecraft, retaining conservative billing when provider usage is unavailable.",
+    "goal": "Set up Minecraft: one Minecraft category, minecraft-chat and minecraft-info text channels, and Minecraft Voice. Retain conservative billing when provider usage is unavailable.",
     "state": "empty",
     "oracle": "minecraft",
     "fault": "unknown_usage"
