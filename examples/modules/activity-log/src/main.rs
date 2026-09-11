@@ -1,4 +1,6 @@
 //! Separately installed metadata logger. Host events and host effects are the only IO ports.
+#[cfg(any(feature = "typed-config-fixture", feature = "no-config-fixture"))]
+mod configuration_fixture;
 mod domain;
 #[cfg(feature = "injection-fixture")]
 mod injection_fixture;
@@ -185,6 +187,20 @@ impl Module for Logger {
                 .description = injection_fixture::DESCRIPTION.into();
             fixture
         };
+        #[cfg(feature = "typed-config-fixture")]
+        let manifest: ModuleManifest =
+            serde_json::from_value(configuration_fixture::configuration_variant(
+                serde_json::to_value(manifest).expect("fixture manifest"),
+                true,
+            ))
+            .expect("typed configuration fixture");
+        #[cfg(feature = "no-config-fixture")]
+        let manifest: ModuleManifest =
+            serde_json::from_value(configuration_fixture::configuration_variant(
+                serde_json::to_value(manifest).expect("fixture manifest"),
+                false,
+            ))
+            .expect("missing configuration fixture");
         manifest
     }
     async fn prepare_configuration(&self, _: GuildContext, _: u64, values: Value) -> Result<()> {

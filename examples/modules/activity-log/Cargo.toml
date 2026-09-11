@@ -7,6 +7,9 @@ publish.workspace = true
 [features]
 # Adversarial metadata fixture; excluded from ordinary module builds.
 injection-fixture = []
+# Metadata variants for native configuration-discovery contract tests.
+typed-config-fixture = []
+no-config-fixture = []
 [dependencies]
 oracle-module-sdk = {path="../../../crates/oracle-module-sdk"}
 oracle-contracts = {path="../../../crates/oracle-contracts"}
