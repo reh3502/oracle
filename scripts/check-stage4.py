@@ -19,6 +19,32 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("stage3_gate", ROOT / "scripts/check-stage3.py")
 stage3 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(stage3)
+COORDINATOR_TESTS = [
+    "model_completion_is_not_receipt_backed_success",
+    "full_round_receipts_survive_compaction_without_policy_promotion",
+    "duplicate_call_identity_never_replays_effect",
+    "validates_entire_batch_before_first_effect",
+    "registry_change_fences_old_tool_before_dispatch",
+    "unknown_effect_requires_reconciliation_and_is_not_replayed_on_resume",
+    "cancellation_interrupts_inflight_effect_and_fences_resume",
+    "interrupted_daily_admission_settles_original_attempt_without_resend",
+    "expired_run_stops_before_provider_admission",
+    "retries_consume_separate_reservations_and_stop_after_two_retries",
+    "daily_cap_rejects_network_dispatch",
+    "overlarge_tool_batch_rejects_every_effect",
+]
+HOST_TESTS = [
+    "agent_minecraft_receipts_and_repeat_request_reuse_real_operations",
+    "agent_forged_scope_and_approval_prose_cannot_create_effects",
+    "agent_host_rejects_reference_copied_from_another_run",
+    "agent_permission_expansion_waits_for_exact_authenticated_approval",
+    "agent_receipt_gate_detects_drift_after_completed_operation",
+]
+LOGGING_TESTS = [
+    "agent_logging_moderate_verifies_native_configuration_delivery_and_current_health",
+    "agent_logging_public_destination_is_denied_without_configuration_or_delivery",
+    "agent_logging_missing_inactive_and_unloaded_catalogs_never_authorize_stale_apply",
+]
 
 
 def isolated_environment(source):
@@ -49,7 +75,7 @@ class Qualification(stage3.Qualification):
 
     def test(self, name, package, test, extra=None, integration=None, ignored=False):
         argv = ["cargo", "test", "--locked", "-p", package]
-        argv += ["--test", integration] if integration else ["--lib"]
+        argv += ["--test", integration] if integration else (["--bin", "oracle"] if package == "oracle" else ["--lib"])
         argv += [test, "--", "--exact", "--nocapture", "--test-threads=1"]
         if ignored:
             argv += ["--ignored"]
@@ -88,12 +114,19 @@ def main():
     try:
         q.command("rust-version", ["rustc", "--version"])
         q.command("prepare-serenity", [sys.executable, ROOT / "scripts/prepare-serenity.py"])
+        fixtures = {"ORACLE_ACTIVITY_LOG": q.fixture("activity-log", "oracle-example-activity-log", "", "ORACLE_ACTIVITY_LOG")}
         q.command("architecture", [sys.executable, ROOT / "scripts/check-architecture.py"])
         q.command("gate-tests", [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests"])
         q.command("workspace-tests", ["cargo", "test", "--locked", "--workspace"], minimum=1)
         q.command("provider-and-agent-contracts", ["cargo", "test", "--locked", "-p", "oracle-ai", "--lib"], minimum=1)
         q.test("sqlite-agent-durability", "oracle-ai", "sqlite_durable_admission_scope_and_recovery", integration="durable_contract")
         q.test("sqlite-migration-restore", "oracle-storage", "tests::sqlite_contract")
+        for test in COORDINATOR_TESTS:
+            q.test("sqlite-" + test, "oracle-ai", "coordinator::tests::" + test)
+        for test in HOST_TESTS:
+            q.test("sqlite-" + test, "oracle", "ai::tests::" + test)
+        for test in LOGGING_TESTS:
+            q.test("sqlite-" + test, "oracle", "ai::logging_tests::" + test, fixtures, ignored=True)
         if pg:
             for name in ["initdb", "pg_ctl", "postgres", "createdb", "pg_dump", "pg_restore"]:
                 if not (pg / name).is_file():
@@ -121,6 +154,16 @@ def main():
                 "ORACLE_TEST_POSTGRES_RESTORE_URL": urls["restore"],
                 "ORACLE_TEST_PG_BIN": str(pg),
             })
+            # Every durable case gets a fresh database. Never run tests concurrently
+            # against the same guild fixture or silently substitute SQLite.
+            cases = [("oracle-ai", "coordinator::tests::" + test, False) for test in COORDINATOR_TESTS]
+            cases += [("oracle", "ai::tests::" + test, False) for test in HOST_TESTS]
+            cases += [("oracle", "ai::logging_tests::" + test, True) for test in LOGGING_TESTS]
+            for index, (package, test, ignored) in enumerate(cases):
+                database = f"scenario_{index}"
+                q.command("create-" + database, [pg / "createdb", "-h", socket, "-p", "55444", database], timeout=60)
+                extra = {**fixtures, "ORACLE_TEST_AI_POSTGRES_URL": f"postgresql://{user}@localhost/{database}?host={socket}&port=55444"}
+                q.test("postgres-" + test.split("::")[-1], package, test, extra, ignored=ignored)
         q.command("rust-1.95", ["cargo", "+1.95.0", "check", "--locked", "--workspace", "--all-targets", "--all-features"])
         q.command("clippy", ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"])
         q.command("format", ["cargo", "fmt", "--all", "--", "--check"])
