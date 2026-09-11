@@ -6,3 +6,5 @@ pub mod gemini;
 pub mod provider;
 pub mod spend;
 pub mod state;
+
+pub mod coordinator;

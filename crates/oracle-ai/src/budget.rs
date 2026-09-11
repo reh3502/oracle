@@ -169,7 +169,12 @@ impl Budget {
         }
         let reported = usage.and_then(|usage| {
             usage.total_tokens.filter(|total| {
-                usage.input_tokens.is_none_or(|input| input <= *total)
+                (match (usage.input_tokens, usage.output_tokens) {
+                    (Some(input), Some(output)) => {
+                        input.checked_add(output).is_some_and(|sum| sum <= *total)
+                    }
+                    _ => true,
+                }) && usage.input_tokens.is_none_or(|input| input <= *total)
                     && usage.output_tokens.is_none_or(|output| output <= *total)
                     && usage
                         .reasoning_tokens
@@ -340,6 +345,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(budget.check(&limits(), 2), Err(BudgetError::Exhausted));
+    }
+    #[test]
+    fn contradictory_component_usage_retains_full_reservation() {
+        let mut budget = Budget::default();
+        let reservation = budget
+            .reserve(&limits(), &prices(), &turn(200, 100), 1, false)
+            .unwrap();
+        budget
+            .settle(
+                &reservation,
+                Some(&Usage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(100),
+                    total_tokens: Some(100),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(budget.charged_tokens, 300);
+        assert_eq!(budget.unknown_attempts, 1);
     }
     #[test]
     fn tool_batch_and_no_progress_limits_are_host_owned() {

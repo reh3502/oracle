@@ -42,6 +42,9 @@ pub struct Run {
     pub limits: Limits,
     pub prices: PriceTable,
     pub budget: Budget,
+    /// Durable daily reservation intent, recorded before daily admission or network I/O.
+    #[serde(default)]
+    pub pending_spend: Option<crate::spend::DailyReservation>,
     pub status: RunStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -368,6 +371,7 @@ impl Run {
             limits,
             prices,
             budget: Budget::default(),
+            pending_spend: None,
             status: RunStatus::Inspecting,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
