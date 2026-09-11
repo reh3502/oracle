@@ -55,7 +55,15 @@ impl StructureBackend for World {
             if let Some(before) = &mutation.before {
                 snapshot.channels.retain(|c| c.id != before.id);
             } else {
-                channel.id = (200 + snapshot.channels.len()).to_string();
+                let mut id = 200 + snapshot.channels.len();
+                while snapshot
+                    .channels
+                    .iter()
+                    .any(|existing| existing.id == id.to_string())
+                {
+                    id += 1;
+                }
+                channel.id = id.to_string();
             }
             snapshot.channels.push(channel.clone());
             self.writes.fetch_add(1, Ordering::SeqCst);
@@ -634,5 +642,42 @@ async fn agent_conflicting_parallel_applies_serialize_and_preserve_receipts() {
             .any(|c| c.call.name == "core_discord_apply_v1" && c.call.is_error)
     );
     assert_ne!(saved.run.status, RunStatus::Succeeded);
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_creation_preserves_large_inventory_without_reusing_ids() {
+    let (_root, host, world) = fixture().await;
+    let initial: Vec<_> = (300..400)
+        .map(|id| Channel {
+            id: id.to_string(),
+            guild: GuildId::new("100").unwrap(),
+            name: format!("other-game-{id}"),
+            kind: ChannelKind::Text,
+            parent: None,
+            overwrites: vec![],
+        })
+        .collect();
+    world.snapshot.lock().unwrap().channels = initial.clone();
+    let saved = coordinator(&host, None)
+        .ask(
+            &PolicyContext::LocalOperator,
+            GuildId::new("100").unwrap(),
+            "Set up Minecraft while preserving all other channels".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.run.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        saved.run.problem
+    );
+    let channels = world.snapshot.lock().unwrap().channels.clone();
+    assert_eq!(channels.len(), 104);
+    assert_eq!(world.writes.load(Ordering::SeqCst), 4);
+    assert!(initial.iter().all(|old| channels.contains(old)));
+    let ids: std::collections::BTreeSet<_> = channels.iter().map(|channel| &channel.id).collect();
+    assert_eq!(ids.len(), channels.len());
     host.close().await.unwrap();
 }

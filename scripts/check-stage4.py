@@ -44,6 +44,7 @@ HOST_TESTS = [
     "agent_receipt_gate_detects_drift_after_completed_operation",
     "agent_permission_revoked_after_first_write_preserves_only_completed_effect",
     "agent_conflicting_parallel_applies_serialize_and_preserve_receipts",
+    "agent_creation_preserves_large_inventory_without_reusing_ids",
 ]
 RECOVERY_TESTS = [
     "host_startup_pauses_interrupted_discord_runs_and_settles_cancelled_spend_without_ai",
