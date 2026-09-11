@@ -384,6 +384,41 @@ async fn agent_logging_moderate_verifies_native_configuration_delivery_and_curre
             .any(|reference| reference.starts_with("verify:"))
     );
 
+    // Repeating the same setup must verify the existing effective configuration,
+    // preserving its revision and reusing the original synthetic delivery receipt.
+    let repeated = coordinator(&host, "456")
+        .ask(
+            &PolicyContext::LocalOperator,
+            guild.clone(),
+            "Configure activity logging with the documented moderate preset in staff channel 456 and verify a synthetic delivery".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.run.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        repeated.run.problem
+    );
+    let repeated_config = host
+        .modules
+        .configuration_inspect(&PolicyContext::LocalOperator, &guild, &module)
+        .await
+        .unwrap();
+    assert_eq!(repeated_config.stored_revision, config.stored_revision);
+    assert_eq!(repeated_config.values, config.values);
+    assert_eq!(transport.messages.lock().unwrap().len(), 1);
+    let tools = HostTools {
+        host: Arc::downgrade(&host),
+    };
+    assert!(
+        tools
+            .reconcile(&PolicyContext::LocalOperator, &repeated.run, &[])
+            .await
+            .unwrap()
+            .complete
+    );
+
     // B08: a successful synthetic delivery does not override current subscription failure.
     policy.deny_subscriptions.store(true, Ordering::SeqCst);
     let status = host
@@ -402,7 +437,7 @@ async fn agent_logging_moderate_verifies_native_configuration_delivery_and_curre
         host: Arc::downgrade(&host),
     };
     let current = tools
-        .reconcile(&PolicyContext::LocalOperator, &run.run, &[])
+        .reconcile(&PolicyContext::LocalOperator, &repeated.run, &[])
         .await;
     assert!(
         !current.is_ok_and(|receipt| receipt.complete),
