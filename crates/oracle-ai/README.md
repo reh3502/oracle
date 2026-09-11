@@ -1,6 +1,6 @@
-# Oracle agent foundations
+# Oracle agent
 
-Stage 4 is in progress. This crate provides the Gemini boundary, bounded tool discovery, admission accounting, and durable semantic run/call records. The coordinator and host CLI/Discord agent controls are not yet integrated.
+This crate provides the Gemini boundary, bounded coordinator, tool discovery, admission accounting, and durable semantic run/call records. The host composes these with shared structure/configuration services and authenticated CLI/Discord controls.
 
 ## Provider boundary
 
@@ -23,7 +23,11 @@ These choices follow the [Gemini Interactions contract](https://ai.google.dev/ge
 - `SpendStore` uses atomic scoped CAS to admit concurrent runs against one guild's UTC-day spending limit. Settlement uses the original day; unknown attempts cannot refund the reservation. A bounded daily record currently admits at most 128 distinct runs per guild/day.
 - `RunStore` binds goals to authenticated principals and guilds. Separate call records keep summaries small. Only a newly inserted call admission may dispatch; reused IDs return their original outcome. Interrupted admissions become unknown recovery work.
 
-Native reasoning is not persisted in run records. Restarted runs must reconcile semantic records and outstanding reservations before beginning a new provider session. The coordinator must enforce this ordering and recheck authority, cancellation and deadlines at dispatch; these primitives alone do not execute a goal.
+Native reasoning is not persisted in run records. Restarted runs must reconcile semantic records and outstanding reservations before beginning a new provider session. The coordinator enforces this ordering and rechecks authority, cancellation and deadlines before dispatch. Only host-verified receipts and fresh state can close a run successfully; model text is labelled unverified when retained as a question.
+
+`ToolHost` supplies an authorized immutable catalog, shared operation execution, and fresh reconciliation. Search updates the active shortlist. Completed tool rounds can compact to a fresh provider session rebuilt from host receipts. At most two retries are allowed for transient/rate-limited provider failures, with each attempt durably charged. Host tool calls are serialized and have one recorded outcome each. Pending or unknown external effects are never blindly replayed.
+
+The host exposes module configuration independently of slash commands. Native module tools require explicit reviewed `ai` metadata; inspection cannot claim notification capabilities, and verification requires a host effect receipt. This remains under the trusted-native-module model. Models cannot install packages, grant capabilities, approve plans or obtain general SQL/HTTP tools.
 
 ## Verification
 
@@ -34,3 +38,15 @@ cargo +1.95.0 check --locked -p oracle-ai --all-targets
 ```
 
 Tests cover native replay, dynamic shortlists, unknown usage, bounded HTTP, redacted failures, cancellation, scope isolation, stale writers, restart accounting, call deduplication and concurrent spending admission. Provider tests use synthetic fixtures and local TCP servers. Storage's contract suite additionally exercises migration 0004 and agent records on SQLite and PostgreSQL. No ordinary test makes paid Gemini calls.
+
+## Module tool projections
+
+Operations are hidden from the model unless their installed manifest explicitly opts in:
+
+```json
+"ai": { "kind": "inspection", "success_pointer": null }
+```
+
+`verification` also requires `discord.notify` and a JSON pointer to a boolean result postcondition. Inspection cannot declare `discord.notify`; neither projection can declare `contracts.invoke` or `host.echo`. The host still checks current capability grants, actor/guild scope, session, generation, activation epoch and canonical schemas. These descriptors describe reviewed native code; they do not sandbox module code or grant new authority.
+
+A verification result must include `receipt.host_effect_id` from the host notification API. The host checks the real effect state, purpose, destination and delivery receipt, then refreshes configuration, subscriptions and destination policy. A module's boolean alone cannot prove delivery. The logging example declares separate inspection and verification projections; it remains an optional installed artifact.

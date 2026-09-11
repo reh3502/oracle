@@ -1,6 +1,6 @@
 # Oracle
 
-Oracle is a Rust Discord bot framework under development. It provides scoped human controls, a durable operation/effect ledger, SQLite or PostgreSQL storage, and runtime loading of separately installed native modules. It ships **zero feature modules** and requires no Gemini key. The bootstrap and dynamic module runtime are implemented. AI management remains a later roadmap stage.
+Oracle is a Rust Discord bot framework under development. It provides scoped human controls, a durable operation/effect ledger, SQLite or PostgreSQL storage, and runtime loading of separately installed native modules. It ships **zero feature modules** and requires no Gemini key. The host also provides an opt-in Gemini agent over the same scoped operation services. AI is disabled unless configured; live-model qualification remains separate from deterministic host tests.
 
 ## Build and initialize
 
@@ -39,7 +39,7 @@ Edit the initialized config to add the guilds and specific users permitted to pa
 }
 ```
 
-Set the referenced bot token in the host environment. Oracle does not automatically source `.env` or a text document. Configure `discord: null` for an entirely offline host. Provider credentials are not read by the host, and no secrets are stored in the database or sent to a module.
+Set the referenced bot token in the host environment. Oracle does not automatically source `.env` or a text document. Configure `discord: null` for an entirely offline host. With AI disabled, provider credentials are not read. With AI enabled, the host reads the configured environment variable; credentials are never stored in the database or sent to a module.
 
 ```sh
 ./target/debug/oracle --config deployment/oracle.json serve
@@ -70,6 +70,37 @@ Review the returned plan and its permission changes. Use `structure --guild GUIL
 Discord exposes the same executor through `/oracle structure` and `/oracle module-config`. Large results arrive as ephemeral JSON attachments. Module configuration uses `inspect`, `plan`, `apply`, and `recover`; stored settings are verified against the running module's effective revision.
 
 Modules explicitly declare their slash routes. Activation publishes only routes whose capabilities were granted. Deactivation and reload revoke the old runtime identity immediately, even while Discord still displays an old command. `status` reports command publication and event delivery state. See the separately installed [activity logging example](examples/modules/activity-log/README.md) for configuration and delivery checks.
+
+## Optional Gemini agent
+
+Add an `ai` object to the host config and restart to enable the agent. Omit it or use `null` to keep AI disabled. Set `key_env` to a host environment variable containing the Gemini key. Configure these required fields:
+
+| Field | Meaning |
+| --- | --- |
+| `key_env` | Name of the secret environment variable, such as `GEMINI_API_KEY` |
+| `profile` | Object with `id`, `model`, `api_version`, `max_context_tokens`, `max_output_tokens` |
+| `prices` | Object with your price-table `revision` and conservative `micros_per_million_tokens` |
+| `max_tokens` | Per-run token admission limit, at least 8,192 |
+| `max_cost_micros` | Per-run spending admission limit in millionths of the pricing currency |
+| `daily_limit_micros` | Shared per-guild UTC-day limit, at least the per-run limit |
+
+Supported explicit profile pairs are `v1beta` with `gemini-3.8-flash`, and `v1` with `gemini-3.7-flash`. There is no automatic fallback. Set model limits and prices from the profile you have qualified. Prices are operator-supplied estimates covering input, output and reasoning; unknown usage retains its reservation. These admission limits are not a provider invoice guarantee.
+
+```sh
+./target/debug/oracle --config deployment/oracle.json agent --guild GUILD ask 'Set up Minecraft channels'
+./target/debug/oracle --config deployment/oracle.json agent --guild GUILD inspect RUN_ID
+./target/debug/oracle --config deployment/oracle.json agent --guild GUILD cancel RUN_ID
+./target/debug/oracle --config deployment/oracle.json agent --guild GUILD resume RUN_ID --clarification 'Use the existing public category'
+./target/debug/oracle --config deployment/oracle.json agent --guild GUILD approve RUN_ID PLAN_ID EXACT_HASH
+```
+
+Discord exposes `/oracle ask` and `/oracle agent` controls. Ask acknowledges a saved run ID promptly; inspect shows durable call outcomes, references and any question. Approval binds the exact run-owned plan and hash; resume continues after approval. Clarification is authenticated user data and cannot change host policy. Inspection and control are restricted to the run's original principal and guild.
+
+Runs admit at most 10 provider attempts and 30 tools within five minutes, with a 60-second turn deadline. Tool execution is serialized. Discovery keeps at most 12 schemas; module load, activation and generation changes invalidate stale tools. Requests use `store=false` and send scoped structure/configuration metadata, the goal and relevant receipts. Bulk message history and native reasoning are not persisted as run context.
+
+A successful status means the planned changes passed host receipt and fresh state checks. Inspect the receipts to confirm the intended scope. Model prose cannot assert success. Logging configuration also requires its declared delivery verification and fresh host health. Missing capabilities, ambiguous input, revoked rights, exhausted budgets and unresolved effects remain explicit incomplete states. Resume preserves original limits and first reconciles saved effects; expired runs cannot acquire a fresh budget by resuming. Cancellation prevents new admission but an already submitted effect can still settle.
+
+See [the agent crate](crates/oracle-ai/README.md) for provider and accounting details. Deterministic tests do not establish live Gemini task quality or Discord simulator parity.
 
 ## Runtime modules
 

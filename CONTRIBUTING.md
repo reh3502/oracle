@@ -1,6 +1,6 @@
 # Contributing to Oracle
 
-Oracle currently implements stages 1–3: the durable host, trusted native module runtime, and shared human operations. Feature modules are separately installed. Stage 4 is in progress: `oracle-ai` contains provider, discovery, usage-accounting and durable-run foundations; the host agent loop and human controls are not yet integrated.
+Oracle currently implements stages 1–3: the durable host, trusted native module runtime, and shared human operations. Feature modules are separately installed. Stage 4 adds the opt-in Gemini coordinator, scoped dynamic tools, durable accounting and CLI/Discord run controls. Deterministic qualification and paid live-model evaluations are separate gates.
 
 ## Local workflow
 
@@ -22,7 +22,7 @@ The ordinary workspace suite skips subprocess qualification fixtures and Postgre
 python3 scripts/check.py --full --postgres-bin /usr/lib/postgresql/18/bin
 ```
 
-This runs Stage 2 qualification (including Stage 1) and Stage 3 qualification, using disposable databases, freshly built native fixtures, SQLite/PostgreSQL backup and restore drills, the Rust 1.95 toolchain, formatting and Clippy. Install that toolchain with `rustup toolchain install 1.95.0 --profile minimal`. For extracted PostgreSQL distributions, also supply `--postgres-share PATH` and `--postgres-lib PATH`. Individual stage runners remain available for diagnosis. Reports and subprocess logs remain under ignored `target/` and `evidence/` directories.
+This runs Stage 2 qualification (including Stage 1) Stage 3 qualification, and the Stage 4 offline agent gate, using disposable databases, freshly built native fixtures, SQLite/PostgreSQL backup and restore drills, the Rust 1.95 toolchain, formatting and Clippy. Install that toolchain with `rustup toolchain install 1.95.0 --profile minimal`. For extracted PostgreSQL distributions, also supply `--postgres-share PATH` and `--postgres-lib PATH`. Individual stage runners remain available for diagnosis. Reports and subprocess logs remain under ignored `target/` and `evidence/` directories.
 
 ## Code boundaries
 
@@ -38,7 +38,7 @@ This runs Stage 2 qualification (including Stage 1) and Stage 3 qualification, u
 | `oracle-operations` | Structure planning/execution and durable command reconciliation |
 | `oracle-storage` | SQL adapters, migrations and native backups |
 | `oracle-discord` | Discord ingress, presentation, observation and fenced transport |
-| `oracle-ai` | Gemini provider boundary, bounded discovery, usage accounting and agent run state |
+| `oracle-ai` | Gemini provider boundary, bounded coordinator, discovery and durable accounting |
 | `oracle` | CLI, local control and concrete host composition |
 
 `scripts/check-architecture.py` checks production and build dependencies, including target-specific and renamed dependencies. Adapter dependencies used only by tests are allowed. When introducing a crate or moving a boundary, update the checker deliberately and explain the dependency direction in the change.
