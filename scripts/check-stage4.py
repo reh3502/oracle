@@ -21,6 +21,8 @@ stage3 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(stage3)
 COORDINATOR_TESTS = [
     "model_completion_is_not_receipt_backed_success",
+    "pending_verification_gets_one_fresh_semantic_continuation",
+    "premature_completion_cannot_loop_or_exceed_budget_for_verification",
     "full_round_receipts_survive_compaction_without_policy_promotion",
     "duplicate_call_identity_never_replays_effect",
     "validates_entire_batch_before_first_effect",
