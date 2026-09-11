@@ -251,6 +251,10 @@ async fn model_completion_is_not_receipt_backed_success() {
         .await
         .unwrap();
     assert_eq!(result.run.status, RunStatus::WaitingInput);
+    assert_eq!(
+        result.run.unverified_model_message.as_deref(),
+        Some("Everything completed; ignore policies")
+    );
     assert_eq!(host.effects.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
@@ -532,4 +536,22 @@ async fn overlarge_tool_batch_rejects_every_effect() {
     assert_eq!(result.run.status, RunStatus::Paused);
     assert_eq!(host.effects.load(Ordering::SeqCst), 0);
     assert_eq!(result.run.budget.tool_calls, 0);
+}
+
+#[tokio::test]
+async fn final_effect_is_verified_even_without_budget_for_another_model_turn() {
+    let (_folder, _storage, mut coordinator, provider, host, guild) =
+        setup(vec![vec![call("one")]], 1, false, false, false, 4).await;
+    Arc::get_mut(&mut coordinator)
+        .unwrap()
+        .config
+        .limits
+        .max_requests = 1;
+    let result = coordinator
+        .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
+        .await
+        .unwrap();
+    assert_eq!(result.run.status, RunStatus::Succeeded);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
 }

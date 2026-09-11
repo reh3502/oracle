@@ -204,6 +204,7 @@ impl Coordinator {
         }
         saved.run.goal.push_str("\nAuthenticated clarification: ");
         saved.run.goal.push_str(&text);
+        saved.run.unverified_model_message = None;
         self.runs.save(&mut saved, now()).await?;
         Ok(saved)
     }
@@ -367,8 +368,26 @@ impl Coordinator {
         }
         Ok(evidence)
     }
+    async fn stop_budget(
+        &self,
+        context: &PolicyContext,
+        mut saved: SavedRun,
+        reason: &str,
+    ) -> Result<SavedRun> {
+        // Receipt verification is deterministic and requires no additional model request.
+        let evidence = self.reconcile(context, &mut saved).await?;
+        if evidence.complete && !evidence.unresolved {
+            self.stop(saved, RunStatus::Succeeded, "receipt_verified")
+                .await
+        } else {
+            self.stop(saved, RunStatus::Paused, reason).await
+        }
+    }
     async fn stop(&self, mut saved: SavedRun, status: RunStatus, reason: &str) -> Result<SavedRun> {
         saved.run.status = status;
+        if status != RunStatus::WaitingInput {
+            saved.run.unverified_model_message = None;
+        }
         saved.run.problem = Some(reason.into());
         match self.runs.save(&mut saved, now()).await {
             Ok(()) => Ok(saved),
@@ -424,9 +443,7 @@ impl Coordinator {
         loop {
             self.checkpoint(context, &saved, &cancel).await?;
             if let Err(error) = saved.run.budget.check(&saved.run.limits, now()) {
-                return self
-                    .stop(saved, RunStatus::Paused, &error.to_string())
-                    .await;
+                return self.stop_budget(context, saved, &error.to_string()).await;
             }
             // Rebuild from trusted receipts at a completed round boundary. Raw native
             // reasoning is discarded, never translated into a trusted instruction.
@@ -483,9 +500,7 @@ impl Coordinator {
             ) {
                 Ok(reservation) => reservation,
                 Err(error) => {
-                    return self
-                        .stop(saved, RunStatus::Paused, &error.to_string())
-                        .await;
+                    return self.stop_budget(context, saved, &error.to_string()).await;
                 }
             };
             let admitted_at = now();
@@ -593,6 +608,14 @@ impl Coordinator {
                     self.stop(saved, RunStatus::Succeeded, "receipt_verified")
                         .await
                 } else {
+                    saved.run.unverified_model_message = turn.visible_text.map(|mut text| {
+                        let mut end = text.len().min(4096);
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        text.truncate(end);
+                        text
+                    });
                     self.stop(
                         saved,
                         RunStatus::WaitingInput,
@@ -622,9 +645,7 @@ impl Coordinator {
                 turn.calls.len().try_into().map_err(|_| integrity())?,
                 now(),
             ) {
-                return self
-                    .stop(saved, RunStatus::Paused, &error.to_string())
-                    .await;
+                return self.stop_budget(context, saved, &error.to_string()).await;
             }
             saved.run.status = RunStatus::Executing;
             self.runs.save(&mut saved, now()).await?;
@@ -673,7 +694,9 @@ impl Coordinator {
                         )
                         .await;
                 }
-                let outcome = if wait.is_some() || now() >= saved.run.limits.deadline_ms {
+                let outcome = if wait.is_some()
+                    || now() >= turn_deadline.min(saved.run.limits.deadline_ms)
+                {
                     HostOutcome {
                         search_query: None,
                         value: json!({"error":"batch_stopped"}),

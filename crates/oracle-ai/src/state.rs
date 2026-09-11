@@ -50,6 +50,9 @@ pub struct Run {
     pub updated_at_ms: u64,
     pub catalog_revision: Option<u64>,
     pub problem: Option<String>,
+    /// Bounded visible model question/proposal; never completion or authority evidence.
+    #[serde(default)]
+    pub unverified_model_message: Option<String>,
     /// Host-issued references created by this run; never populated from model claims.
     pub references: Vec<String>,
 }
@@ -91,6 +94,8 @@ impl RunStore {
             || run.updated_at_ms != run.created_at_ms
             || run.budget.requests != 0
             || run.budget.pending.is_some()
+            || run.pending_spend.is_some()
+            || run.unverified_model_message.is_some()
             || run.prices.revision.is_empty()
             || run.prices.micros_per_million_tokens == 0
         {
@@ -377,6 +382,7 @@ impl Run {
             updated_at_ms: now_ms,
             catalog_revision: None,
             problem: None,
+            unverified_model_message: None,
             references: Vec::new(),
         }
     }
