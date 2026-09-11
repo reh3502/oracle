@@ -63,6 +63,8 @@ pub struct Reconciliation {
     pub value: Value,
     pub complete: bool,
     pub unresolved: bool,
+    /// Host-selected verification tool query; never a model or module instruction.
+    pub verification_query: Option<String>,
 }
 
 #[derive(Clone)]
@@ -508,6 +510,7 @@ impl Coordinator {
         let mut session_turns = 0_u32;
         let mut retries = 0_u32;
         let mut query = saved.run.goal.clone();
+        let mut verification_continued = false;
         loop {
             self.checkpoint(context, &saved, &cancel).await?;
             if let Err(error) = saved.run.budget.check(&saved.run.limits, now()) {
@@ -672,6 +675,23 @@ impl Coordinator {
                 saved.run.status = RunStatus::Verifying;
                 self.runs.save(&mut saved, now()).await?;
                 let evidence = self.reconcile(context, &mut saved).await?;
+                if !evidence.complete
+                    && !evidence.unresolved
+                    && !verification_continued
+                    && let Some(hint) = evidence.verification_query.as_deref()
+                    && !hint.trim().is_empty()
+                    && hint.len() <= 4096
+                {
+                    // One fresh semantic session may finish a host-known verification
+                    // step. All ordinary admission, catalog, and authority checks remain.
+                    verification_continued = true;
+                    query = hint.to_owned();
+                    semantic = evidence.value;
+                    continuation = None;
+                    results.clear();
+                    session_turns = 0;
+                    continue;
+                }
                 return if evidence.complete && !evidence.unresolved {
                     self.stop(saved, RunStatus::Succeeded, "receipt_verified")
                         .await
