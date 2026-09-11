@@ -488,7 +488,21 @@ async fn http_errors_are_typed_redacted_and_never_retried() {
                 retry_after_ms: Some(2000),
             },
         ),
-        ("503 Unavailable", "", ProviderError::Transient),
+        (
+            "503 Unavailable",
+            "",
+            ProviderError::HttpTransient { status: 503 },
+        ),
+        (
+            "408 Request Timeout",
+            "",
+            ProviderError::HttpTransient { status: 408 },
+        ),
+        (
+            "500 Internal Server Error",
+            "",
+            ProviderError::HttpTransient { status: 500 },
+        ),
         ("400 Bad Request", "", ProviderError::InvalidRequest),
         (
             "307 Temporary Redirect",
@@ -504,9 +518,29 @@ async fn http_errors_are_typed_redacted_and_never_retried() {
             .err()
             .unwrap();
         assert_eq!(error, expected);
-        assert!(!format!("{error:?} {error}").contains("SECRET"));
+        assert!(
+            !format!(
+                "{error:?} {error} {}",
+                serde_json::to_string(&error).unwrap()
+            )
+            .contains("SECRET")
+        );
         task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn disconnected_transport_is_redacted_and_never_retried() {
+    let (p, task) = loopback(String::new(), Duration::ZERO).await;
+    let error = p
+        .send(p.prepare(request()).unwrap(), &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error, ProviderError::Transport);
+    assert_eq!(error.to_string(), "provider transport failed");
+    assert_eq!(serde_json::to_string(&error).unwrap(), "\"transport\"");
+    task.await.unwrap();
 }
 
 #[tokio::test]
@@ -567,7 +601,7 @@ async fn cancellation_timeout_and_forged_preparation_are_fail_closed() {
             if cancel {
                 ProviderError::Cancelled
             } else {
-                ProviderError::Transient
+                ProviderError::Timeout
             }
         );
         signal.await.unwrap();
@@ -615,7 +649,7 @@ async fn stalled_body_reads_obey_cancellation_and_total_deadline() {
             if cancelled {
                 ProviderError::Cancelled
             } else {
-                ProviderError::Transient
+                ProviderError::Timeout
             }
         );
         signal.await.unwrap();

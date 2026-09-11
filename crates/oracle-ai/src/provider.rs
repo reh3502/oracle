@@ -108,6 +108,12 @@ pub enum ProviderError {
     RateLimited { retry_after_ms: Option<u64> },
     #[error("transient provider failure")]
     Transient,
+    #[error("provider HTTP failure ({status})")]
+    HttpTransient { status: u16 },
+    #[error("provider transport failed")]
+    Transport,
+    #[error("provider deadline exceeded")]
+    Timeout,
     #[error("invalid provider request")]
     InvalidRequest,
     #[error("provider context limit exceeded")]

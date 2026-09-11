@@ -739,8 +739,22 @@ async fn operational_failure_is_a_durable_paused_diagnostic() {
 }
 
 #[tokio::test]
-async fn rejected_model_calls_retry_without_dispatching_and_protocol_errors_stop() {
+async fn retryable_provider_failures_obey_attempt_and_spend_limits() {
     for (failure, count, expected_sends, succeeded, max_requests) in [
+        (ProviderError::Transient, 1, 3, true, 10),
+        (ProviderError::HttpTransient { status: 503 }, 1, 3, true, 10),
+        (
+            ProviderError::HttpTransient { status: 503 },
+            4,
+            3,
+            false,
+            10,
+        ),
+        (ProviderError::Transport, 1, 3, true, 10),
+        (ProviderError::Transport, 4, 3, false, 10),
+        (ProviderError::Timeout, 1, 3, true, 10),
+        (ProviderError::Timeout, 4, 3, false, 10),
+        (ProviderError::Timeout, 4, 1, false, 1),
         (ProviderError::InvalidToolCall, 1, 3, true, 10),
         (ProviderError::InvalidToolCall, 4, 3, false, 10),
         (ProviderError::ProtocolMismatch, 4, 1, false, 10),

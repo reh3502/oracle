@@ -407,7 +407,7 @@ impl ModelProvider for GeminiProvider {
         }
         let deadline = started + Duration::from_millis(request.timeout_ms);
         if tokio::time::Instant::now() >= deadline {
-            return Err(ProviderError::Transient);
+            return Err(ProviderError::Timeout);
         }
         let operation = async {
             let mut response = self
@@ -418,7 +418,13 @@ impl ModelProvider for GeminiProvider {
                 .body(request.body)
                 .send()
                 .await
-                .map_err(|_| ProviderError::Transient)?;
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        ProviderError::Timeout
+                    } else {
+                        ProviderError::Transport
+                    }
+                })?;
             let status = response.status();
             if !status.is_success() {
                 return Err(match status.as_u16() {
@@ -431,7 +437,9 @@ impl ModelProvider for GeminiProvider {
                             .and_then(|s| s.parse::<u64>().ok())
                             .and_then(|s| s.checked_mul(1000)),
                     },
-                    408 | 500..=599 => ProviderError::Transient,
+                    408 | 500..=599 => ProviderError::HttpTransient {
+                        status: status.as_u16(),
+                    },
                     300..=399 => ProviderError::ProtocolMismatch,
                     _ => ProviderError::InvalidRequest,
                 });
@@ -458,14 +466,14 @@ impl ModelProvider for GeminiProvider {
                 return Err(ProviderError::Cancelled);
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ProviderError::Transient);
+                return Err(ProviderError::Timeout);
             }
             Ok(turn)
         };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
-            result = tokio::time::timeout_at(deadline, operation) => result.map_err(|_| ProviderError::Transient)?,
+            result = tokio::time::timeout_at(deadline, operation) => result.map_err(|_| ProviderError::Timeout)?,
         }
     }
 }

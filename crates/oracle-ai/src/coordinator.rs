@@ -611,7 +611,7 @@ impl Coordinator {
             let attempt_cancel = cancel.child_token();
             let response = tokio::select! {
                 _ = cancel.cancelled() => Err(ProviderError::Cancelled),
-                response = tokio::time::timeout(Duration::from_millis(timeout_ms), self.provider.send(prepared, &attempt_cancel)) => response.unwrap_or(Err(ProviderError::Transient)),
+                response = tokio::time::timeout(Duration::from_millis(timeout_ms), self.provider.send(prepared, &attempt_cancel)) => response.unwrap_or(Err(ProviderError::Timeout)),
             };
             attempt_cancel.cancel();
             let old_cost = saved
@@ -646,6 +646,9 @@ impl Coordinator {
                 }
                 Err(
                     error @ (ProviderError::Transient
+                    | ProviderError::HttpTransient { .. }
+                    | ProviderError::Transport
+                    | ProviderError::Timeout
                     | ProviderError::RateLimited { .. }
                     | ProviderError::InvalidToolCall),
                 ) if retries < 2 => {
