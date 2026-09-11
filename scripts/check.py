@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local developer gate; --full also qualifies stages 1–3 on disposable PostgreSQL."""
+"""Run the local developer gate; --full also qualifies stages 1–4 on disposable PostgreSQL."""
 import argparse
 import os
 import pathlib
@@ -45,6 +45,7 @@ def main():
         commands += [
             [sys.executable, "scripts/check-stage2.py", *postgres],
             [sys.executable, "scripts/check-stage3.py", "--require-postgres", *postgres],
+            [sys.executable, "scripts/check-stage4.py", "--require-postgres", *postgres],
         ]
     else:
         commands += [
@@ -57,7 +58,7 @@ def main():
         result = subprocess.run(command, cwd=ROOT, env=env)
         if result.returncode:
             return result.returncode if result.returncode > 0 else 1
-    print("Developer checks passed" + (" (stages 1–3, SQLite and PostgreSQL)" if args.full else " (local gate; run --full for subprocess and PostgreSQL qualification)"))
+    print("Developer checks passed" + (" (stages 1–4 offline contracts, SQLite and PostgreSQL)" if args.full else " (local gate; run --full for subprocess and PostgreSQL qualification)"))
     return 0
 
 
