@@ -234,14 +234,14 @@ fn core_entries() -> Vec<Entry> {
         ),
         entry(
             "core_guild_inspect_v1",
-            "Inspect visible guild channels roles and permissions before planning server structure.",
+            "Inspect visible guild channels roles and permissions before planning server structure. This observation alone cannot complete a setup request; plan and apply the desired state even if it already exists.",
             object(json!({}), &[]),
             "core:inspect:1".into(),
             false,
         ),
         entry(
             "core_discord_plan_v1",
-            "Plan exact server channel/category structure and permissions. Permission expansion requires human approval.",
+            "Plan exact server channel/category structure and permissions, including a no-change plan for already satisfied or repeated requests. Apply the returned plan to obtain a verifiable receipt. Permission expansion requires human approval.",
             object(
                 json!({"channels":{"type":"array","items":channel}}),
                 &["channels"],
