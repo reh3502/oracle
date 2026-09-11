@@ -191,6 +191,7 @@ struct Campaign {
     limits: (u64, u64, u64),
     metrics: Mutex<Metrics>,
     ledger: Mutex<std::fs::File>,
+    ledger_failed: AtomicBool,
 }
 struct Admission {
     id: u64,
@@ -198,11 +199,17 @@ struct Admission {
 }
 impl Campaign {
     fn record(&self, value: Value) -> std::result::Result<(), ProviderError> {
+        if self.ledger_failed.load(Ordering::SeqCst) {
+            return Err(ProviderError::Cancelled);
+        }
         let mut ledger = self.ledger.lock().unwrap();
         writeln!(ledger, "{value}")
             .and_then(|()| ledger.flush())
             .and_then(|()| ledger.sync_all())
-            .map_err(|_| ProviderError::Cancelled)
+            .map_err(|_| {
+                self.ledger_failed.store(true, Ordering::SeqCst);
+                ProviderError::Cancelled
+            })
     }
     fn admit(
         &self,
@@ -235,8 +242,24 @@ impl Campaign {
     fn settle(
         &self,
         admission: Admission,
-        total_tokens: Option<u64>,
+        usage: Option<&Usage>,
     ) -> std::result::Result<(), ProviderError> {
+        // Match Budget::settle: malformed component totals are unknown billing.
+        let total_tokens = usage.and_then(|usage| {
+            usage.total_tokens.filter(|total| {
+                (match (usage.input_tokens, usage.output_tokens) {
+                    (Some(input), Some(output)) => {
+                        input.checked_add(output).is_some_and(|sum| sum <= *total)
+                    }
+                    _ => true,
+                }) && usage.input_tokens.is_none_or(|input| input <= *total)
+                    && usage.output_tokens.is_none_or(|output| output <= *total)
+                    && usage
+                        .reasoning_tokens
+                        .is_none_or(|reasoning| reasoning <= *total)
+                    && usage.cached_tokens.is_none_or(|cached| cached <= *total)
+            })
+        });
         let mut metrics = self.metrics.lock().unwrap();
         let charge = total_tokens.map_or(admission.cost, |tokens| {
             u64::try_from((u128::from(tokens) * u128::from(self.limits.2)).div_ceil(1_000_000))
@@ -329,13 +352,8 @@ impl ModelProvider for Candidate {
             let mut metrics = self.campaign.metrics.lock().unwrap();
             metrics.attempts.push(json!({"fixture":self.case.id,"successful_response":response.is_ok(),"tool_result_continuation":self.continuation.load(Ordering::SeqCst),"duration_ms":started.elapsed().as_millis(),"model":response.as_ref().ok().and_then(|turn|turn.model.as_ref()),"usage":response.as_ref().ok().map(|turn|&turn.usage),"error":response.as_ref().err().map(|error|format!("{error:?}"))}));
         }
-        self.campaign.settle(
-            admission,
-            response
-                .as_ref()
-                .ok()
-                .and_then(|turn| turn.usage.total_tokens),
-        )?;
+        self.campaign
+            .settle(admission, response.as_ref().ok().map(|turn| &turn.usage))?;
         let mut turn = response?;
         {
             let mut metrics = self.campaign.metrics.lock().unwrap();
@@ -546,6 +564,7 @@ fn global_paid_cap_rejects_before_another_provider_dispatch() {
     let campaign = Campaign {
         limits: (2, 25, 1_000_000),
         metrics: Mutex::new(Metrics::default()),
+        ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(tempfile::tempfile().unwrap()),
     };
     let request = PreparedTurn {
@@ -567,6 +586,7 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
     let campaign = Campaign {
         limits: (10, 100, 4_000_000),
         metrics: Mutex::new(Metrics::default()),
+        ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(ledger.reopen().unwrap()),
     };
     let request = PreparedTurn {
@@ -584,7 +604,15 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
         "charge is durable before dispatch"
     );
     assert!(campaign.admit(&request, "A01").is_err());
-    campaign.settle(first, Some(3)).unwrap();
+    campaign
+        .settle(
+            first,
+            Some(&Usage {
+                total_tokens: Some(3),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
     assert_eq!(campaign.metrics.lock().unwrap().reserved_cost_micros, 12);
     let second = campaign.admit(&request, "A01").unwrap();
     campaign.settle(second, None).unwrap();
@@ -603,12 +631,140 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
     let overrun = Campaign {
         limits: (10, 100, 4_000_000),
         metrics: Mutex::new(Metrics::default()),
+        ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(tempfile::tempfile().unwrap()),
     };
     let admission = overrun.admit(&request, "A01").unwrap();
-    overrun.settle(admission, Some(30)).unwrap();
+    overrun
+        .settle(
+            admission,
+            Some(&Usage {
+                total_tokens: Some(30),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
     assert_eq!(overrun.metrics.lock().unwrap().reserved_cost_micros, 120);
     assert!(overrun.admit(&request, "A01").is_err());
+}
+
+#[test]
+fn campaign_malformed_usage_never_refunds_reserved_capacity() {
+    let inconsistent = [
+        Usage {
+            input_tokens: Some(9),
+            output_tokens: Some(9),
+            total_tokens: Some(10),
+            ..Default::default()
+        },
+        Usage {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(1),
+            total_tokens: Some(u64::MAX),
+            ..Default::default()
+        },
+        Usage {
+            input_tokens: Some(11),
+            total_tokens: Some(10),
+            ..Default::default()
+        },
+        Usage {
+            output_tokens: Some(11),
+            total_tokens: Some(10),
+            ..Default::default()
+        },
+        Usage {
+            cached_tokens: Some(11),
+            total_tokens: Some(10),
+            ..Default::default()
+        },
+        Usage {
+            reasoning_tokens: Some(11),
+            total_tokens: Some(10),
+            ..Default::default()
+        },
+        Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            total_tokens: None,
+            ..Default::default()
+        },
+    ];
+    for usage in inconsistent {
+        let campaign = Campaign {
+            limits: (10, 100, 4_000_000),
+            metrics: Mutex::new(Metrics::default()),
+            ledger_failed: AtomicBool::new(false),
+            ledger: Mutex::new(tempfile::tempfile().unwrap()),
+        };
+        let request = PreparedTurn {
+            provider_metadata: None,
+            body: String::new(),
+            input_token_reservation: 10,
+            output_token_reservation: 10,
+            max_response_bytes: 1000,
+            timeout_ms: 10,
+        };
+        let admission = campaign.admit(&request, "A01").unwrap();
+        campaign.settle(admission, Some(&usage)).unwrap();
+        assert_eq!(campaign.metrics.lock().unwrap().reserved_cost_micros, 80);
+        assert_eq!(campaign.metrics.lock().unwrap().unknown_usage, 1);
+        assert!(campaign.admit(&request, "A01").is_err());
+    }
+}
+
+#[test]
+fn campaign_ledger_write_failure_permanently_stops_new_dispatch() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let campaign = Campaign {
+        limits: (10, 100, 4_000_000),
+        metrics: Mutex::new(Metrics::default()),
+        ledger_failed: AtomicBool::new(false),
+        ledger: Mutex::new(std::fs::File::open(file.path()).unwrap()),
+    };
+    let request = PreparedTurn {
+        provider_metadata: None,
+        body: String::new(),
+        input_token_reservation: 10,
+        output_token_reservation: 10,
+        max_response_bytes: 1000,
+        timeout_ms: 10,
+    };
+    assert!(campaign.admit(&request, "A01").is_err());
+    assert_eq!(campaign.metrics.lock().unwrap().provider_attempts, 0);
+    *campaign.ledger.lock().unwrap() = file.reopen().unwrap();
+    assert!(
+        campaign.admit(&request, "A01").is_err(),
+        "an uncertain ledger must not be reused"
+    );
+    let settlement_failure = Campaign {
+        limits: (10, 100, 4_000_000),
+        metrics: Mutex::new(Metrics::default()),
+        ledger_failed: AtomicBool::new(false),
+        ledger: Mutex::new(tempfile::tempfile().unwrap()),
+    };
+    let admission = settlement_failure.admit(&request, "A01").unwrap();
+    *settlement_failure.ledger.lock().unwrap() = std::fs::File::open(file.path()).unwrap();
+    assert!(
+        settlement_failure
+            .settle(
+                admission,
+                Some(&Usage {
+                    total_tokens: Some(1),
+                    ..Default::default()
+                })
+            )
+            .is_err()
+    );
+    assert_eq!(
+        settlement_failure
+            .metrics
+            .lock()
+            .unwrap()
+            .reserved_cost_micros,
+        80
+    );
+    assert!(settlement_failure.admit(&request, "A01").is_err());
 }
 
 #[test]
@@ -725,6 +881,7 @@ async fn live_candidate_five_trials_and_repeat() {
             required_u64("ORACLE_AI_EVAL_RATE_MICROS_PER_MILLION"),
         ),
         metrics: Mutex::new(Metrics::default()),
+        ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(
             std::fs::OpenOptions::new()
                 .write(true)
