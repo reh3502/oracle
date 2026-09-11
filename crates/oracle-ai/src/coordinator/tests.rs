@@ -15,6 +15,7 @@ struct Provider {
     turns: Mutex<VecDeque<Vec<ToolCall>>>,
     sends: AtomicUsize,
     failures: AtomicUsize,
+    failure: Mutex<ProviderError>,
     requests: Mutex<Vec<(String, String, bool, usize)>>,
 }
 #[async_trait]
@@ -51,7 +52,7 @@ impl ModelProvider for Provider {
             })
             .is_ok()
         {
-            return Err(ProviderError::Transient);
+            return Err(self.failure.lock().unwrap().clone());
         }
         let calls = self.turns.lock().unwrap().pop_front().unwrap_or_default();
         Ok(ModelTurn {
@@ -214,6 +215,7 @@ async fn setup(
         turns: Mutex::new(turns.into()),
         sends: AtomicUsize::new(0),
         failures: AtomicUsize::new(0),
+        failure: Mutex::new(ProviderError::Transient),
         requests: Mutex::new(vec![]),
     });
     let host = Arc::new(Host {
@@ -709,4 +711,44 @@ async fn operational_failure_is_a_durable_paused_diagnostic() {
     assert_eq!(result.run.status, RunStatus::Paused);
     assert_eq!(result.run.problem.as_deref(), Some("host_error:Conflict"));
     assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rejected_model_calls_retry_without_dispatching_and_protocol_errors_stop() {
+    for (failure, count, expected_sends, succeeded, max_requests) in [
+        (ProviderError::InvalidToolCall, 1, 3, true, 10),
+        (ProviderError::InvalidToolCall, 4, 3, false, 10),
+        (ProviderError::ProtocolMismatch, 4, 1, false, 10),
+        (ProviderError::InvalidToolCall, 4, 1, false, 1),
+    ] {
+        let (_folder, _storage, mut coordinator, provider, host, guild) = setup(
+            vec![vec![call("verified")], vec![]],
+            1,
+            false,
+            false,
+            false,
+            4,
+        )
+        .await;
+        Arc::get_mut(&mut coordinator)
+            .unwrap()
+            .config
+            .limits
+            .max_requests = max_requests;
+        *provider.failure.lock().unwrap() = failure;
+        provider.failures.store(count, Ordering::SeqCst);
+        let result = coordinator
+            .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
+            .await
+            .unwrap();
+        assert_eq!(provider.sends.load(Ordering::SeqCst), expected_sends);
+        assert_eq!(result.run.budget.requests, expected_sends as u32);
+        assert_eq!(host.effects.load(Ordering::SeqCst), usize::from(succeeded));
+        assert_eq!(result.run.status == RunStatus::Succeeded, succeeded);
+        assert_eq!(
+            result.run.budget.unknown_attempts,
+            if succeeded { 1 } else { expected_sends as u32 }
+        );
+        assert!(result.run.budget.pending.is_none());
+    }
 }

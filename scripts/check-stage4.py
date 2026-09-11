@@ -32,6 +32,7 @@ COORDINATOR_TESTS = [
     "interrupted_daily_admission_settles_original_attempt_without_resend",
     "expired_run_stops_before_provider_admission",
     "retries_consume_separate_reservations_and_stop_after_two_retries",
+    "rejected_model_calls_retry_without_dispatching_and_protocol_errors_stop",
     "daily_cap_rejects_network_dispatch",
     "overlarge_tool_batch_rejects_every_effect",
     "final_effect_is_verified_even_without_budget_for_another_model_turn",

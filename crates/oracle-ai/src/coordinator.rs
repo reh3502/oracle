@@ -641,9 +641,11 @@ impl Coordinator {
                     retries = 0;
                     turn
                 }
-                Err(error @ (ProviderError::Transient | ProviderError::RateLimited { .. }))
-                    if retries < 2 =>
-                {
+                Err(
+                    error @ (ProviderError::Transient
+                    | ProviderError::RateLimited { .. }
+                    | ProviderError::InvalidToolCall),
+                ) if retries < 2 => {
                     retries += 1;
                     let delay = match error {
                         ProviderError::RateLimited { retry_after_ms } => {
