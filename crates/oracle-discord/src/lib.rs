@@ -276,7 +276,7 @@ impl DiscordBootstrap {
         }
         if interaction_ops::is_operation(interaction) {
             return self
-                .handle_operation(interaction, responder, Duration::from_secs(310))
+                .handle_operation(interaction, responder, Duration::from_secs(30))
                 .await;
         }
         let (context, guild, action) = match authenticated_request(interaction) {
