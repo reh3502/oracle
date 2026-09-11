@@ -133,6 +133,33 @@ async fn run(case: &'static str) {
         )
         .await
         .unwrap();
+    // Configuration-only artifacts must be discoverable without a slash command.
+    assert!(manager.catalog(&ACTOR, &guild).await.unwrap().is_empty());
+    let ai = manager.ai_catalog_snapshot(&ACTOR, &guild).await.unwrap();
+    assert_eq!(ai.entries.len(), 1);
+    assert_eq!(ai.entries[0].module, module);
+    assert_eq!(ai.entries[0].artifact_digest, installed.digest);
+    assert!(
+        ai.entries[0]
+            .configuration
+            .as_ref()
+            .unwrap()
+            .presets
+            .contains_key("moderate/v1")
+    );
+    let foreign = PolicyContext::Discord {
+        guild: "999".parse().unwrap(),
+        user: "42".parse().unwrap(),
+        manage_guild: true,
+    };
+    assert_eq!(
+        manager
+            .ai_catalog_snapshot(&foreign, &guild)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ForbiddenScope
+    );
     let task_manager = manager.clone();
     let task_storage = storage.clone();
     let task_scratch = scratch.clone();
@@ -329,7 +356,19 @@ async fn run(case: &'static str) {
                     .unload(&module, Duration::from_secs(1))
                     .await
                     .unwrap();
+                assert!(
+                    manager
+                        .ai_catalog_snapshot(&ACTOR, &guild)
+                        .await
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
                 manager.load(&installed.digest).await.unwrap();
+                let reloaded = manager.ai_catalog_snapshot(&ACTOR, &guild).await.unwrap();
+                assert!(reloaded.revision > ai.revision);
+                assert_eq!(reloaded.entries.len(), 1);
+                assert_ne!(reloaded.entries[0].generation, ai.entries[0].generation);
                 assert!(
                     manager
                         .configuration_apply(&ACTOR, &guild, &module, &plan.id)

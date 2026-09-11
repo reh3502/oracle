@@ -46,6 +46,24 @@ pub struct ModuleCatalogSnapshot {
     pub revision: u64,
     pub entries: Vec<ModuleCatalogEntry>,
 }
+/// Authorized AI metadata, independent of whether a module publishes human commands.
+/// Saved configuration values and credentials are never part of this snapshot.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModuleAiCatalogEntry {
+    pub module: ModuleId,
+    pub version: String,
+    pub artifact_digest: String,
+    pub session: String,
+    pub generation: u64,
+    pub epoch: u64,
+    pub operations: Vec<ModuleOperation>,
+    pub configuration: Option<ModuleConfiguration>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModuleAiCatalogSnapshot {
+    pub revision: u64,
+    pub entries: Vec<ModuleAiCatalogEntry>,
+}
 pub struct ModuleManager {
     registry_signal: Arc<crate::registry::RegistrySignal>,
     event_services: RwLock<Option<events::EventServices>>,
@@ -691,6 +709,54 @@ impl ModuleManager {
                 revision,
                 entries: self.catalog_current(guild),
             }))
+    }
+    pub async fn ai_catalog_snapshot(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+    ) -> Result<ModuleAiCatalogSnapshot> {
+        self.core.authorize_module(actor, guild).await?;
+        Ok(self.registry_signal.snapshot(|revision| {
+            let generations: Vec<_> = self.registry.read().unwrap().values().cloned().collect();
+            let mut entries = Vec::new();
+            for generation in generations {
+                if !generation.process().is_alive()
+                    || self.validate_dependencies(&generation, guild).is_err()
+                {
+                    continue;
+                }
+                let Some(active) = generation.activations.lock().unwrap().get(guild).cloned()
+                else {
+                    continue;
+                };
+                if !generation.gate.is_active(guild, active.epoch) {
+                    continue;
+                }
+                let manifest = &generation.installed.package.manifest;
+                let operations = manifest
+                    .operations
+                    .iter()
+                    .filter(|op| op.capabilities.iter().all(|c| active.grants.contains(c)))
+                    .cloned()
+                    .collect();
+                let configuration = if active.grants.contains("config.own") {
+                    manifest.configuration.clone()
+                } else {
+                    None
+                };
+                entries.push(ModuleAiCatalogEntry {
+                    module: manifest.id.clone(),
+                    version: manifest.version.clone(),
+                    artifact_digest: generation.installed.digest.clone(),
+                    session: generation.session.clone(),
+                    generation: generation.number,
+                    epoch: active.epoch,
+                    operations,
+                    configuration,
+                });
+            }
+            ModuleAiCatalogSnapshot { revision, entries }
+        }))
     }
     fn catalog_current(&self, guild: &GuildId) -> Vec<ModuleCatalogEntry> {
         let generations: Vec<_> = self.registry.read().unwrap().values().cloned().collect();
