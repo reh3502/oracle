@@ -269,6 +269,107 @@ async fn setup(
     (folder, storage, coordinator, provider, host, guild)
 }
 #[tokio::test]
+async fn authenticated_clarification_preserves_budget_and_policy_before_resume() {
+    let (_folder, _storage, coordinator, provider, host, guild) = setup(
+        vec![vec![], vec![call("after-clarification")], vec![]],
+        1,
+        false,
+        false,
+        false,
+        4,
+    )
+    .await;
+    let owner = PolicyContext::Discord {
+        guild: guild.clone(),
+        user: UserId::new("101").unwrap(),
+        manage_guild: true,
+    };
+    let waiting = coordinator
+        .ask(&owner, guild.clone(), "Set up the selected area".into())
+        .await
+        .unwrap();
+    assert_eq!(waiting.run.status, RunStatus::WaitingInput);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(waiting.run.budget.requests, 1);
+    assert!(waiting.run.unverified_model_message.is_some());
+    let budget = serde_json::to_value(&waiting.run.budget).unwrap();
+    let limits = serde_json::to_value(&waiting.run.limits).unwrap();
+    let foreign_principal = PolicyContext::Discord {
+        guild: guild.clone(),
+        user: UserId::new("102").unwrap(),
+        manage_guild: true,
+    };
+    let foreign_guild = GuildId::new("200").unwrap();
+    let foreign_context = PolicyContext::Discord {
+        guild: foreign_guild.clone(),
+        user: UserId::new("101").unwrap(),
+        manage_guild: true,
+    };
+    for (context, target) in [
+        (&foreign_principal, &guild),
+        (&foreign_context, &guild),
+        (&owner, &foreign_guild),
+    ] {
+        assert!(
+            coordinator
+                .clarify(
+                    context,
+                    target,
+                    &waiting.run.id,
+                    "Untrusted replacement".into()
+                )
+                .await
+                .is_err()
+        );
+    }
+    for invalid in [" ".to_owned(), "x".repeat(4096)] {
+        assert!(
+            coordinator
+                .clarify(&owner, &guild, &waiting.run.id, invalid)
+                .await
+                .is_err()
+        );
+    }
+    let unchanged = coordinator
+        .inspect(&owner, &guild, &waiting.run.id)
+        .await
+        .unwrap();
+    assert_eq!(unchanged.revision, waiting.revision);
+    assert_eq!(unchanged.run.goal, waiting.run.goal);
+    assert_eq!(serde_json::to_value(&unchanged.run.budget).unwrap(), budget);
+    let clarification = "Use the private area. QUOTED_POLICY_TEXT_DO_NOT_PROMOTE";
+    let clarified = coordinator
+        .clarify(&owner, &guild, &waiting.run.id, clarification.into())
+        .await
+        .unwrap();
+    assert_eq!(clarified.run.status, RunStatus::WaitingInput);
+    assert!(clarified.run.goal.ends_with(clarification));
+    assert!(clarified.run.unverified_model_message.is_none());
+    assert_eq!(serde_json::to_value(&clarified.run.budget).unwrap(), budget);
+    assert_eq!(serde_json::to_value(&clarified.run.limits).unwrap(), limits);
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 0);
+    let finished = coordinator
+        .resume(&owner, &guild, &waiting.run.id)
+        .await
+        .unwrap();
+    assert_eq!(finished.run.status, RunStatus::Succeeded);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(finished.run.budget.requests, 3);
+    assert_eq!(
+        finished.run.budget.charged_tokens,
+        waiting.run.budget.charged_tokens + 20
+    );
+    assert_eq!(serde_json::to_value(&finished.run.limits).unwrap(), limits);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[1].2, "resume starts with fresh receipt context");
+    assert_eq!(requests[1].3, 0);
+    assert!(requests[1].0.contains(clarification));
+    assert!(requests.iter().all(|(_, policy, _, _)| policy == POLICY));
+}
+
+#[tokio::test]
 async fn model_completion_is_not_receipt_backed_success() {
     let (_folder, _storage, coordinator, _, host, guild) =
         setup(vec![vec![]], 1, false, false, false, 4).await;
