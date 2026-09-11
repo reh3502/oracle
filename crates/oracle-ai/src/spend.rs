@@ -102,6 +102,61 @@ impl SpendStore {
         Err(Error::new(ErrorCode::Conflict))
     }
 
+    /// Host startup/recovery only: retain the original charge and clear exactly
+    /// this attempt's pending marker. Missing admission and an already settled
+    /// sequence are safe; a different reservation at the same sequence is not.
+    pub async fn recover_reservation(
+        &self,
+        guild: &GuildId,
+        reservation: &DailyReservation,
+    ) -> Result<()> {
+        let key = format!("day:{}", reservation.day);
+        for _ in 0..8 {
+            let Some(record) = self
+                .repository
+                .workflow_get(guild, WorkflowKind::AgentSpend, &key)
+                .await?
+            else {
+                return Ok(());
+            };
+            let mut state: Day = serde_json::from_value(record.value)
+                .map_err(|_| Error::new(ErrorCode::Integrity))?;
+            let Some(account) = state.runs.get_mut(reservation.run.as_str()) else {
+                return Ok(());
+            };
+            if account.last_sequence > reservation.request.sequence {
+                return Ok(());
+            }
+            if account.pending.is_none() {
+                return Ok(()); // No pending charge: either not admitted or already settled.
+            }
+            if account.last_sequence != reservation.request.sequence
+                || account.pending.as_ref() != Some(&reservation.request)
+            {
+                return Err(Error::new(ErrorCode::Integrity));
+            }
+            account.pending = None;
+            let value =
+                serde_json::to_value(state).map_err(|_| Error::new(ErrorCode::Integrity))?;
+            match self
+                .repository
+                .workflow_put(
+                    guild,
+                    WorkflowKind::AgentSpend,
+                    &key,
+                    Some(record.revision),
+                    &value,
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if error.code == ErrorCode::Conflict => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::new(ErrorCode::Conflict))
+    }
+
     /// Settle the original UTC day even after midnight. None retains the charge.
     /// Unknown/cancelled attempts cannot refund money that may already be billed.
     pub async fn settle(

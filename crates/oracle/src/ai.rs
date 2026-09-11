@@ -299,133 +299,20 @@ impl HostTools {
             .upgrade()
             .ok_or_else(|| Error::new(ErrorCode::Cancelled))
     }
-    async fn entries(&self, context: &PolicyContext, run: &Run) -> Result<(u64, Vec<Entry>)> {
+    async fn entries(
+        &self,
+        context: &PolicyContext,
+        run: &Run,
+    ) -> Result<(u64, Vec<Entry>, Vec<Value>)> {
         require_owner(context, run)?;
         let host = self.host()?;
         let snapshot = host
             .modules
             .ai_catalog_snapshot(context, &run.guild)
             .await?;
-        let mut entries = core_entries();
-        if host.operations.get().is_none() {
-            entries.retain(|entry| {
-                !matches!(
-                    entry.definition.name.as_str(),
-                    "core_guild_inspect_v1" | "core_discord_plan_v1" | "core_discord_apply_v1"
-                )
-            });
-        }
-        for module in snapshot.entries {
-            let prefix = module.module.as_str().replace(['.', '-'], "_");
-            let binding = format!(
-                "config:{}:{}:{}:{}:{}",
-                module.module,
-                module.session,
-                module.generation,
-                module.epoch,
-                module.artifact_digest
-            );
-            for operation in &module.operations {
-                let Some(ai) = &operation.ai else {
-                    continue;
-                };
-                let forbidden = operation
-                    .capabilities
-                    .iter()
-                    .any(|cap| cap == "contracts.invoke" || cap == "host.echo");
-                let notify = operation
-                    .capabilities
-                    .iter()
-                    .any(|cap| cap == "discord.notify");
-                if forbidden
-                    || (ai.kind == ModuleAiOperationKind::Inspection && notify)
-                    || (ai.kind == ModuleAiOperationKind::Verification
-                        && (!notify || ai.success_pointer.is_none()))
-                {
-                    continue;
-                }
-                let mut projected = entry(
-                    &format!("{prefix}_{}_v1", operation.name),
-                    &operation.description,
-                    portable_schema(&operation.input_schema, 0)?,
-                    format!(
-                        "module:{}:{}:{}:{}:{}:{}",
-                        module.module,
-                        module.session,
-                        module.generation,
-                        module.epoch,
-                        module.artifact_digest,
-                        operation.name
-                    ),
-                    false,
-                );
-                projected.tags = vec![
-                    module.module.to_string(),
-                    "status".into(),
-                    "verification".into(),
-                ];
-                entries.push(projected);
-            }
-            let Some(configuration) = module.configuration else {
-                continue;
-            };
-            for (suffix, description, parameters) in [
-                (
-                    "inspect",
-                    format!(
-                        "Inspect {} configuration and effective receipt",
-                        module.module
-                    ),
-                    object(json!({}), &[]),
-                ),
-                (
-                    "plan",
-                    format!(
-                        "Plan {} configuration. Available presets: {}",
-                        module.module,
-                        configuration
-                            .presets
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    {
-                        let mut values = portable_schema(&configuration.schema, 0)?;
-                        if let Some(object) = values.as_object_mut() {
-                            object.remove("required");
-                        }
-                        object(
-                            json!({"preset": if configuration.presets.is_empty() { string() } else { json!({"type":"string","enum":configuration.presets.keys().collect::<Vec<_>>()}) },"values":values}),
-                            &[],
-                        )
-                    },
-                ),
-                (
-                    "apply",
-                    format!(
-                        "Apply a run-owned {} configuration plan. Then search for and run its declared verification and status operations before completion.",
-                        module.module
-                    ),
-                    object(json!({"reference":string()}), &["reference"]),
-                ),
-            ] {
-                let mut item = entry(
-                    &format!("{prefix}_config_{suffix}_v1"),
-                    &description,
-                    parameters,
-                    format!("{binding}:{suffix}"),
-                    false,
-                );
-                item.tags = vec![
-                    "configuration".into(),
-                    "configure".into(),
-                    module.module.to_string(),
-                ];
-                entries.push(item);
-            }
-        }
-        Ok((snapshot.revision.max(1), entries))
+        let (entries, unavailable) =
+            project_catalog(snapshot.entries, host.operations.get().is_some());
+        Ok((snapshot.revision.max(1), entries, unavailable))
     }
     async fn inspect_reference(
         &self,
@@ -551,7 +438,7 @@ impl HostTools {
 #[async_trait::async_trait]
 impl ToolHost for HostTools {
     async fn catalog(&self, context: &PolicyContext, run: &Run) -> Result<Catalog> {
-        let (revision, entries) = self.entries(context, run).await?;
+        let (revision, entries, _) = self.entries(context, run).await?;
         Catalog::new(revision, entries).map_err(|_| invalid())
     }
     async fn execute(
@@ -566,7 +453,8 @@ impl ToolHost for HostTools {
         if cancel.is_cancelled() {
             return Err(Error::new(ErrorCode::Cancelled));
         }
-        let catalog = self.catalog(context, run).await?;
+        let (revision, entries, unavailable) = self.entries(context, run).await?;
+        let catalog = Catalog::new(revision, entries).map_err(|_| invalid())?;
         catalog
             .validate(&Selection {
                 revision: run.catalog_revision.ok_or_else(invalid)?,
@@ -583,6 +471,13 @@ impl ToolHost for HostTools {
                     let mut result = outcome(value(
                         catalog.select(&query.query, 12).map_err(|_| invalid())?,
                     )?);
+                    result.value["unavailable_tools"] =
+                        json!(unavailable.iter().take(64).collect::<Vec<_>>());
+                    result.value["unavailable_count"] = json!(unavailable.len());
+                    result.value["catalog_scope"] = json!("active_and_authorized");
+                    result.value["unavailable_next_action"] = json!(
+                        "A missing tool does not prove a missing module. A local operator must inspect installation, activation and grants."
+                    );
                     result.search_query = Some(query.query);
                     result
                 }
@@ -867,7 +762,7 @@ impl ToolHost for HostTools {
             .modules
             .ai_catalog_snapshot(context, &run.guild)
             .await?;
-        for module in snapshot.entries {
+        for module in &snapshot.entries {
             if !run
                 .references
                 .iter()
@@ -901,13 +796,60 @@ impl ToolHost for HostTools {
                 }
             }
         }
+        let mut resolved_calls = Vec::new();
+        for call in calls {
+            if call.state != oracle_ai::state::CallState::Unknown {
+                continue;
+            }
+            let Ok(reference) = decode::<Reference>(call.arguments.clone()) else {
+                continue;
+            };
+            let Some(receipt) = receipts.iter().find(|receipt| {
+                receipt["reference"] == reference.reference && receipt["verified"] == true
+            }) else {
+                continue;
+            };
+            let bound = if call.name == "core_discord_apply_v1" && call.binding == "core:apply:1" {
+                reference.reference.starts_with("structure:")
+            } else {
+                snapshot.entries.iter().any(|module| {
+                    call.name
+                        == format!(
+                            "{}_config_apply_v1",
+                            module.module.as_str().replace(['.', '-'], "_")
+                        )
+                        && call.binding
+                            == format!(
+                                "config:{}:{}:{}:{}:{}:apply",
+                                module.module,
+                                module.session,
+                                module.generation,
+                                module.epoch,
+                                module.artifact_digest
+                            )
+                        && reference
+                            .reference
+                            .starts_with(&format!("config:{}:", module.module))
+                })
+            };
+            if bound {
+                resolved_calls.push(oracle_ai::coordinator::ResolvedCall {
+                    call_id: call.call_id.clone(),
+                    value: json!({"reference":reference.reference,"verified":true,"reconciliation":"fresh_host_receipt","state":receipt["receipt"]["state"]}),
+                    is_error: false,
+                });
+            }
+        }
         let unresolved = calls.iter().any(|call| {
             matches!(
                 call.state,
                 oracle_ai::state::CallState::Admitted | oracle_ai::state::CallState::Unknown
-            )
+            ) && !resolved_calls
+                .iter()
+                .any(|resolved| resolved.call_id == call.call_id)
         });
         Ok(Reconciliation {
+            resolved_calls,
             references: recovered,
             value: json!({"receipts":receipts,"pending_verification":pending_verification,"scope":"verified_planned_changes"}),
             complete: complete && !unresolved,
@@ -920,6 +862,22 @@ impl ToolHost for HostTools {
 // validates the original schema. Unsupported structural forms fail closed.
 fn portable_schema(schema: &Value, depth: usize) -> Result<Value> {
     if depth > 24 {
+        return Err(invalid());
+    }
+    if [
+        "$ref",
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "prefixItems",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+    ]
+    .iter()
+    .any(|key| schema.get(key).is_some())
+    {
         return Err(invalid());
     }
     if let Some(fixed) = schema.get("const") {
@@ -997,4 +955,171 @@ fn constant_schema(fixed: &Value, depth: usize) -> Result<Value> {
         result["additionalProperties"] = json!(false);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+#[path = "ai_eval_tests.rs"]
+mod eval_tests;
+
+#[cfg(test)]
+#[path = "ai_recovery_tests.rs"]
+mod recovery_tests;
+
+fn project_catalog(
+    modules: Vec<oracle_modules::ModuleAiCatalogEntry>,
+    structure_available: bool,
+) -> (Vec<Entry>, Vec<Value>) {
+    let mut unavailable = Vec::new();
+    let mut entries = core_entries();
+    if !structure_available {
+        entries.retain(|entry| {
+            !matches!(
+                entry.definition.name.as_str(),
+                "core_guild_inspect_v1" | "core_discord_plan_v1" | "core_discord_apply_v1"
+            )
+        });
+    }
+    for module in modules {
+        let prefix = module.module.as_str().replace(['.', '-'], "_");
+        let binding = format!(
+            "config:{}:{}:{}:{}:{}",
+            module.module, module.session, module.generation, module.epoch, module.artifact_digest
+        );
+        for operation in &module.operations {
+            let Some(ai) = &operation.ai else {
+                continue;
+            };
+            let forbidden = operation
+                .capabilities
+                .iter()
+                .any(|cap| cap == "contracts.invoke" || cap == "host.echo");
+            let notify = operation
+                .capabilities
+                .iter()
+                .any(|cap| cap == "discord.notify");
+            if forbidden
+                || (ai.kind == ModuleAiOperationKind::Inspection && notify)
+                || (ai.kind == ModuleAiOperationKind::Verification
+                    && (!notify || ai.success_pointer.is_none()))
+            {
+                continue;
+            }
+            let Ok(parameters) = portable_schema(&operation.input_schema, 0) else {
+                unavailable.push(json!({"module":module.module,"operation":operation.name,"reason":"schema_not_projectable"}));
+                continue;
+            };
+            let mut projected = entry(
+                &format!("{prefix}_{}_v1", operation.name),
+                &operation.description,
+                parameters,
+                format!(
+                    "module:{}:{}:{}:{}:{}:{}",
+                    module.module,
+                    module.session,
+                    module.generation,
+                    module.epoch,
+                    module.artifact_digest,
+                    operation.name
+                ),
+                false,
+            );
+            projected.tags = vec![
+                module.module.to_string(),
+                "status".into(),
+                "verification".into(),
+            ];
+            entries.push(projected);
+        }
+        let Some(configuration) = module.configuration else {
+            continue;
+        };
+        let Ok(mut values) = portable_schema(&configuration.schema, 0) else {
+            unavailable.push(json!({"module":module.module,"operation":"configuration","reason":"schema_not_projectable"}));
+            entries.push(entry(
+                &format!("{prefix}_config_inspect_v1"),
+                &format!("Inspect {} configuration", module.module),
+                object(json!({}), &[]),
+                format!("{binding}:inspect"),
+                false,
+            ));
+            continue;
+        };
+        if let Some(object) = values.as_object_mut() {
+            object.remove("required");
+        }
+        for (suffix, description, parameters) in [
+            (
+                "inspect",
+                format!(
+                    "Inspect {} configuration and effective receipt",
+                    module.module
+                ),
+                object(json!({}), &[]),
+            ),
+            (
+                "plan",
+                format!(
+                    "Plan {} configuration. Available presets: {}",
+                    module.module,
+                    configuration
+                        .presets
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                {
+                    object(
+                        json!({"preset": if configuration.presets.is_empty() { string() } else { json!({"type":"string","enum":configuration.presets.keys().collect::<Vec<_>>()}) },"values":values}),
+                        &[],
+                    )
+                },
+            ),
+            (
+                "apply",
+                format!(
+                    "Apply a run-owned {} configuration plan. Then search for and run its declared verification and status operations before completion.",
+                    module.module
+                ),
+                object(json!({"reference":string()}), &["reference"]),
+            ),
+        ] {
+            let mut item = entry(
+                &format!("{prefix}_config_{suffix}_v1"),
+                &description,
+                parameters,
+                format!("{binding}:{suffix}"),
+                false,
+            );
+            item.tags = vec![
+                "configuration".into(),
+                "configure".into(),
+                module.module.to_string(),
+            ];
+            entries.push(item);
+        }
+    }
+
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in &entries {
+        *counts
+            .entry(entry.definition.name.clone())
+            .or_insert(0usize) += 1;
+    }
+    entries.retain(|entry| {
+        if entry.binding.starts_with("core:") {
+            return true;
+        }
+        let name = &entry.definition.name;
+        let valid = !name.starts_with("core_")
+            && counts.get(name) == Some(&1)
+            && Catalog::new(1, vec![entry.clone()]).is_ok()
+            && serde_json::to_vec(&entry.definition)
+                .is_ok_and(|bytes| bytes.len() <= oracle_ai::catalog::MAX_SELECTED_SCHEMA_BYTES);
+        if !valid {
+            unavailable.push(json!({"tool":name,"reason":"descriptor_or_alias_unavailable"}));
+        }
+        valid
+    });
+    (entries, unavailable)
 }

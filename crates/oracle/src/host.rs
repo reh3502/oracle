@@ -60,6 +60,37 @@ impl Host {
             return Err(error);
         }
         let core = Arc::new(CoreService::new(storage.clone(), config.guilds.clone()));
+        // Recover semantic AI state even when Gemini is disabled or no key exists.
+        // This host-only pass never reconstructs Discord authority or invokes tools.
+        let recovery = async {
+            let runs = oracle_ai::state::RunStore::new(core.clone(), storage.clone());
+            let spend = oracle_ai::spend::SpendStore::new(storage.clone());
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Error::new(ErrorCode::Integrity))?
+                .as_millis()
+                .try_into()
+                .map_err(|_| Error::new(ErrorCode::Integrity))?;
+            for guild in storage.status(None).await?.guilds {
+                oracle_ai::recovery::recover_guild(
+                    &runs,
+                    &spend,
+                    storage.as_ref(),
+                    &guild.guild,
+                    now_ms,
+                )
+                .await?;
+            }
+            Ok::<(), Error>(())
+        };
+        let recovered = tokio::time::timeout(Duration::from_secs(30), recovery)
+            .await
+            .map_err(|_| Error::new(ErrorCode::RecoveryRequired))
+            .and_then(|result| result);
+        if let Err(error) = recovered {
+            let _ = storage.close().await;
+            return Err(error);
+        }
         let modules = match ModuleManager::new(
             storage.clone(),
             core.clone(),
