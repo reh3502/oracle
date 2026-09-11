@@ -32,6 +32,9 @@ COORDINATOR_TESTS = [
     "retries_consume_separate_reservations_and_stop_after_two_retries",
     "daily_cap_rejects_network_dispatch",
     "overlarge_tool_batch_rejects_every_effect",
+    "final_effect_is_verified_even_without_budget_for_another_model_turn",
+    "operational_failure_is_a_durable_paused_diagnostic",
+    "host_receipt_resolves_unknown_call_without_redispatch",
 ]
 HOST_TESTS = [
     "agent_minecraft_receipts_and_repeat_request_reuse_real_operations",
@@ -39,11 +42,18 @@ HOST_TESTS = [
     "agent_host_rejects_reference_copied_from_another_run",
     "agent_permission_expansion_waits_for_exact_authenticated_approval",
     "agent_receipt_gate_detects_drift_after_completed_operation",
+    "agent_permission_revoked_after_first_write_preserves_only_completed_effect",
+    "agent_conflicting_parallel_applies_serialize_and_preserve_receipts",
+]
+RECOVERY_TESTS = [
+    "host_startup_pauses_interrupted_discord_runs_and_settles_cancelled_spend_without_ai",
+    "agent_restart_resolves_only_owned_apply_with_fresh_complete_receipt_without_replay",
 ]
 LOGGING_TESTS = [
     "agent_logging_moderate_verifies_native_configuration_delivery_and_current_health",
     "agent_logging_public_destination_is_denied_without_configuration_or_delivery",
     "agent_logging_missing_inactive_and_unloaded_catalogs_never_authorize_stale_apply",
+    "agent_malicious_module_guide_cannot_read_or_exfiltrate_host_secret",
 ]
 
 
@@ -114,7 +124,10 @@ def main():
     try:
         q.command("rust-version", ["rustc", "--version"])
         q.command("prepare-serenity", [sys.executable, ROOT / "scripts/prepare-serenity.py"])
-        fixtures = {"ORACLE_ACTIVITY_LOG": q.fixture("activity-log", "oracle-example-activity-log", "", "ORACLE_ACTIVITY_LOG")}
+        fixtures = {
+            "ORACLE_ACTIVITY_LOG": q.fixture("activity-log", "oracle-example-activity-log", "", "ORACLE_ACTIVITY_LOG"),
+            "ORACLE_ACTIVITY_LOG_INJECTION": q.fixture("activity-log-injection", "oracle-example-activity-log", "injection-fixture", "ORACLE_ACTIVITY_LOG_INJECTION"),
+        }
         q.command("architecture", [sys.executable, ROOT / "scripts/check-architecture.py"])
         q.command("gate-tests", [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests"])
         q.command("workspace-tests", ["cargo", "test", "--locked", "--workspace"], minimum=1)
@@ -125,6 +138,9 @@ def main():
             q.test("sqlite-" + test, "oracle-ai", "coordinator::tests::" + test)
         for test in HOST_TESTS:
             q.test("sqlite-" + test, "oracle", "ai::tests::" + test)
+        for test in RECOVERY_TESTS:
+            q.test("sqlite-" + test, "oracle", "ai::recovery_tests::" + test)
+        q.test("catalog-projection-fails-closed", "oracle", "ai::recovery_tests::catalog_unprojectable_or_colliding_module_tools_cannot_remove_core_operations")
         for test in LOGGING_TESTS:
             q.test("sqlite-" + test, "oracle", "ai::logging_tests::" + test, fixtures, ignored=True)
         if pg:
@@ -158,6 +174,7 @@ def main():
             # against the same guild fixture or silently substitute SQLite.
             cases = [("oracle-ai", "coordinator::tests::" + test, False) for test in COORDINATOR_TESTS]
             cases += [("oracle", "ai::tests::" + test, False) for test in HOST_TESTS]
+            cases += [("oracle", "ai::recovery_tests::" + test, False) for test in RECOVERY_TESTS]
             cases += [("oracle", "ai::logging_tests::" + test, True) for test in LOGGING_TESTS]
             for index, (package, test, ignored) in enumerate(cases):
                 database = f"scenario_{index}"

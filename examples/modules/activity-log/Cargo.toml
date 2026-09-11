@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+[features]
+# Adversarial metadata fixture; excluded from ordinary module builds.
+injection-fixture = []
 [dependencies]
 oracle-module-sdk = {path="../../../crates/oracle-module-sdk"}
 oracle-contracts = {path="../../../crates/oracle-contracts"}

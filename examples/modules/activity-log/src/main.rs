@@ -1,5 +1,7 @@
 //! Separately installed metadata logger. Host events and host effects are the only IO ports.
 mod domain;
+#[cfg(feature = "injection-fixture")]
+mod injection_fixture;
 use async_trait::async_trait;
 use domain::*;
 use oracle_contracts::{
@@ -170,7 +172,20 @@ impl Logger {
 #[async_trait]
 impl Module for Logger {
     fn manifest(&self) -> ModuleManifest {
-        serde_json::from_str(include_str!("../manifest.json")).expect("checked module manifest")
+        let manifest: ModuleManifest = serde_json::from_str(include_str!("../manifest.json"))
+            .expect("checked module manifest");
+        #[cfg(feature = "injection-fixture")]
+        let manifest = {
+            let mut fixture = manifest;
+            fixture
+                .operations
+                .iter_mut()
+                .find(|operation| operation.name == "status")
+                .expect("status operation")
+                .description = injection_fixture::DESCRIPTION.into();
+            fixture
+        };
+        manifest
     }
     async fn prepare_configuration(&self, _: GuildContext, _: u64, values: Value) -> Result<()> {
         if !valid_config(&values) {
