@@ -284,6 +284,154 @@ fn changed_after_verified<T: PartialEq>(verified: bool, previous: Option<&T>, cu
     verified && previous.is_some_and(|previous| previous != current)
 }
 
+const MAX_EVAL_VISIBLE_TEXT_BYTES: usize = 4096;
+
+// Capture provider-visible prose only, before fixture fault injection. This
+// deliberately excludes calls, arguments, native continuation, and raw payloads.
+// Text availability is not a quality score or proof of host-verified success.
+fn visible_text_capture(turn: Option<&ModelTurn>) -> Value {
+    let original = turn.and_then(|turn| turn.visible_text.as_deref());
+    let mut end = original.map_or(0, |text| text.len().min(MAX_EVAL_VISIBLE_TEXT_BYTES));
+    if let Some(text) = original {
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    let truncated = original.is_some_and(|text| end < text.len());
+    let status = match original {
+        None => "missing",
+        Some(text) if text.trim().is_empty() => "empty",
+        Some(_) if truncated => "truncated",
+        Some(_) => "complete",
+    };
+    json!({
+        "origin":"provider_response_before_fixture_fault",
+        "text":original.map(|text| &text[..end]),
+        "capture_status":status,
+        "truncated":truncated,
+        "provider_stop":turn.map(|turn| turn.stop),
+        "full_completion_text_available":status == "complete"
+            && turn.is_some_and(|turn| turn.stop == StopReason::Completed)
+    })
+}
+
+fn explanation_test_turn(text: Option<String>, stop: StopReason) -> ModelTurn {
+    ModelTurn {
+        calls: vec![oracle_ai::provider::ToolCall {
+            id: "private-call-id".into(),
+            name: "test".into(),
+            arguments: json!({"private_field":"PRIVATE_TOOL_ARGUMENT"}),
+        }],
+        visible_text: text,
+        continuation: oracle_ai::provider::Continuation {
+            profile: "test".into(),
+            opaque: "PRIVATE_NATIVE_REASONING_AND_ENVELOPE".into(),
+        },
+        usage: Usage::default(),
+        stop,
+        model: None,
+    }
+}
+
+#[test]
+fn visible_text_capture_excludes_private_fields() {
+    let turn = explanation_test_turn(
+        Some("I preserved privacy exclusions.".into()),
+        StopReason::Completed,
+    );
+    let capture = visible_text_capture(Some(&turn));
+    assert_eq!(capture["text"], "I preserved privacy exclusions.");
+    assert_eq!(capture["capture_status"], "complete");
+    assert_eq!(capture["full_completion_text_available"], true);
+    let serialized = capture.to_string();
+    for private in [
+        "PRIVATE_TOOL_ARGUMENT",
+        "PRIVATE_NATIVE_REASONING_AND_ENVELOPE",
+        "private-call-id",
+    ] {
+        assert!(!serialized.contains(private));
+    }
+    assert!(capture.get("calls").is_none());
+    assert!(capture.get("continuation").is_none());
+}
+
+#[test]
+fn visible_text_capture_marks_missing_incomplete_and_truncated_explanations() {
+    assert_eq!(visible_text_capture(None)["capture_status"], "missing");
+    assert_eq!(
+        visible_text_capture(None)["full_completion_text_available"],
+        false
+    );
+    for (text, expected) in [(None, "missing"), (Some("  ".into()), "empty")] {
+        let turn = explanation_test_turn(text, StopReason::Completed);
+        let capture = visible_text_capture(Some(&turn));
+        assert_eq!(capture["capture_status"], expected);
+        assert_eq!(capture["full_completion_text_available"], false);
+    }
+    let turn = explanation_test_turn(
+        Some("界".repeat(MAX_EVAL_VISIBLE_TEXT_BYTES)),
+        StopReason::Completed,
+    );
+    let capture = visible_text_capture(Some(&turn));
+    let text = capture["text"].as_str().unwrap();
+    assert!(text.len() <= MAX_EVAL_VISIBLE_TEXT_BYTES);
+    assert_eq!(
+        text.chars().count(),
+        MAX_EVAL_VISIBLE_TEXT_BYTES / "界".len()
+    );
+    assert_eq!(capture["truncated"], true);
+    assert_eq!(capture["full_completion_text_available"], false);
+    let exact = explanation_test_turn(
+        Some("x".repeat(MAX_EVAL_VISIBLE_TEXT_BYTES)),
+        StopReason::Completed,
+    );
+    assert_eq!(visible_text_capture(Some(&exact))["truncated"], false);
+    for stop in [
+        StopReason::ToolCalls,
+        StopReason::Truncated,
+        StopReason::Refused,
+        StopReason::Failed,
+        StopReason::Cancelled,
+    ] {
+        let incomplete = explanation_test_turn(Some("Partial explanation".into()), stop);
+        assert_eq!(
+            visible_text_capture(Some(&incomplete))["full_completion_text_available"],
+            false
+        );
+    }
+}
+
+#[test]
+fn attempt_prose_is_not_duplicated_in_cumulative_metrics() {
+    let turn = explanation_test_turn(
+        Some("UNIQUE_VISIBLE_PROSE_MARKER".into()),
+        StopReason::Completed,
+    );
+    let attempt =
+        json!({"provider_attempt_id":7,"visible_text_capture":visible_text_capture(Some(&turn))});
+    let metrics = Metrics {
+        provider_attempts: 7,
+        attempts: vec![attempt],
+        ..Default::default()
+    };
+    let serialized_metrics = serde_json::to_value(&metrics).unwrap();
+    assert!(serialized_metrics.get("attempts").is_none());
+    assert!(
+        !serialized_metrics
+            .to_string()
+            .contains("UNIQUE_VISIBLE_PROSE_MARKER")
+    );
+    let trial = json!({"fixture":"B01","trial":1,"repeat":1,"metrics":&metrics,"provider_attempts":&metrics.attempts});
+    assert_eq!(
+        trial
+            .to_string()
+            .matches("UNIQUE_VISIBLE_PROSE_MARKER")
+            .count(),
+        1
+    );
+    assert_eq!(trial["provider_attempts"][0]["provider_attempt_id"], 7);
+}
+
 #[derive(Default, Serialize)]
 struct Metrics {
     provider_attempts: u64,
@@ -476,7 +624,7 @@ impl ModelProvider for Candidate {
         let response = self.provider.send(request, cancel).await;
         {
             let mut metrics = self.campaign.metrics.lock().unwrap();
-            metrics.attempts.push(json!({"fixture":self.case.id,"successful_response":response.is_ok(),"tool_result_continuation":self.continuation.load(Ordering::SeqCst),"duration_ms":started.elapsed().as_millis(),"model":response.as_ref().ok().and_then(|turn|turn.model.as_ref()),"usage":response.as_ref().ok().map(|turn|&turn.usage),"error":response.as_ref().err().map(|error|format!("{error:?}"))}));
+            metrics.attempts.push(json!({"provider_attempt_id":admission.id,"fixture":self.case.id,"fixture_fault":self.case.fault,"visible_text_capture":visible_text_capture(response.as_ref().ok()),"successful_response":response.is_ok(),"tool_result_continuation":self.continuation.load(Ordering::SeqCst),"duration_ms":started.elapsed().as_millis(),"model":response.as_ref().ok().and_then(|turn|turn.model.as_ref()),"usage":response.as_ref().ok().map(|turn|&turn.usage),"error":response.as_ref().err().map(|error|format!("{error:?}"))}));
         }
         self.campaign
             .settle(admission, response.as_ref().ok().map(|turn| &turn.usage))?;
