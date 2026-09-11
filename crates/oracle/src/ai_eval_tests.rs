@@ -193,6 +193,7 @@ struct Metrics {
 }
 struct Campaign {
     limits: (u64, u64, u64),
+    input_rates: Option<(u64, u64)>,
     metrics: Mutex<Metrics>,
     ledger: Mutex<std::fs::File>,
     ledger_failed: AtomicBool,
@@ -266,15 +267,28 @@ impl Campaign {
         });
         let mut metrics = self.metrics.lock().unwrap();
         let charge = total_tokens.map_or(admission.cost, |tokens| {
-            u64::try_from((u128::from(tokens) * u128::from(self.limits.2)).div_ceil(1_000_000))
-                .unwrap_or(u64::MAX)
+            let weighted = match (self.input_rates, usage.and_then(|usage| usage.input_tokens)) {
+                (Some((input_rate, cached_rate)), Some(input)) => {
+                    let cached = usage.and_then(|usage| usage.cached_tokens).unwrap_or(0);
+                    if cached <= input {
+                        u128::from(input - cached) * u128::from(input_rate)
+                            + u128::from(cached) * u128::from(cached_rate)
+                            + u128::from(tokens - input) * u128::from(self.limits.2)
+                    } else {
+                        // An unusable cached breakdown cannot justify a discount.
+                        u128::from(tokens) * u128::from(self.limits.2)
+                    }
+                }
+                _ => u128::from(tokens) * u128::from(self.limits.2),
+            };
+            u64::try_from(weighted.div_ceil(1_000_000)).unwrap_or(u64::MAX)
         });
         let total = metrics
             .reserved_cost_micros
             .saturating_sub(admission.cost)
             .saturating_add(charge);
         // Persist settlement before releasing capacity. An interrupted/failed write retains the reservation.
-        self.record(json!({"kind":"settled","id":admission.id,"total_tokens":total_tokens,"charged_cost_micros":charge,"charged_total_micros":total}))?;
+        self.record(json!({"kind":"settled","id":admission.id,"total_tokens":total_tokens,"usage":usage,"charged_cost_micros":charge,"charged_total_micros":total}))?;
         metrics.reserved_cost_micros = total;
         if let Some(tokens) = total_tokens {
             metrics.reported_tokens = metrics.reported_tokens.saturating_add(tokens);
@@ -490,6 +504,22 @@ fn required_u64(name: &str) -> u64 {
         .unwrap_or_else(|| panic!("{name} must be positive"))
 }
 
+fn settlement_rates(
+    max_rate: u64,
+    input: Option<u64>,
+    cached: Option<u64>,
+) -> std::result::Result<Option<(u64, u64)>, &'static str> {
+    match (input, cached) {
+        (None, None) => Ok(None),
+        (Some(input), Some(cached))
+            if input > 0 && cached > 0 && input <= max_rate && cached <= max_rate =>
+        {
+            Ok(Some((input, cached)))
+        }
+        _ => Err("set both positive input/cached rates at or below the maximum rate"),
+    }
+}
+
 fn selected_cases(
     split: &str,
     mode: &str,
@@ -655,6 +685,7 @@ async fn all_scenario_initial_snapshots_have_valid_unique_scoped_resource_identi
 fn global_paid_cap_rejects_before_another_provider_dispatch() {
     let campaign = Campaign {
         limits: (2, 25, 1_000_000),
+        input_rates: None,
         metrics: Mutex::new(Metrics::default()),
         ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(tempfile::tempfile().unwrap()),
@@ -677,6 +708,7 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
     let ledger = tempfile::NamedTempFile::new().unwrap();
     let campaign = Campaign {
         limits: (10, 100, 4_000_000),
+        input_rates: None,
         metrics: Mutex::new(Metrics::default()),
         ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(ledger.reopen().unwrap()),
@@ -722,6 +754,7 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
     assert_eq!(records[3]["total_tokens"], Value::Null);
     let overrun = Campaign {
         limits: (10, 100, 4_000_000),
+        input_rates: None,
         metrics: Mutex::new(Metrics::default()),
         ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(tempfile::tempfile().unwrap()),
@@ -738,6 +771,114 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
         .unwrap();
     assert_eq!(overrun.metrics.lock().unwrap().reserved_cost_micros, 120);
     assert!(overrun.admit(&request, "A01").is_err());
+}
+
+#[test]
+fn known_input_and_cached_rates_settle_only_valid_billing_breakdowns() {
+    let cases = [
+        (
+            Some(Usage {
+                input_tokens: Some(800),
+                output_tokens: Some(200),
+                cached_tokens: Some(600),
+                total_tokens: Some(1000),
+                ..Default::default()
+            }),
+            1060,
+        ),
+        (
+            Some(Usage {
+                input_tokens: Some(800),
+                output_tokens: Some(200),
+                total_tokens: Some(1000),
+                ..Default::default()
+            }),
+            1600,
+        ),
+        (
+            Some(Usage {
+                total_tokens: Some(1000),
+                ..Default::default()
+            }),
+            4000,
+        ),
+        (
+            Some(Usage {
+                input_tokens: Some(200),
+                cached_tokens: Some(300),
+                total_tokens: Some(1000),
+                ..Default::default()
+            }),
+            4000,
+        ),
+        (
+            Some(Usage {
+                input_tokens: Some(800),
+                output_tokens: Some(300),
+                total_tokens: Some(1000),
+                ..Default::default()
+            }),
+            8000,
+        ),
+        (
+            Some(Usage {
+                input_tokens: Some(800),
+                cached_tokens: Some(1100),
+                total_tokens: Some(1000),
+                ..Default::default()
+            }),
+            8000,
+        ),
+        (
+            Some(Usage {
+                input_tokens: Some(800),
+                total_tokens: None,
+                ..Default::default()
+            }),
+            8000,
+        ),
+        (None, 8000),
+    ];
+    for (usage, expected) in cases {
+        let campaign = Campaign {
+            limits: (10, 8000, 4_000_000),
+            input_rates: Some((1_000_000, 100_000)),
+            metrics: Mutex::new(Metrics::default()),
+            ledger_failed: AtomicBool::new(false),
+            ledger: Mutex::new(tempfile::tempfile().unwrap()),
+        };
+        let request = PreparedTurn {
+            provider_metadata: None,
+            body: String::new(),
+            input_token_reservation: 1000,
+            output_token_reservation: 1000,
+            max_response_bytes: 1000,
+            timeout_ms: 10,
+        };
+        let admission = campaign.admit(&request, "A01").unwrap();
+        assert_eq!(campaign.metrics.lock().unwrap().reserved_cost_micros, 8000);
+        assert!(campaign.admit(&request, "A01").is_err());
+        campaign.settle(admission, usage.as_ref()).unwrap();
+        assert_eq!(
+            campaign.metrics.lock().unwrap().reserved_cost_micros,
+            expected
+        );
+    }
+    assert_eq!(settlement_rates(4_000_000, None, None).unwrap(), None);
+    assert_eq!(
+        settlement_rates(4_000_000, Some(1_000_000), Some(100_000)).unwrap(),
+        Some((1_000_000, 100_000))
+    );
+    for (input, cached) in [
+        (Some(1), None),
+        (None, Some(1)),
+        (Some(0), Some(1)),
+        (Some(1), Some(0)),
+        (Some(4_000_001), Some(1)),
+        (Some(1), Some(4_000_001)),
+    ] {
+        assert!(settlement_rates(4_000_000, input, cached).is_err());
+    }
 }
 
 #[test]
@@ -785,6 +926,7 @@ fn campaign_malformed_usage_never_refunds_reserved_capacity() {
     for usage in inconsistent {
         let campaign = Campaign {
             limits: (10, 100, 4_000_000),
+            input_rates: None,
             metrics: Mutex::new(Metrics::default()),
             ledger_failed: AtomicBool::new(false),
             ledger: Mutex::new(tempfile::tempfile().unwrap()),
@@ -810,6 +952,7 @@ fn campaign_ledger_write_failure_permanently_stops_new_dispatch() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let campaign = Campaign {
         limits: (10, 100, 4_000_000),
+        input_rates: None,
         metrics: Mutex::new(Metrics::default()),
         ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(std::fs::File::open(file.path()).unwrap()),
@@ -831,6 +974,7 @@ fn campaign_ledger_write_failure_permanently_stops_new_dispatch() {
     );
     let settlement_failure = Campaign {
         limits: (10, 100, 4_000_000),
+        input_rates: None,
         metrics: Mutex::new(Metrics::default()),
         ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(tempfile::tempfile().unwrap()),
@@ -966,12 +1110,21 @@ async fn live_candidate_five_trials_and_repeat() {
             "evaluation and billing reports must be ignored local material"
         );
     }
+    let max_rate = required_u64("ORACLE_AI_EVAL_RATE_MICROS_PER_MILLION");
+    let optional_rate = |name| std::env::var(name).ok().map(|_| required_u64(name));
+    let input_rates = settlement_rates(
+        max_rate,
+        optional_rate("ORACLE_AI_EVAL_INPUT_RATE_MICROS_PER_MILLION"),
+        optional_rate("ORACLE_AI_EVAL_CACHED_INPUT_RATE_MICROS_PER_MILLION"),
+    )
+    .unwrap();
     let campaign = Arc::new(Campaign {
         limits: (
             required_u64("ORACLE_AI_EVAL_MAX_REQUESTS"),
             required_u64("ORACLE_AI_EVAL_MAX_COST_MICROS"),
-            required_u64("ORACLE_AI_EVAL_RATE_MICROS_PER_MILLION"),
+            max_rate,
         ),
+        input_rates,
         metrics: Mutex::new(Metrics::default()),
         ledger_failed: AtomicBool::new(false),
         ledger: Mutex::new(
@@ -982,7 +1135,7 @@ async fn live_candidate_five_trials_and_repeat() {
                 .unwrap(),
         ),
     });
-    campaign.record(json!({"kind":"manifest","host_commit":commit,"conservative_rate":campaign.limits.2,"max_cost_micros":campaign.limits.1,"report":output})).unwrap();
+    campaign.record(json!({"kind":"manifest","host_commit":commit,"conservative_rate":campaign.limits.2,"input_rates":campaign.input_rates,"max_cost_micros":campaign.limits.1,"report":output})).unwrap();
     if mode == "smoke" {
         assert!(
             campaign.limits.0 <= 3,
@@ -994,7 +1147,7 @@ async fn live_candidate_five_trials_and_repeat() {
         .create_new(true)
         .open(&output)
         .unwrap();
-    writeln!(report,"{}",json!({"kind":"manifest","level":"live_gemini_simulated_discord","host_commit":commit,"profile":profile,"corpus_hash":digest(CORPUS),"module_digest":digest(module_bytes),"split":split,"selected_fixtures":selected.iter().map(|case|&case.id).collect::<Vec<_>>(),"mode":mode,"trials":trials,"repeat_requests":repeats,"global_max_requests":campaign.limits.0,"global_max_cost_micros":campaign.limits.1,"conservative_rate":campaign.limits.2})).unwrap();
+    writeln!(report,"{}",json!({"kind":"manifest","level":"live_gemini_simulated_discord","host_commit":commit,"profile":profile,"corpus_hash":digest(CORPUS),"module_digest":digest(module_bytes),"split":split,"selected_fixtures":selected.iter().map(|case|&case.id).collect::<Vec<_>>(),"mode":mode,"trials":trials,"repeat_requests":repeats,"global_max_requests":campaign.limits.0,"global_max_cost_micros":campaign.limits.1,"conservative_rate":campaign.limits.2,"input_rates":campaign.input_rates})).unwrap();
     assert!(
         campaign.limits.0 <= 8000,
         "campaign exceeds the maximum 80*5*2*10 requests"
