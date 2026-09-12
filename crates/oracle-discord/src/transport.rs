@@ -9,7 +9,7 @@ use hyper::{
     header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue},
 };
 use hyper_util::rt::TokioIo;
-use oracle_core::{Error, ErrorCode, Result};
+use oracle_core::{Error, ErrorCode, ErrorDetail, Result};
 use oracle_operations::executor::{SendGuard, now};
 use serde_json::Value;
 use std::{
@@ -30,6 +30,8 @@ use tokio_rustls::{
     rustls::{self, pki_types::ServerName},
 };
 
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_DELAY: Duration = Duration::from_secs(86_400);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -40,7 +42,7 @@ fn error(code: ErrorCode) -> Error {
 
 #[async_trait]
 pub trait FreshCheck: Send + Sync {
-    /// Re-fetch current authority and preconditions after rate and connection waits.
+    /// Re-fetch current authority and preconditions after rate waits, before connecting.
     async fn check(&self) -> Result<()>;
 }
 
@@ -139,7 +141,14 @@ impl DiscordWriteClient {
             tokio::time::sleep_until(ready).await;
             guard.dispatch(|| Ok(()))?;
             let (response, rate_delay) = self
-                .send_once(method.clone(), path, payload.clone(), guard, fresh)
+                .send_once(
+                    method.clone(),
+                    path,
+                    payload.clone(),
+                    guard,
+                    fresh,
+                    NETWORK_TIMEOUT,
+                )
                 .await?;
             if let Some(delay) = rate_delay {
                 let mut ready = self.next_ready.lock().await;
@@ -173,6 +182,29 @@ impl DiscordWriteClient {
         payload: Vec<u8>,
         guard: &SendGuard,
         fresh: &dyn FreshCheck,
+        network_timeout: Duration,
+    ) -> Result<(WriteResponse, Option<Duration>)> {
+        // Authority reads can wait for a minute-long Discord bucket reset. Do
+        // not open the mutation connection until those reads finish: an idle
+        // connection may otherwise be closed before its first HTTP request.
+        fresh.check().await?;
+        guard.dispatch(|| Ok(()))?;
+        let deadline = Instant::now() + network_timeout;
+        tokio::time::timeout_at(
+            deadline,
+            self.connect_and_request(method, path, payload, guard, deadline),
+        )
+        .await
+        .map_err(|_| Error::with_detail(ErrorCode::UnknownOutcome, ErrorDetail::NetworkTimeout))?
+    }
+
+    async fn connect_and_request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Vec<u8>,
+        guard: &SendGuard,
+        deadline: Instant,
     ) -> Result<(WriteResponse, Option<Duration>)> {
         #[cfg(test)]
         if let Some(endpoint) = self.endpoint {
@@ -181,26 +213,27 @@ impl DiscordWriteClient {
                 .map_err(|_| error(ErrorCode::Io))?;
             return self
                 .request(
-                    GuardedIo::new(stream, guard.clone()),
+                    GuardedIo::new(stream, guard.clone(), deadline),
                     method,
                     path,
                     payload,
                     guard,
-                    fresh,
+                    deadline,
                 )
                 .await;
         }
         let stream = TcpStream::connect(("discord.com", 443))
             .await
             .map_err(|_| error(ErrorCode::Io))?;
-        let stream = GuardedIo::new(stream, guard.clone());
+        let stream = GuardedIo::new(stream, guard.clone(), deadline);
         let name = ServerName::try_from("discord.com").map_err(|_| error(ErrorCode::Io))?;
         let tls = self
             .tls
             .connect(name, stream)
             .await
             .map_err(|_| error(ErrorCode::Io))?;
-        self.request(tls, method, path, payload, guard, fresh).await
+        self.request(tls, method, path, payload, guard, deadline)
+            .await
     }
 
     async fn request<T>(
@@ -210,7 +243,7 @@ impl DiscordWriteClient {
         path: &str,
         payload: Vec<u8>,
         guard: &SendGuard,
-        fresh: &dyn FreshCheck,
+        deadline: Instant,
     ) -> Result<(WriteResponse, Option<Duration>)>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -221,7 +254,6 @@ impl DiscordWriteClient {
         let driver = Driver(tokio::spawn(async move {
             let _ = connection.await;
         }));
-        fresh.check().await?;
         guard.dispatch(|| Ok(()))?;
         let request = Request::builder()
             .method(method)
@@ -234,7 +266,7 @@ impl DiscordWriteClient {
         let response = sender
             .send_request(request)
             .await
-            .map_err(|_| error(ErrorCode::UnknownOutcome))?;
+            .map_err(|_| network_failure(deadline))?;
         let status = response.status().as_u16();
         let headers = response.headers();
         let exhausted = headers
@@ -261,7 +293,7 @@ impl DiscordWriteClient {
         let mut body = response.into_body();
         let mut bytes = Vec::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| error(ErrorCode::UnknownOutcome))?;
+            let frame = frame.map_err(|_| network_failure(deadline))?;
             if let Ok(data) = frame.into_data() {
                 if bytes.len().saturating_add(data.len()) > MAX_BODY {
                     return Err(error(ErrorCode::QuotaExceeded));
@@ -272,7 +304,7 @@ impl DiscordWriteClient {
         let body = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes).map_err(|_| error(ErrorCode::UnknownOutcome))?
+            serde_json::from_slice(&bytes).map_err(|_| network_failure(deadline))?
         };
         drop(driver);
         Ok((WriteResponse { status, body }, rate_delay))
@@ -295,10 +327,15 @@ impl Drop for Driver {
 struct GuardedIo<T> {
     inner: T,
     guard: SendGuard,
+    deadline: Instant,
 }
 impl<T> GuardedIo<T> {
-    fn new(inner: T, guard: SendGuard) -> Self {
-        Self { inner, guard }
+    fn new(inner: T, guard: SendGuard, deadline: Instant) -> Self {
+        Self {
+            inner,
+            guard,
+            deadline,
+        }
     }
 }
 impl<T: AsyncRead + Unpin> AsyncRead for GuardedIo<T> {
@@ -310,6 +347,30 @@ impl<T: AsyncRead + Unpin> AsyncRead for GuardedIo<T> {
         Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
+fn network_failure(deadline: Instant) -> Error {
+    Error::with_detail(
+        ErrorCode::UnknownOutcome,
+        if Instant::now() >= deadline {
+            ErrorDetail::NetworkTimeout
+        } else {
+            ErrorDetail::HttpFailure
+        },
+    )
+}
+
+// Check under the same dispatch lock as the socket write, including TLS records.
+// Dropping the request aborts its driver, but this also fences a driver that is
+// scheduled late before it gets to observe that abort.
+fn within_deadline<T>(
+    deadline: Instant,
+    write: impl FnOnce() -> Poll<io::Result<T>>,
+) -> Result<Poll<io::Result<T>>> {
+    if Instant::now() >= deadline {
+        return Err(network_failure(deadline));
+    }
+    Ok(write())
+}
+
 fn fenced<T>(result: Result<Poll<io::Result<T>>>) -> Poll<io::Result<T>> {
     result.unwrap_or_else(|_| {
         Poll::Ready(Err(io::Error::new(
@@ -325,10 +386,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GuardedIo<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        fenced(
-            this.guard
-                .dispatch(|| Ok(Pin::new(&mut this.inner).poll_write(cx, buf))),
-        )
+        fenced(this.guard.dispatch(|| {
+            within_deadline(this.deadline, || {
+                Pin::new(&mut this.inner).poll_write(cx, buf)
+            })
+        }))
     }
     fn poll_write_vectored(
         self: Pin<&mut Self>,
@@ -336,27 +398,28 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GuardedIo<T> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        fenced(
-            this.guard
-                .dispatch(|| Ok(Pin::new(&mut this.inner).poll_write_vectored(cx, bufs))),
-        )
+        fenced(this.guard.dispatch(|| {
+            within_deadline(this.deadline, || {
+                Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+            })
+        }))
     }
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        fenced(
-            this.guard
-                .dispatch(|| Ok(Pin::new(&mut this.inner).poll_flush(cx))),
-        )
+        fenced(this.guard.dispatch(|| {
+            within_deadline(this.deadline, || Pin::new(&mut this.inner).poll_flush(cx))
+        }))
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        fenced(
-            this.guard
-                .dispatch(|| Ok(Pin::new(&mut this.inner).poll_shutdown(cx))),
-        )
+        fenced(this.guard.dispatch(|| {
+            within_deadline(this.deadline, || {
+                Pin::new(&mut this.inner).poll_shutdown(cx)
+            })
+        }))
     }
 }
 
@@ -413,6 +476,179 @@ mod tests {
     async fn reply(stream: &mut TcpStream, status: u16, body: &str) {
         stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     }
+    struct SlowFresh;
+    #[async_trait]
+    impl FreshCheck for SlowFresh {
+        async fn check(&self) -> Result<()> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn delayed_authority_does_not_leave_an_idle_write_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request =
+                tokio::time::timeout(Duration::from_millis(50), read_request(&mut stream)).await;
+            if request.is_err() {
+                // Model Discord closing a newly opened connection that has sat idle.
+                return false;
+            }
+            reply(&mut stream, 200, "{}").await;
+            true
+        });
+        let result = client
+            .execute(
+                Method::POST,
+                "/api/v10/guilds/100/channels",
+                &json!({}),
+                &guard(),
+                &SlowFresh,
+            )
+            .await;
+        assert!(
+            server.await.unwrap(),
+            "write connection idled during authority refresh"
+        );
+        assert_eq!(result.unwrap().status, 200);
+    }
+    #[tokio::test]
+    async fn freshness_wait_is_outside_network_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            reply(&mut stream, 200, "{}").await;
+        });
+        let response = client
+            .send_once(
+                Method::POST,
+                "/api/v10/guilds/100/channels",
+                vec![],
+                &guard(),
+                &SlowFresh,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.0.status, 200);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn stalled_response_body_has_unknown_network_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(!read_request(&mut stream).await.is_empty());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{")
+                .await
+                .unwrap();
+            let mut remaining = Vec::new();
+            // The network deadline drops and aborts the driver, closing this socket.
+            tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut remaining))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(remaining.is_empty());
+        });
+        let error = client
+            .send_once(
+                Method::POST,
+                "/api/v10/guilds/100/channels",
+                vec![],
+                &guard(),
+                &Fresh(true),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnknownOutcome);
+        assert_eq!(error.diagnostic().detail, Some(ErrorDetail::NetworkTimeout));
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn lost_response_is_diagnostic_and_never_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(!read_request(&mut stream).await.is_empty());
+            drop(stream);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = client
+            .execute(
+                Method::POST,
+                "/api/v10/guilds/100/channels",
+                &json!({}),
+                &guard(),
+                &Fresh(true),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnknownOutcome);
+        assert_eq!(error.diagnostic().detail, Some(ErrorDetail::HttpFailure));
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn network_deadline_fences_late_socket_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut stream =
+            GuardedIo::new(stream, guard(), Instant::now() + Duration::from_millis(30));
+        stream.write_all(b"first").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(stream.write_all(b"late").await.is_err());
+        assert!(
+            stream
+                .write_vectored(&[io::IoSlice::new(b"late")])
+                .await
+                .is_err()
+        );
+        assert!(stream.flush().await.is_err());
+        drop(stream);
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"first");
+    }
+    #[tokio::test]
+    async fn cancellation_during_freshness_wait_opens_no_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let guard = guard();
+        let cancel = guard.clone();
+        let task = tokio::spawn(async move {
+            client
+                .execute(
+                    Method::POST,
+                    "/api/v10/guilds/100/channels",
+                    &json!({}),
+                    &guard,
+                    &SlowFresh,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.revoke();
+        assert_eq!(task.await.unwrap().unwrap_err().code, ErrorCode::Cancelled);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
     #[tokio::test]
     async fn queued_revocation_sends_no_http_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -441,15 +677,9 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn stale_authority_after_connect_sends_no_http_bytes() {
+    async fn stale_authority_opens_no_write_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = client(listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut data = Vec::new();
-            stream.read_to_end(&mut data).await.unwrap();
-            data
-        });
         assert_eq!(
             client
                 .execute(
@@ -464,7 +694,11 @@ mod tests {
                 .code,
             ErrorCode::Conflict
         );
-        assert!(server.await.unwrap().is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn definite_429_retry_is_fenced_before_second_request() {
@@ -508,7 +742,7 @@ mod tests {
             .unwrap();
         let (mut peer, _) = listener.accept().await.unwrap();
         let guard = guard();
-        let mut io = GuardedIo::new(stream, guard.clone());
+        let mut io = GuardedIo::new(stream, guard.clone(), Instant::now() + NETWORK_TIMEOUT);
         io.write_all(b"first").await.unwrap();
         let mut first = [0; 5];
         peer.read_exact(&mut first).await.unwrap();
@@ -681,7 +915,7 @@ mod tests {
             .await
             .unwrap();
         let (mut peer, _) = listener.accept().await.unwrap();
-        let mut io = GuardedIo::new(stream, guard);
+        let mut io = GuardedIo::new(stream, guard, Instant::now() + NETWORK_TIMEOUT);
         io.write_all(b"first").await.unwrap();
         let mut first = [0; 5];
         peer.read_exact(&mut first).await.unwrap();
