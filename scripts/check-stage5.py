@@ -199,6 +199,7 @@ def main():
             if path:
                 postgres += ["--postgres-" + name, str(path.resolve())]
         q.command("full-offline", [sys.executable, ROOT / "scripts/check.py", "--full", *postgres], timeout=7200)
+        q.command("canary-offline-contracts", ["cargo", "test", "--locked", "-p", "oracle-discord", "--example", "stage5_live"], minimum=3)
         q.command("process-soak", [sys.executable, ROOT / "scripts/check-process-soak.py", "--cycles", str(args.soak_cycles)], timeout=1800)
         q.report["offline_passed"] = True
         if args.gemini_evidence:
