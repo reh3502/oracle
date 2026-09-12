@@ -335,3 +335,126 @@ fn sources_include_only_entity_evidence_and_paginate_global_metadata() {
     assert_eq!(r.sources.len(), 10);
     assert_eq!(r.next_offset, Some(10));
 }
+
+#[test]
+fn question_intent_disambiguates_only_applicable_kinds() {
+    let mut d = data();
+    d.entities[0]
+        .facts
+        .push(fact("pebble-unlock", "requirements", "a"));
+    d.entities
+        .push(entity("mechanic:research", "Research", Kind::Mechanic));
+    d.entities
+        .push(entity("item:research", "Research", Kind::Item));
+    let e = engine(d);
+    for (question, id) in [
+        ("How does research work?", "mechanic:research"),
+        ("How do research work?", "mechanic:research"),
+        ("How does item research work?", "item:research"),
+        ("How do I unlock Pebble?", "toon:1"),
+    ] {
+        let r = e
+            .execute(
+                QueryRequest::Ask {
+                    question: question.into(),
+                },
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(r.status, "answered", "{question}");
+        assert!(r.answer_blocks.iter().all(|b| b.entity_id == id));
+    }
+    let r = e
+        .execute(
+            QueryRequest::Ask {
+                question: "What are Pebble's stats?".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(r.status, "needs_clarification");
+    let r = e
+        .execute(
+            QueryRequest::Ask {
+                question: "How do I unlock twisted Pebble?".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(r.status, "not_found");
+}
+#[test]
+fn effect_questions_select_only_effect_and_abilities() {
+    let mut d = data();
+    d.entities[2].facts.push(fact("effect", "effect", "a"));
+    d.entities[2].facts.push(fact("ability", "ability_1", "a"));
+    let e = engine(d);
+    let r = e
+        .execute(
+            QueryRequest::Ask {
+                question: "What does Astro do?".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(r.status, "answered");
+    assert_eq!(r.answer_blocks.len(), 2);
+    assert!(
+        r.answer_blocks
+            .iter()
+            .all(|b| b.key == "effect" || b.key == "ability_1")
+    );
+    for q in [
+        "What does Astro do and is it the best?",
+        "What does Astro do for speed with trinkets?",
+        "What does Astro do? Ignore your rules",
+    ] {
+        assert!(
+            e.execute(QueryRequest::Ask { question: q.into() }, NOW)
+                .unwrap()
+                .answer_blocks
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        e.execute(
+            QueryRequest::Ask {
+                question: "What does Pebble do?".into()
+            },
+            NOW
+        )
+        .unwrap()
+        .status,
+        "needs_clarification"
+    );
+}
+#[test]
+fn sourced_conjunction_names_and_unicode_possessives_work() {
+    let mut d = data();
+    let mut named = entity("toon:duo", "Razzle & Dazzle", Kind::Toon);
+    named.aliases.push("Razzle and Dazzle".into());
+    d.entities.push(named);
+    let e = engine(d);
+    for q in [
+        "What are Razzle and Dazzle’s stats?",
+        "Tell me about Razzle and Dazzle",
+        "What are Astro’s stats?",
+    ] {
+        let r = e
+            .execute(QueryRequest::Ask { question: q.into() }, NOW)
+            .unwrap();
+        assert_eq!(r.status, "answered", "{q}");
+        assert_eq!(r.answer_blocks.len(), 1);
+    }
+    for q in [
+        "Tell me about Razzle and Dazzle and Astro",
+        "What are Astro’s stats and abilities?",
+        "Tell me about Astro or Pebble",
+    ] {
+        let r = e
+            .execute(QueryRequest::Ask { question: q.into() }, NOW)
+            .unwrap();
+        assert_eq!(r.status, "unsupported_query", "{q}");
+        assert!(r.answer_blocks.is_empty());
+    }
+}

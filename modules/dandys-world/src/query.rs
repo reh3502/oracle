@@ -290,6 +290,7 @@ impl QueryEngine {
             .any(|p| k.starts_with(p)),
             "speed" => k == "movementspeed",
             "ability" | "abilities" => k.contains("abilit"),
+            "effectorability" => k == "effect" || k.contains("abilit"),
             "unlock" | "requirements" => {
                 k.contains("unlock") || k.contains("requirement") || k.contains("obtainment")
             }
@@ -605,22 +606,23 @@ impl QueryEngine {
     fn ask(&self, question: &str, now: u64) -> QueryResponse {
         // A deliberately closed grammar consumes the entire question. No partial
         // match can silently drop a second request, modifier, or instruction.
-        let q = question.trim().trim_end_matches('?').trim().to_lowercase();
+        let q = question
+            .trim()
+            .trim_end_matches('?')
+            .trim()
+            .replace('’', "'")
+            .to_lowercase();
         let unsupported = || {
             self.response("unsupported_query","This question is outside the supported question patterns. Use an exact lookup, field, search, or comparison.")
         };
-        if q.contains(" and ")
-            || q.contains(" or ")
-            || q.contains(';')
-            || q.contains('\n')
-            || q.contains("http")
-        {
+        if q.contains(';') || q.contains('\n') || q.contains("http") {
             return unsupported();
         }
         let mut kind = None;
         let mut field = None;
         let mut name = None;
         for prefix in [
+            "what does ",
             "what are ",
             "what is ",
             "who is ",
@@ -645,6 +647,13 @@ impl QueryEngine {
         let Some(mut name) = name else {
             return unsupported();
         };
+        if q.starts_with("what does ") {
+            let Some(n) = name.strip_suffix(" do") else {
+                return unsupported();
+            };
+            name = n;
+            field = Some("effect_or_ability");
+        }
         if (q.starts_with("how does ") || q.starts_with("how do ")) && field.is_none() {
             let Some(n) = name.strip_suffix(" work") else {
                 return unsupported();
@@ -698,6 +707,27 @@ impl QueryEngine {
             }
         }
         if name.chars().count() > 100 || name.is_empty() {
+            return unsupported();
+        }
+        if kind.is_none() {
+            let matches = self.matches(name, None);
+            if field == Some("unlock") {
+                let eligible: Vec<_> = matches
+                    .iter()
+                    .filter(|e| matches!(e.kind, Kind::Toon | Kind::Npc | Kind::Trinket))
+                    .collect();
+                if eligible.len() == 1 {
+                    kind = Some(eligible[0].kind);
+                }
+            } else if (q.starts_with("how does ") || q.starts_with("how do "))
+                && matches.iter().any(|e| e.kind == Kind::Mechanic)
+            {
+                kind = Some(Kind::Mechanic);
+            }
+        }
+        // Conjunctions may be part of a sourced proper name, but never a
+        // second request that is dropped during matching.
+        if (q.contains(" and ") || q.contains(" or ")) && self.matches(name, kind).is_empty() {
             return unsupported();
         }
         // Only resolve the entire remaining entity span, never an embedded name.
