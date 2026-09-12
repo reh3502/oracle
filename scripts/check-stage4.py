@@ -25,6 +25,7 @@ COORDINATOR_TESTS = [
     "pending_verification_gets_one_fresh_semantic_continuation",
     "premature_completion_cannot_loop_or_exceed_budget_for_verification",
     "compaction_prioritizes_pending_verification_without_promoting_host_data",
+    "compaction_uses_only_reserved_verification_allowance",
     "full_round_receipts_survive_compaction_without_policy_promotion",
     "duplicate_call_identity_never_replays_effect",
     "validates_entire_batch_before_first_effect",

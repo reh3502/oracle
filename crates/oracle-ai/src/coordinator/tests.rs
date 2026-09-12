@@ -94,16 +94,28 @@ impl ToolHost for Host {
         let count = self.catalogs.fetch_add(1, Ordering::SeqCst);
         Catalog::new(
             if self.stale && count > 0 { 2 } else { 1 },
-            vec![Entry {
-                definition: crate::provider::ToolDefinition {
-                    name: "inspect".into(),
-                    description: "Inspect goal".into(),
-                    parameters: json!({"type":"object"}),
+            vec![
+                Entry {
+                    definition: crate::provider::ToolDefinition {
+                        name: "inspect".into(),
+                        description: "Inspect goal".into(),
+                        parameters: json!({"type":"object"}),
+                    },
+                    tags: vec![],
+                    binding: "inspect/v1".into(),
+                    pinned: true,
                 },
-                tags: vec![],
-                binding: "inspect/v1".into(),
-                pinned: true,
-            }],
+                Entry {
+                    definition: crate::provider::ToolDefinition {
+                        name: "receiptprobe".into(),
+                        description: "receiptprobe".into(),
+                        parameters: json!({"type":"object"}),
+                    },
+                    tags: vec![],
+                    binding: "receiptprobe/v1".into(),
+                    pinned: false,
+                },
+            ],
         )
         .map_err(|_| integrity())
     }
@@ -485,7 +497,7 @@ async fn premature_completion_cannot_loop_or_exceed_budget_for_verification() {
 #[tokio::test]
 async fn compaction_prioritizes_pending_verification_without_promoting_host_data() {
     for (hint, expected_phase) in [
-        (Some("inspect HOST_HINT_DO_NOT_PROMOTE".into()), true),
+        (Some("receiptprobe HOST_HINT_DO_NOT_PROMOTE".into()), true),
         (Some(" ".into()), false),
         (Some("x".repeat(4097)), false),
         (None, false),
@@ -494,7 +506,15 @@ async fn compaction_prioritizes_pending_verification_without_promoting_host_data
             vec![
                 vec![call("effect")],
                 vec![call("read")],
-                vec![call("verify")],
+                vec![ToolCall {
+                    name: if expected_phase {
+                        "receiptprobe"
+                    } else {
+                        "inspect"
+                    }
+                    .into(),
+                    ..call("verify")
+                }],
                 vec![],
             ],
             3,
@@ -538,6 +558,48 @@ async fn compaction_prioritizes_pending_verification_without_promoting_host_data
                 assert!(!policy.contains(untrusted));
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn compaction_uses_only_reserved_verification_allowance() {
+    for max_tokens in [39, 40] {
+        let (_folder, _storage, mut coordinator, provider, host, guild) = setup(
+            vec![
+                vec![call("effect")],
+                vec![call("read")],
+                vec![call("verify")],
+            ],
+            3,
+            false,
+            false,
+            false,
+            2,
+        )
+        .await;
+        let limits = &mut Arc::get_mut(&mut coordinator).unwrap().config.limits;
+        limits.max_tokens = max_tokens;
+        limits.verification_tokens = max_tokens - 30;
+        *host.verification_query.lock().unwrap() = Some("inspect".into());
+        let saved = coordinator
+            .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
+            .await
+            .unwrap();
+        let expected_sends = if max_tokens == 40 { 3 } else { 2 };
+        assert_eq!(
+            saved.run.status,
+            if max_tokens == 40 {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Paused
+            }
+        );
+        assert_eq!(provider.sends.load(Ordering::SeqCst), expected_sends);
+        assert_eq!(host.effects.load(Ordering::SeqCst), expected_sends);
+        assert_eq!(saved.run.budget.charged_tokens, expected_sends as u64 * 10);
+        assert!(saved.run.budget.charged_tokens <= max_tokens);
+        assert!(saved.run.budget.pending.is_none());
+        assert!(saved.run.pending_spend.is_none());
     }
 }
 

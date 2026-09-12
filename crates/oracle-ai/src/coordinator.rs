@@ -545,6 +545,8 @@ impl Coordinator {
                 if !verification_continued && let Some(hint) = evidence.verification_hint() {
                     verification_continued = true;
                     query = hint.to_owned();
+                    saved.run.status = RunStatus::Verifying;
+                    self.runs.save(&mut saved, now()).await?;
                 }
                 semantic = evidence.value;
                 continuation = None;
