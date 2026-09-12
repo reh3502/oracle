@@ -20,9 +20,13 @@ stage4 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(stage4)
 
 
+class GateFailure(ValueError):
+    """A fixed, safe qualification reason, never a raw backend exception."""
+
+
 def require(condition, reason):
     if not condition:
-        raise ValueError(reason)
+        raise GateFailure(reason)
 
 
 def digest(path):
@@ -206,11 +210,14 @@ def main():
             spec.loader.exec_module(live)
             q.report["discord"] = live.validate_evidence(args.discord_evidence)
         q.report["source_changed"] = q.report["source_sha256"] != stage4.stage3.snapshot()
+        q.report["offline_passed"] = not q.report["source_changed"]
         require(not q.report["source_changed"], "source changed during qualification")
         q.report["release_passed"] = all(q.report[g]["status"] == "passed" for g in ("gemini", "discord"))
         q.report["passed"] = q.report["offline_passed"] and (q.report["release_passed"] or not args.require_release)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, RuntimeError, KeyboardInterrupt) as error:
         q.report.update(passed=False, error=type(error).__name__)
+        if isinstance(error, GateFailure):
+            q.report["failure_reason"] = str(error)
         # Raw exceptions may include local configuration/content; keep diagnostics bounded.
         print("Qualification failed: " + type(error).__name__, file=sys.stderr)
     finally:

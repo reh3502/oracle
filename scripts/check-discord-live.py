@@ -97,6 +97,8 @@ def main():
         q.report["passed"] = True
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         q.report.update(passed=False, error=type(error).__name__)
+        if isinstance(error, stage5.GateFailure):
+            q.report["failure_reason"] = str(error)
         print("Canary failed; inspect the local report for cleanup status. Do not blindly retry.", file=sys.stderr)
     finally:
         if raw.is_file():
