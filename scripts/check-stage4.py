@@ -34,6 +34,7 @@ COORDINATOR_TESTS = [
     "expired_run_stops_before_provider_admission",
     "retries_consume_separate_reservations_and_stop_after_two_retries",
     "retryable_provider_failures_obey_attempt_and_spend_limits",
+    "rejected_proposals_settle_reported_usage_and_retain_unknown_reservations",
     "daily_cap_rejects_network_dispatch",
     "overlarge_tool_batch_rejects_every_effect",
     "final_effect_is_verified_even_without_budget_for_another_model_turn",

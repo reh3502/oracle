@@ -622,12 +622,23 @@ impl ModelProvider for Candidate {
         let admission = self.campaign.admit(&request, &self.case.id)?;
         let started = Instant::now();
         let response = self.provider.send(request, cancel).await;
+        let reported_usage = response.as_ref().ok().map(|turn| &turn.usage).or_else(|| {
+            response
+                .as_ref()
+                .err()
+                .and_then(ProviderError::reported_usage)
+        });
+        let error_category = response.as_ref().err().map(|error| match error {
+            ProviderError::RejectedToolCall { reason, .. } => {
+                format!("RejectedToolCall:{reason:?}")
+            }
+            error => format!("{error:?}"),
+        });
         {
             let mut metrics = self.campaign.metrics.lock().unwrap();
-            metrics.attempts.push(json!({"provider_attempt_id":admission.id,"fixture":self.case.id,"fixture_fault":self.case.fault,"visible_text_capture":visible_text_capture(response.as_ref().ok()),"successful_response":response.is_ok(),"tool_result_continuation":self.continuation.load(Ordering::SeqCst),"duration_ms":started.elapsed().as_millis(),"model":response.as_ref().ok().and_then(|turn|turn.model.as_ref()),"usage":response.as_ref().ok().map(|turn|&turn.usage),"error":response.as_ref().err().map(|error|format!("{error:?}"))}));
+            metrics.attempts.push(json!({"provider_attempt_id":admission.id,"fixture":self.case.id,"fixture_fault":self.case.fault,"visible_text_capture":visible_text_capture(response.as_ref().ok()),"successful_response":response.is_ok(),"tool_result_continuation":self.continuation.load(Ordering::SeqCst),"duration_ms":started.elapsed().as_millis(),"model":response.as_ref().ok().and_then(|turn|turn.model.as_ref()),"usage":reported_usage,"error":error_category}));
         }
-        self.campaign
-            .settle(admission, response.as_ref().ok().map(|turn| &turn.usage))?;
+        self.campaign.settle(admission, reported_usage)?;
         let mut turn = response?;
         {
             let mut metrics = self.campaign.metrics.lock().unwrap();
@@ -1169,6 +1180,104 @@ fn paid_usage_settlement_refunds_known_tokens_and_preserves_unknown_charges() {
         .unwrap();
     assert_eq!(overrun.metrics.lock().unwrap().reserved_cost_micros, 120);
     assert!(overrun.admit(&request, "A01").is_err());
+}
+
+#[tokio::test]
+async fn rejected_provider_calls_settle_usage_in_campaign_ledger() {
+    struct Rejected(Option<Usage>);
+    #[async_trait::async_trait]
+    impl ModelProvider for Rejected {
+        fn profile(&self) -> &ModelProfile {
+            static PROFILE: std::sync::OnceLock<ModelProfile> = std::sync::OnceLock::new();
+            PROFILE.get_or_init(tests::profile)
+        }
+        fn prepare(&self, _: ModelRequest) -> std::result::Result<PreparedTurn, ProviderError> {
+            Err(ProviderError::InvalidRequest)
+        }
+        async fn send(
+            &self,
+            _: PreparedTurn,
+            _: &CancellationToken,
+        ) -> std::result::Result<ModelTurn, ProviderError> {
+            Err(ProviderError::RejectedToolCall {
+                reason: oracle_ai::provider::ToolCallRejection::InvalidArguments,
+                usage: self.0.clone(),
+            })
+        }
+    }
+    let known = Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(2),
+        total_tokens: Some(5),
+        ..Default::default()
+    };
+    for (usage, expected_charge, unknown) in [
+        (Some(known.clone()), 20, 0),
+        (None, 80, 1),
+        (
+            Some(Usage {
+                output_tokens: Some(4),
+                ..known
+            }),
+            80,
+            1,
+        ),
+    ] {
+        let (_root, host, world) = tests::fixture().await;
+        let ledger = tempfile::NamedTempFile::new().unwrap();
+        let campaign = Arc::new(Campaign {
+            limits: (10, 100, 4_000_000),
+            input_rates: None,
+            metrics: Mutex::new(Metrics::default()),
+            ledger_failed: AtomicBool::new(false),
+            ledger: Mutex::new(ledger.reopen().unwrap()),
+        });
+        let candidate = Candidate {
+            provider: Arc::new(Rejected(usage.clone())),
+            campaign: campaign.clone(),
+            case: corpus().into_iter().find(|case| case.id == "A01").unwrap(),
+            host: host.clone(),
+            world: world.clone(),
+            module: None,
+            attempts: AtomicUsize::new(0),
+            continuation: AtomicBool::new(false),
+        };
+        let result = candidate
+            .send(
+                PreparedTurn {
+                    provider_metadata: None,
+                    body: String::new(),
+                    input_token_reservation: 10,
+                    output_token_reservation: 10,
+                    max_response_bytes: 1000,
+                    timeout_ms: 1000,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::RejectedToolCall { .. })
+        ));
+        assert_eq!(world.writes.load(Ordering::SeqCst), 0);
+        {
+            let metrics = campaign.metrics.lock().unwrap();
+            assert_eq!(metrics.provider_attempts, 1);
+            assert_eq!(metrics.reserved_cost_micros, expected_charge);
+            assert_eq!(metrics.unknown_usage, unknown);
+            assert_eq!(metrics.attempts[0]["usage"], json!(usage));
+        }
+        let records: Vec<Value> = std::fs::read_to_string(ledger.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["kind"], "settled");
+        assert_eq!(records[1]["charged_cost_micros"], expected_charge);
+        assert_eq!(records[1]["usage"], json!(usage));
+        host.close().await.unwrap();
+    }
 }
 
 #[test]

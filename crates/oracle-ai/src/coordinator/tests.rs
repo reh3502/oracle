@@ -3,7 +3,7 @@ use crate::{
     catalog::Entry,
     provider::{Continuation, ModelProfile, ModelTurn, PreparedTurn, Usage},
 };
-use oracle_core::{CoreService, GuildPolicy, UserId};
+use oracle_core::{CoreService, GuildPolicy, UserId, WorkflowKind, WorkflowRepository};
 use oracle_storage::{DatabaseConfig, Storage};
 use std::{
     collections::VecDeque,
@@ -879,6 +879,71 @@ async fn operational_failure_is_a_durable_paused_diagnostic() {
     assert_eq!(result.run.status, RunStatus::Paused);
     assert_eq!(result.run.problem.as_deref(), Some("host_error:Conflict"));
     assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rejected_proposals_settle_reported_usage_and_retain_unknown_reservations() {
+    let known = Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(2),
+        total_tokens: Some(5),
+        ..Default::default()
+    };
+    let contradictory = Usage {
+        output_tokens: Some(4),
+        ..known.clone()
+    };
+    for (usage, failures, charged, unknown, succeeded) in [
+        (Some(known.clone()), 1, 25, 0, true),
+        (Some(known), 4, 15, 0, false),
+        (None, 4, 60, 3, false),
+        (Some(Usage::default()), 4, 60, 3, false),
+        (Some(contradictory), 4, 60, 3, false),
+    ] {
+        let (_folder, storage, coordinator, provider, host, guild) = setup(
+            vec![vec![call("verified")], vec![]],
+            1,
+            false,
+            false,
+            false,
+            4,
+        )
+        .await;
+        *provider.failure.lock().unwrap() = ProviderError::RejectedToolCall {
+            reason: crate::provider::ToolCallRejection::InvalidArguments,
+            usage,
+        };
+        provider.failures.store(failures, Ordering::SeqCst);
+        let saved = coordinator
+            .ask(
+                &PolicyContext::LocalOperator,
+                guild.clone(),
+                "inspect".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.run.status == RunStatus::Succeeded, succeeded);
+        assert_eq!(provider.sends.load(Ordering::SeqCst), 3);
+        assert_eq!(saved.run.budget.requests, 3);
+        assert_eq!(host.effects.load(Ordering::SeqCst), usize::from(succeeded));
+        assert_eq!(saved.run.budget.charged_tokens, charged);
+        assert_eq!(saved.run.budget.estimated_cost_micros, charged);
+        assert_eq!(saved.run.budget.unknown_attempts, unknown);
+        assert_eq!(
+            saved.run.budget.reported_tokens,
+            if unknown == 0 { charged } else { 0 }
+        );
+        assert!(saved.run.budget.pending.is_none());
+        let days = storage
+            .workflow_list(&guild, WorkflowKind::AgentSpend, None, 10)
+            .await
+            .unwrap();
+        let daily_charge: u64 = days
+            .iter()
+            .filter_map(|day| day.value["runs"][saved.run.id.as_str()]["charged_micros"].as_u64())
+            .sum();
+        assert_eq!(daily_charge, charged);
+    }
 }
 
 #[tokio::test]

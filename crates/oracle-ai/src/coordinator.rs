@@ -620,10 +620,16 @@ impl Coordinator {
                 .estimated_cost_micros
                 .saturating_sub(reservation.cost_micros);
             let old_unknown = saved.run.budget.unknown_attempts;
+            let reported_usage = response.as_ref().ok().map(|turn| &turn.usage).or_else(|| {
+                response
+                    .as_ref()
+                    .err()
+                    .and_then(ProviderError::reported_usage)
+            });
             saved
                 .run
                 .budget
-                .settle(&reservation, response.as_ref().ok().map(|turn| &turn.usage))
+                .settle(&reservation, reported_usage)
                 .map_err(|_| integrity())?;
             let actual = (saved.run.budget.unknown_attempts == old_unknown).then_some(
                 saved
@@ -650,6 +656,7 @@ impl Coordinator {
                     | ProviderError::Transport
                     | ProviderError::Timeout
                     | ProviderError::RateLimited { .. }
+                    | ProviderError::RejectedToolCall { .. }
                     | ProviderError::InvalidToolCall),
                 ) if retries < 2 => {
                     retries += 1;
