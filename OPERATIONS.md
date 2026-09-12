@@ -35,3 +35,15 @@ Start with local `status`, `module health`, `recovery --guild GUILD`, saved stru
 For a bug report include the host revision and digest, OS/toolchain/backend versions, safe error code, failing command shape, lifecycle phase, and whether an external effect is uncertain. Replace deployment/guild/user/channel IDs and paths with consistent placeholders. Preserve only the minimal non-sensitive receipt relationships needed to reproduce the problem. A useful report says, for example, `module upgrade --module MODULE --digest DIGEST failed; code=data_version_mismatch; module remains unavailable; checkpoint retained`.
 
 Review every report before sharing. Configuration inspection, agent goals, module documents and Discord content can contain private data even when credentials are excluded. Do not attach raw environment dumps, database files, connection URLs, bot/provider keys, unrestricted stderr, panic payloads or provider responses. Module stderr is untrusted and may contain secrets. Share a redacted description and a source fixture instead. Keep original logs and generated qualification reports private and ignored.
+
+## Live canary failures
+
+The release canary intentionally mutates a disposable Discord guild. With a private credentials file containing `DISCORD_TOKEN` and `GUILD_ID`, run:
+
+```sh
+python3 scripts/check-discord-live.py --execute --env-file /private/path
+```
+
+Inspect `target/stage5-live/run-*/report.json` and the associated canary report before retrying a failed or interrupted run. The check creates nonce-named fixture commands and structure resources, checks live Gateway startup/shutdown and shared structure receipts, and cleans up only resources it owns. A timeout does not prove cleanup finished. Confirm the recorded cleanup/postflight results against the disposable guild; preserve uncertain or incomplete records and remove only positively identified canary resources. Do not delete unrelated resources or blindly repeat a create after an uncertain result.
+
+Reports remain private and ignored. This check makes no paid model calls and proves no human slash-command invocation. Use its report only for its recorded live Gateway, command and structure scope.

@@ -30,6 +30,18 @@ This is the supported candidate surface and the evidence required to mark it tes
 
 Gemini profile identifiers are accepted configuration choices, not a guarantee of current provider availability. There is no implicit model fallback. Record the exact model/API, prompt and price revisions and usage for each evaluation. Missing, stale or unavailable evidence remains unqualified. macOS, Windows, multi-host operation, arbitrary native targets and other model/backend versions are not implied by this matrix.
 
+## Bounded live Discord check
+
+Use a disposable guild and a private file containing literal `DISCORD_TOKEN=...` and `GUILD_ID=...` assignments. The file is parsed as data, never sourced by a shell. Run this separately when you intend to create and clean up live fixture resources:
+
+```sh
+python3 scripts/check-discord-live.py --execute --env-file /private/path
+```
+
+The runner builds the canary and writes `target/stage5-live/run-*/report.json`. Supply that report to the release runner's `--discord-evidence` option. The canary checks Gateway readiness/shutdown, nonce-named command creation/readback/deletion, and shared structure planning, application, receipt readback and repeated no-op behavior. It verifies cleanup of its owned resources and preservation of the surrounding inventory. It does not call Gemini or load an existing deployment.
+
+This proves the listed live adapter paths. It does **not** exercise a human slash-command invocation, real moderation-event logging coverage, or Gemini against live Discord. Those remain separately described evidence scopes; do not relabel this canary as those checks. A failed or interrupted run requires cleanup inspection before another attempt; see [operations](OPERATIONS.md#live-canary-failures).
+
 ## Release decision
 
 Require passing deterministic authority/adversarial checks with **zero unauthorized effects**, both database drills, executable unload/reaping, joined shutdown, durable restart recovery, and reproducible module staging/reload/upgrade. Verify the framework starts with zero feature modules installed and AI disabled without a provider key. Review measured resource limits for the recorded workload rather than inventing universal throughput or memory limits.
