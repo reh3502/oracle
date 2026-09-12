@@ -83,11 +83,13 @@ def main():
     q.report.update(scope="bounded live Discord canary; no model calls", runtime_sources=stage5.runtime_sources(),
                     canary_sources=canary_sources())
     raw = folder / "canary.json"
+    q.report["canary_report"] = str(raw)
+    q.save()
     try:
         q.command("build-canary", ["cargo", "build", "--locked", "-p", "oracle-discord", "--example", "stage5_live"])
         binary = ROOT / "target/debug/examples/stage5_live"
         q.report["binary_sha256"] = stage5.digest(binary)
-        q.command("live-canary", [binary, "--execute", raw], secrets, timeout=600)
+        q.command("live-canary", [binary, "--execute", raw], secrets, timeout=900)
         validate_report(json.loads(raw.read_text()))
         q.report.update(canary_report=str(raw), canary_sha256=stage5.digest(raw))
         q.report["source_changed"] = q.report["source_sha256"] != stage5.stage4.stage3.snapshot()
@@ -97,6 +99,8 @@ def main():
         q.report.update(passed=False, error=type(error).__name__)
         print("Canary failed; inspect the local report for cleanup status. Do not blindly retry.", file=sys.stderr)
     finally:
+        if raw.is_file():
+            q.report["canary_sha256"] = stage5.digest(raw)
         q.save()
         print(folder / "report.json")
     return 0 if q.report["passed"] else 1
