@@ -1,0 +1,475 @@
+use super::*;
+use dandys_world_core::{
+    model::{CatalogData, SOURCE_ORIGIN},
+    query::QueryResponse,
+};
+use oracle_module_sdk::CancellationToken;
+use oracle_rpc::{RpcHandler, RpcPeer};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
+const NOW: u64 = 1_800_000_000_000;
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+struct Temp(PathBuf);
+impl Temp {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "dw-module-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+fn catalog() -> CatalogData {
+    serde_json::from_value(json!({
+        "schema_version":1,"adapter_version":"synthetic-module-fixture","source_origin":SOURCE_ORIGIN,
+        "crawl_started_at":"2026-09-12T00:00:00Z","crawl_completed_at":"2026-09-12T00:01:00Z",
+        "sources":[{"id":"page:1","page_id":1,"title":"Fixture Rock","url":format!("{SOURCE_ORIGIN}/wiki/Fixture_Rock"),"revision_id":2,"revision_timestamp":"2026-09-12T00:00:00Z","validated_at_ms":NOW,"content_sha256":"a".repeat(64),"license":"CC BY-SA 3.0","license_url":"https://creativecommons.org/licenses/by-sa/3.0/"}],
+        "entities":[{"id":"toon:fixture","kind":"toon","name":"Fixture Rock","aliases":["Rock"],"availability":"supported","warnings":[],"facts":[{"id":"fixture.health","key":"health","text":"Fixture hearts","value":2,"unit":"hearts","conditions":["base"],"state":"supported","citations":[{"source_id":"page:1","section":"Fixture stats","quote":"Two fixture hearts"}]}],"relationships":[]}],
+        "coverage":{"discovered_pages":1,"imported_pages":1,"namespace_counts":{"articles":1},"nonredirect_articles":1,"redirects":0,"entities_by_kind":{"toon":1},"excluded":[],"unresolved_redirects":[],"warnings":[]}
+    })).unwrap()
+}
+fn response(catalog: CatalogData, request: QueryRequest, now: u64) -> QueryResponse {
+    QueryEngine::new("fixture-snapshot".into(), Arc::new(catalog))
+        .execute(request, now)
+        .unwrap()
+}
+fn lookup(offset: usize) -> QueryRequest {
+    QueryRequest::Lookup {
+        name: "Fixture Rock".into(),
+        kind: Some(dandys_world_core::model::Kind::Toon),
+        field: None,
+        offset,
+    }
+}
+fn assert_bounded(reply: &presentation::Reply) {
+    assert!(reply.text.encode_utf16().count() <= 1800);
+    assert!(reply.citations.len() <= 5);
+    let rendered = format!(
+        "{}{}",
+        reply.text,
+        reply
+            .citations
+            .iter()
+            .map(|c| format!(
+                "\n[{}]({SOURCE_ORIGIN}/index.php?oldid={})",
+                c.label, c.revision
+            ))
+            .collect::<String>()
+    );
+    assert!(
+        rendered.encode_utf16().count() <= 1900,
+        "{}",
+        rendered.len()
+    );
+}
+struct Host(AtomicUsize);
+#[async_trait]
+impl RpcHandler for Host {
+    async fn handle(
+        &self,
+        _peer: RpcPeer,
+        _method: String,
+        _params: Value,
+        _cancel: CancellationToken,
+    ) -> Result<Value> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(RpcError::Remote("No callbacks permitted".into()))
+    }
+}
+struct Harness {
+    peer: RpcPeer,
+    task: tokio::task::JoinHandle<Result<()>>,
+    host: Arc<Host>,
+}
+impl Harness {
+    fn new(module: Arc<DwModule>) -> Self {
+        let (a, b) = tokio::io::duplex(65536);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let host = Arc::new(Host(AtomicUsize::new(0)));
+        let peer = RpcPeer::new(ar, aw, host.clone());
+        let task = tokio::spawn(oracle_module_sdk::serve_streams(module, br, bw));
+        Self { peer, task, host }
+    }
+    async fn call(&self, method: &str, input: Value) -> Result<Value> {
+        self.peer.call(method, input, Duration::from_secs(5)).await
+    }
+    async fn hello(&self) {
+        assert_eq!(
+            self.call(
+                "hello",
+                json!({"protocol_major":1,"protocol_minor":1,"session":"dw-test","generation":7})
+            )
+            .await
+            .unwrap()["protocol_minor"],
+            1
+        );
+    }
+    async fn initialize(&self, runtime: Value) -> Result<Value> {
+        self.call(
+            "initialize",
+            json!({"session":"dw-test","generation":7,"mode":"normal","runtime":runtime}),
+        )
+        .await
+    }
+    async fn invoke(&self, operation: &str, input: Value) -> Result<Value> {
+        self.call("operation.invoke",json!({"invocation":"opaque-test","session":"dw-test","generation":7,"guild":"123","epoch":2,"operation":operation,"input":input})).await
+    }
+    async fn close(self) {
+        self.call("shutdown", json!({})).await.unwrap();
+        assert_eq!(self.host.0.load(Ordering::SeqCst), 0);
+        self.peer.close().await;
+        self.task.await.unwrap().unwrap();
+    }
+}
+#[tokio::test]
+async fn sdk_lifecycle_requires_snapshot_and_fences_queries_without_callbacks() {
+    let dir = Temp::new();
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    assert!(
+        h.invoke("lookup", json!({"name":"Fixture Rock"}))
+            .await
+            .is_err()
+    );
+    assert!(
+        h.initialize(json!({}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("data_directory")
+    );
+    assert!(
+        h.initialize(json!({"data_directory":"relative"}))
+            .await
+            .is_err()
+    );
+    assert!(h.initialize(json!({"data_directory":dir.0})).await.is_err());
+    let mut data = catalog();
+    data.sources[0].validated_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    h.call("activate", json!({"guild":"123","epoch":2}))
+        .await
+        .unwrap();
+    let reply = h
+        .invoke("lookup", json!({"name":"Fixture Rock","field":"health"}))
+        .await
+        .unwrap();
+    assert!(
+        reply["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Value: 2")
+    );
+    assert_eq!(reply["reply"]["citations"][0]["revision"], 2);
+    assert!(
+        h.invoke("lookup", json!({"name":"Fixture Rock","op":"status"}))
+            .await
+            .is_err()
+    );
+    h.call("quiesce", json!({"guild":"123"})).await.unwrap();
+    assert!(h.invoke("status", json!({})).await.is_err());
+    h.close().await;
+    assert!(module.query("status", json!({}), NOW).is_err());
+}
+#[tokio::test]
+async fn loaded_catalog_remains_immutable_until_next_initialization() {
+    let dir = Temp::new();
+    let store = Store::new(&dir.0).unwrap();
+    let mut data = catalog();
+    store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    data.entities[0].facts[0].value = json!(9);
+    store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    assert!(
+        module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Value: 2")
+    );
+    h.close().await;
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    assert!(
+        module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Value: 9")
+    );
+    h.close().await;
+}
+#[test]
+fn manifest_exposes_only_typed_member_routes_and_private_health() {
+    let m = DwModule::default().manifest();
+    assert_eq!(m.id.as_str(), "community.dandys-world");
+    assert_eq!(m.manifest_version, 2);
+    assert_eq!(m.protocol_minor_min, 1);
+    assert!(m.runtime.unwrap().data_directory_required);
+    assert!(m.capabilities.is_empty());
+    assert!(
+        m.operations
+            .iter()
+            .all(|o| o.capabilities.is_empty() && o.ai.is_none())
+    );
+    let routes = m.commands.unwrap().routes;
+    assert_eq!(routes.len(), 6);
+    for route in routes {
+        assert_ne!(route.operation, "health");
+        assert!(matches!(
+            route.input,
+            Some(oracle_contracts::ModuleCommandInput::Typed { .. })
+        ));
+        assert_eq!(
+            m.operations
+                .iter()
+                .find(|o| o.name == route.operation)
+                .unwrap()
+                .audience,
+            oracle_contracts::ModuleAudience::MemberRead
+        );
+    }
+    assert_eq!(
+        m.operations
+            .iter()
+            .find(|o| o.name == "health")
+            .unwrap()
+            .audience,
+        oracle_contracts::ModuleAudience::Operator
+    );
+    for (operation, input) in [
+        ("lookup", json!({"name":"Rock","surprise":1})),
+        ("lookup", json!({"name":42})),
+        ("search", json!({"query":"x","limit":1.5})),
+        ("sources", json!({"offset":-1})),
+        ("status", json!({"op":"lookup"})),
+        ("unknown", json!({})),
+    ] {
+        assert!(request(operation, input).is_err());
+    }
+}
+#[test]
+fn renderer_keeps_complete_fact_conditions_and_evidence() {
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(catalog(), req.clone(), NOW));
+    assert!(reply.text.contains("Fixture hearts"));
+    assert!(reply.text.contains("Conditions: base"));
+    assert!(reply.text.contains("Value: 2"));
+    assert_eq!(reply.citations[0].revision, 2);
+    assert_bounded(&reply);
+}
+#[test]
+fn renderer_does_not_claim_conflicting_or_stale_values() {
+    let mut data = catalog();
+    data.entities[0].facts[0].state = dandys_world_core::model::EvidenceState::Conflicting;
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(reply.text.contains("Conflicting"));
+    assert!(!reply.text.contains("Value: 2"));
+    assert!(!reply.text.contains("Fixture hearts"));
+    assert_eq!(reply.citations.len(), 1);
+    assert_bounded(&reply);
+    let reply = presentation::render(
+        &req,
+        &response(catalog(), req.clone(), NOW + 8 * 86_400_000),
+    );
+    assert!(!reply.text.contains("Value: 2"));
+    assert!(reply.text.contains("seven days"));
+    assert_bounded(&reply);
+}
+#[test]
+fn oversized_fact_falls_back_without_truncating_claim_and_offers_next_offset() {
+    let mut data = catalog();
+    data.entities[0].facts[0].text = "oversized claim ".repeat(200);
+    let mut second = data.entities[0].facts[0].clone();
+    second.id = "second".into();
+    second.key = "z_field".into();
+    second.text = "Second complete fact".into();
+    data.entities[0].facts.push(second);
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data.clone(), req.clone(), NOW));
+    assert!(!reply.text.contains("oversized claim"));
+    assert!(reply.text.contains("consult the linked wiki"));
+    assert!(reply.text.contains("offset:1"));
+    assert_eq!(reply.citations.len(), 1);
+    assert_bounded(&reply);
+    let req = lookup(1);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(reply.text.contains("Second complete fact"));
+    assert!(!reply.text.contains("offset:"));
+    assert_bounded(&reply);
+}
+#[test]
+fn lookup_and_sources_pagination_use_number_actually_shown() {
+    let mut data = catalog();
+    let base = data.entities[0].facts[0].clone();
+    data.entities[0].facts.clear();
+    for i in 0..8 {
+        let mut fact = base.clone();
+        fact.id = format!("f{i}");
+        fact.key = format!("field{i}");
+        fact.text = format!("Full fact {i}: {}", "detail ".repeat(50));
+        data.entities[0].facts.push(fact);
+    }
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    let count = (0..8)
+        .filter(|i| reply.text.contains(&format!("Full fact {i}:")))
+        .count();
+    assert!(count > 0 && count < 8);
+    assert!(reply.text.contains(&format!("offset:{count}")));
+    assert_bounded(&reply);
+    let mut data = catalog();
+    let base = data.sources[0].clone();
+    for i in 1..9 {
+        let mut source = base.clone();
+        source.id = format!("page:{i}");
+        source.revision_id = 10 + i;
+        source.page_id = 10 + i;
+        source.title = format!("Fixture source {i}");
+        data.sources.push(source);
+    }
+    let req = QueryRequest::Sources {
+        name: None,
+        kind: None,
+        offset: 0,
+    };
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert_eq!(reply.citations.len(), 5);
+    assert!(reply.text.contains("offset:5"));
+    assert_bounded(&reply);
+}
+#[test]
+fn excessive_evidence_uses_navigation_fallback_without_partial_fact() {
+    let mut data = catalog();
+    let base = data.sources[0].clone();
+    let citation = data.entities[0].facts[0].citations[0].clone();
+    for i in 2..=6 {
+        let mut source = base.clone();
+        source.id = format!("page:{i}");
+        source.revision_id = i + 10;
+        data.sources.push(source.clone());
+        let mut c = citation.clone();
+        c.source_id = source.id;
+        data.entities[0].facts[0].citations.push(c);
+    }
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(!reply.text.contains("Fixture hearts"));
+    assert!(reply.text.contains("No game fact"));
+    assert_eq!(reply.citations.len(), 1);
+    assert_bounded(&reply);
+}
+#[test]
+fn comparisons_keep_both_complete_sides_or_show_no_claim() {
+    let mut data = catalog();
+    let mut other = data.entities[0].clone();
+    other.id = "toon:other".into();
+    other.name = "Other Rock".into();
+    other.aliases.clear();
+    other.facts[0].id = "other.health".into();
+    other.facts[0].value = json!(3);
+    data.entities.push(other);
+    let req = QueryRequest::Compare {
+        left: "toon:fixture".into(),
+        right: "toon:other".into(),
+        field: Some("health".into()),
+    };
+    let reply = presentation::render(&req, &response(data.clone(), req.clone(), NOW));
+    assert!(reply.text.contains("Value: 2") && reply.text.contains("Value: 3"));
+    assert_bounded(&reply);
+    data.entities[1].facts[0].text = "huge ".repeat(400);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(!reply.text.contains("Value: 2") && !reply.text.contains("Value: 3"));
+    assert_bounded(&reply);
+}
+#[test]
+fn optional_full_catalog_human_reply_qualification() {
+    let Ok(path) = std::env::var("DW_TEST_CATALOG") else {
+        return;
+    };
+    let data: CatalogData = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let now = data
+        .sources
+        .iter()
+        .map(|s| s.validated_at_ms)
+        .max()
+        .unwrap()
+        + 1;
+    let engine = QueryEngine::new("full-catalog".into(), Arc::new(data.clone()));
+    let cases = [
+        (
+            "lookup",
+            json!({"name":"Pebble","kind":"toon","field":"health"}),
+        ),
+        ("lookup", json!({"name":"Twisted Pebble","field":"speed"})),
+        (
+            "lookup",
+            json!({"name":"Bone","kind":"trinket","field":"effect"}),
+        ),
+        ("ask", json!({"question":"How does research work?"})),
+        ("search", json!({"query":"Pebble"})),
+        ("sources", json!({"name":"Pebble","kind":"toon"})),
+        ("status", json!({})),
+    ];
+    for (operation, input) in cases {
+        let req = request(operation, input).unwrap();
+        let reply = presentation::render(&req, &engine.execute(req.clone(), now).unwrap());
+        println!("{operation}: {}", reply.text);
+        assert_bounded(&reply);
+    }
+    // Every entity's lookup start and each distinct field must produce a bounded reply.
+    for entity in &data.entities {
+        let mut fields: std::collections::BTreeSet<_> =
+            entity.facts.iter().map(|f| Some(f.key.clone())).collect();
+        fields.insert(None);
+        for field in fields {
+            let req = QueryRequest::Lookup {
+                name: entity.id.clone(),
+                kind: None,
+                field,
+                offset: 0,
+            };
+            let reply = presentation::render(&req, &engine.execute(req.clone(), now).unwrap());
+            assert_bounded(&reply);
+        }
+    }
+}
+#[test]
+fn out_of_range_revision_fails_closed_without_uncited_claim() {
+    let mut data = catalog();
+    data.sources[0].revision_id = u64::MAX;
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(reply.text.contains("cannot be displayed safely"));
+    assert!(!reply.text.contains("Fixture hearts"));
+    assert!(reply.citations.is_empty());
+    assert_bounded(&reply);
+}
