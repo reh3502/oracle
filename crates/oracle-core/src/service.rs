@@ -104,6 +104,30 @@ impl CoreService {
             Err(Error::new(ErrorCode::ForbiddenPermission))
         }
     }
+    /// Verify authenticated membership, known guild scope, and unpaused state.
+    pub async fn authorize_member_read(
+        &self,
+        context: &crate::member_read::MemberContext,
+        guild: &GuildId,
+    ) -> Result<()> {
+        // Authenticated membership is distinct from operator authorization.
+        let actor = PolicyContext::Discord {
+            guild: context.guild.clone(),
+            user: context.user.clone(),
+            manage_guild: false,
+        };
+        self.authorize(&actor, Some(guild), false)?;
+        let status = self.repository.status(Some(guild)).await?;
+        if status
+            .guilds
+            .iter()
+            .any(|state| &state.guild == guild && !state.paused)
+        {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorCode::ForbiddenPermission))
+        }
+    }
     /// Updated by the runtime registry after publication and fencing.
     pub fn set_module_inventory(&self, modules: BTreeMap<ModuleId, BTreeSet<GuildId>>) {
         *self.modules.write().unwrap() = modules;

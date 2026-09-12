@@ -3,6 +3,7 @@
 pub use oracle_contracts::*;
 pub mod tasks;
 
+pub mod member_read;
 mod module_repository;
 mod repository;
 mod service;

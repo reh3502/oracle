@@ -308,6 +308,66 @@ fn setup(mode: AdapterMode) -> (CoreService, Arc<MemoryRepository>, Adapter) {
 }
 
 #[tokio::test]
+async fn member_read_is_distinct_from_operator_and_respects_pause_and_scope() {
+    let repository = Arc::new(MemoryRepository::new());
+    let service = CoreService::new(
+        repository.clone(),
+        vec![GuildPolicy {
+            guild: guild_a(),
+            operators: vec![operator()],
+        }],
+    );
+    let member = member_read::MemberContext {
+        guild: guild_a(),
+        user: UserId::new("30").unwrap(),
+        channel: "40".into(),
+        roles: Default::default(),
+        observed_at: std::time::Instant::now(),
+    };
+    service
+        .authorize_member_read(&member, &guild_a())
+        .await
+        .unwrap();
+    let actor = PolicyContext::Discord {
+        guild: guild_a(),
+        user: member.user.clone(),
+        manage_guild: false,
+    };
+    assert_eq!(
+        service
+            .authorize_module(&actor, &guild_a())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ForbiddenPermission
+    );
+    assert_eq!(
+        service
+            .authorize_member_read(&member, &guild_b())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ForbiddenScope
+    );
+    repository
+        .records
+        .lock()
+        .unwrap()
+        .guilds
+        .get_mut(&guild_a())
+        .unwrap()
+        .paused = true;
+    assert_eq!(
+        service
+            .authorize_member_read(&member, &guild_a())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ForbiddenPermission
+    );
+}
+
+#[tokio::test]
 async fn cross_guild_and_unscoped_discord_requests_never_reach_repository_or_adapter() {
     let (service, repository, adapter) = setup(AdapterMode::Success);
     let cancel = CancellationToken::new();
