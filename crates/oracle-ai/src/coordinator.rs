@@ -441,7 +441,7 @@ impl Coordinator {
         }
         Ok(evidence)
     }
-    async fn stop_budget(
+    async fn stop_with_receipts(
         &self,
         context: &PolicyContext,
         mut saved: SavedRun,
@@ -517,7 +517,9 @@ impl Coordinator {
         loop {
             self.checkpoint(context, &saved, &cancel).await?;
             if let Err(error) = saved.run.budget.check(&saved.run.limits, now()) {
-                return self.stop_budget(context, saved, &error.to_string()).await;
+                return self
+                    .stop_with_receipts(context, saved, &error.to_string())
+                    .await;
             }
             // Rebuild from trusted receipts at a completed round boundary. Raw native
             // reasoning is discarded, never translated into a trusted instruction.
@@ -574,7 +576,9 @@ impl Coordinator {
             ) {
                 Ok(reservation) => reservation,
                 Err(error) => {
-                    return self.stop_budget(context, saved, &error.to_string()).await;
+                    return self
+                        .stop_with_receipts(context, saved, &error.to_string())
+                        .await;
                 }
             };
             let admitted_at = now();
@@ -676,7 +680,7 @@ impl Coordinator {
                 }
                 Err(_) => {
                     return self
-                        .stop(saved, RunStatus::Paused, "provider_attempt_failed")
+                        .stop_with_receipts(context, saved, "provider_attempt_failed")
                         .await;
                 }
             };
@@ -748,7 +752,9 @@ impl Coordinator {
                 turn.calls.len().try_into().map_err(|_| integrity())?,
                 now(),
             ) {
-                return self.stop_budget(context, saved, &error.to_string()).await;
+                return self
+                    .stop_with_receipts(context, saved, &error.to_string())
+                    .await;
             }
             saved.run.status = RunStatus::Executing;
             self.runs.save(&mut saved, now()).await?;

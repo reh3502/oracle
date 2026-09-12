@@ -15,6 +15,7 @@ struct Provider {
     turns: Mutex<VecDeque<Vec<ToolCall>>>,
     sends: AtomicUsize,
     failures: AtomicUsize,
+    failure_after: AtomicUsize,
     failure: Mutex<ProviderError>,
     requests: Mutex<Vec<(String, String, bool, usize)>>,
 }
@@ -44,13 +45,14 @@ impl ModelProvider for Provider {
         _: PreparedTurn,
         _: &CancellationToken,
     ) -> std::result::Result<ModelTurn, ProviderError> {
-        self.sends.fetch_add(1, Ordering::SeqCst);
-        if self
-            .failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_ok()
+        let previous_sends = self.sends.fetch_add(1, Ordering::SeqCst);
+        if previous_sends >= self.failure_after.load(Ordering::SeqCst)
+            && self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
         {
             return Err(self.failure.lock().unwrap().clone());
         }
@@ -222,6 +224,7 @@ async fn setup(
         turns: Mutex::new(turns.into()),
         sends: AtomicUsize::new(0),
         failures: AtomicUsize::new(0),
+        failure_after: AtomicUsize::new(0),
         failure: Mutex::new(ProviderError::Transient),
         requests: Mutex::new(vec![]),
     });
@@ -879,6 +882,67 @@ async fn operational_failure_is_a_durable_paused_diagnostic() {
     assert_eq!(result.run.status, RunStatus::Paused);
     assert_eq!(result.run.problem.as_deref(), Some("host_error:Conflict"));
     assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn provider_failure_preserves_receipt_verified_completion() {
+    for failure in [
+        ProviderError::RejectedToolCall {
+            reason: crate::provider::ToolCallRejection::UnknownTool,
+            usage: Some(Usage {
+                total_tokens: Some(5),
+                ..Default::default()
+            }),
+        },
+        ProviderError::Transport,
+        ProviderError::ProtocolMismatch,
+    ] {
+        for required in [1, 2] {
+            let (_folder, _storage, coordinator, provider, host, guild) = setup(
+                vec![vec![call("verified")]],
+                required,
+                false,
+                false,
+                false,
+                4,
+            )
+            .await;
+            *provider.failure.lock().unwrap() = failure.clone();
+            provider.failure_after.store(1, Ordering::SeqCst);
+            provider.failures.store(4, Ordering::SeqCst);
+            let saved = coordinator
+                .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
+                .await
+                .unwrap();
+            assert_eq!(
+                saved.run.status,
+                if required == 1 {
+                    RunStatus::Succeeded
+                } else {
+                    RunStatus::Paused
+                }
+            );
+            assert_eq!(
+                saved.run.problem.as_deref(),
+                Some(if required == 1 {
+                    "receipt_verified"
+                } else {
+                    "provider_attempt_failed"
+                })
+            );
+            assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider.sends.load(Ordering::SeqCst),
+                if failure == ProviderError::ProtocolMismatch {
+                    2
+                } else {
+                    4
+                }
+            );
+            assert!(saved.run.budget.pending.is_none());
+            assert!(saved.run.pending_spend.is_none());
+        }
+    }
 }
 
 #[tokio::test]
