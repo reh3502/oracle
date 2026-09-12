@@ -65,3 +65,9 @@ python3 scripts/check-module-dev.py
 ```
 
 The check creates and later removes a temporary SQLite deployment with no Discord configuration, scrubs provider/bot credential variables from subprocesses, starts one host, and runs two real trusted counter reloads followed by an explicit v2 upgrade. It verifies persistent value 7, fresh generation/epoch after both replacement paths, automatic restoration of activation, and an unchanged host PID/deployment. Read-only checks of this disposable SQLite file confirm `{ "count": 7 }` became `{ "total": 7 }`, namespace and document data versions are 2, and migration checkpoints are cleared. A subsequent ordinary v1 reload must be rejected before mutation while the v2 module continues serving value 7. Finally the check sends SIGTERM and requires joined shutdown with zero remaining tracked tasks. Reports and host logs remain under `.local/module-dev/checks/`; no existing deployment or `.env` file is used.
+
+## Authoring and release checks
+
+The [SDK guide](../../crates/oracle-module-sdk/README.md) defines the source, wire and data compatibility policy and a module-author checklist. The [activity-log module](activity-log/README.md) demonstrates a separately installed configurable event consumer; the configuration probe is a qualification fixture. Neither is installed by a normal host build or initialization.
+
+Use the reload drill above for reproducible local development, then qualify the module against the exact host revision, target and both storage backends you intend to support. Successful staging proves artifact provenance and packaging only. It does not prove lifecycle behavior, authorization, migration safety or live event coverage. Keep release evidence private under ignored paths and follow the [release gates](../../RELEASE.md).

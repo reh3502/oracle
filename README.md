@@ -162,6 +162,8 @@ Keep backup files private, copy them to separate storage, and periodically repea
 
 ## Development and qualification
 
+Use the [operations guide](OPERATIONS.md) for deployment updates and failure diagnostics, the [release guide](RELEASE.md) for qualification and the tested-matrix policy, and the [SDK compatibility policy](crates/oracle-module-sdk/README.md#compatibility-policy) when shipping modules. Live evidence and measured resource limits belong to the exact candidate revision; supported configuration is not itself a release qualification.
+
 Start with the [contributor guide](CONTRIBUTING.md) for the crate map, architecture rules, and everyday checks. Run `python3 scripts/check.py` for the local developer gate. Python 3.11 or newer is required for the check scripts.
 
 Production crates separate value contracts, policy/orchestration, SQL repositories, Discord presentation and the executable composition root. The pinned Serenity upstream revision and minimal patch are reproduced by `scripts/prepare-serenity.py`; unexpected local fork edits are preserved and rejected for review.

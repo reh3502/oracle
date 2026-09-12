@@ -11,3 +11,33 @@ The handshake order is `hello`, `initialize`, then `activate` before normal invo
 `quiesce` fences and joins either one guild or the whole module. `deactivate` fences the guild before its hook. `shutdown` drains scopes and runs the shutdown hook before acknowledging. The host closes stdin after this response, and `serve_stdio` exits after transport handlers and scopes are joined. Unexpected EOF also drains scopes. Health reports safe task counts globally and per guild; payloads and panic text are excluded.
 
 The executable examples live under `examples/modules/counter` and `examples/modules/dependent`. SDK tests use real duplex framed transport to cover scoped callbacks, retained-context expiry, migration mode isolation, per-guild quiescence, epoch fencing, and task joining. Host packaging, installation, bindings and process-group cleanup are tested separately by the host manager.
+
+## Compatibility policy
+
+The Rust SDK is a source API, currently workspace version `0.1.0` and unpublished. Pin SDK and contract dependencies to a reviewed Oracle commit and keep your lockfile. No stable Rust binary ABI, independently published crate support window, or automatic compatibility across source revisions is promised. Rebuild and run the module contract/lifecycle suite when updating that pin. Any future source API break must be documented with migration instructions before declaring a supported release.
+
+The process contract is versioned separately from the crate version:
+
+| Field | Current acceptance rule |
+| --- | --- |
+| `manifest_version` | Exactly `1` |
+| `protocol_major` | Exactly `1` |
+| `protocol_minor_min` | Exactly `0`; this host does not negotiate later minors |
+| `host_api` | Valid SemVer requirement matching `1.0.0` |
+| `target` | Exact host target triple; example staging targets `x86_64-unknown-linux-gnu` |
+| `version` | Valid module SemVer; independent of document schema version |
+| Provided/consumed contracts | Explicit contract name and SemVer compatibility, plus a valid guild binding |
+
+Unknown manifest fields are rejected. Do not assume adding a field is backward-compatible. A breaking wire change requires a new major and explicit host/module support; extensions require qualification on both sides before claiming compatibility. Installation checks a manifest and artifact, and execution still requires a matching handshake, fresh identity and granted capabilities. A successful install alone does not qualify module behavior.
+
+Document data versions are an independent persistence contract. Declare the current version, readable versions and explicit forward migration steps; the current version must be readable and future readable versions are invalid. The host refuses unsafe downgrades and preserves migration checkpoints. Advertising a readable older schema does not itself implement reverse migration or authorize loading against newer data. Keep old packages and a verified backup before upgrades; test interruption and resumption on both supported databases.
+
+## Author a module
+
+Start from the [counter or dependent executable](../../examples/modules/README.md) and its manifest, retaining the SDK transport and tracked scopes. Give your module a unique ID and declare bounded input/output schemas, operation deadlines, own-document collections and only needed capabilities. Explicitly declare dependencies, commands, event subscriptions and required intents. Keep Discord credentials, SQL and arbitrary outbound effect transport in the host; use scoped SDK callbacks. AI metadata currently exposes reviewed inspection operations and cannot grant authority.
+
+Use document revisions for compare-and-swap updates and handle conflicts explicitly. Do not persist invocation contexts or spawn detached work: callbacks expire with their invocation and quiescence fences scopes. Keep stdout exclusively for framed RPC. Log only bounded, redacted diagnostics to stderr. A native module can bypass SDK discipline, so installation remains an explicit operator trust decision.
+
+For configurable modules, implement the declared configuration hooks and report the actual applied revision. Validate schemas and destination requirements before claiming success. For event consumers, bound queues and retained data, deduplicate stable event IDs, expose drops and coverage gaps, and provide maintenance for expiry. The [activity-log example](../../examples/modules/activity-log/README.md) demonstrates configuration, retention and delivery receipts.
+
+Before distributing a package, test schema rejection, missing grants/dependencies, cross-guild denial, invocation cancellation, stale callbacks, crash recovery, graceful/forced unload and upgrade interruption. Exercise real host install/load/activate/invoke/deactivate/unload, then restart and isolated restore. Keep modules separately distributed; adding an example must not install it into a default host. Package trusted executable bytes with their manifest, checksum and source/license provenance using the [development workflow](../../examples/modules/README.md). Record target/toolchain and qualification results under the [release policy](../../RELEASE.md).

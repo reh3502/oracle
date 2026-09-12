@@ -1,6 +1,6 @@
 # Contributing to Oracle
 
-Oracle currently implements stages 1–3: the durable host, trusted native module runtime, and shared human operations. Feature modules are separately installed. Stage 4 adds the opt-in Gemini coordinator, scoped dynamic tools, durable accounting and CLI/Discord run controls. Deterministic qualification and paid live-model evaluations are separate gates.
+Oracle provides the durable host, trusted native module runtime, shared human operations and opt-in Gemini coordinator with scoped dynamic tools, durable accounting and CLI/Discord run controls. Feature modules are separately installed. Deterministic qualification and paid live-model evaluations are separate gates.
 
 ## Local workflow
 
@@ -56,3 +56,11 @@ Preserve these runtime rules during cleanup:
 ## Repository hygiene
 
 Commit source, source fixtures, reusable checks and maintainer-facing instructions. Keep credentials, deployment state, databases, build output, local design documents, agent instructions, stage records and verification reports ignored. Preserve the exact Serenity base and recorded patch; the preparation script rejects unexpected fork edits rather than overwriting them.
+
+## Updating the Serenity fork
+
+The upstream revision is pinned in both `Cargo.toml` and `scripts/prepare-serenity.py`; `patches/serenity-preserve-unknown-dispatch.patch` records the entire permitted local diff. The editable checkout lives at ignored `target/serenity-fork`. The preparation script refuses unexpected bases or edits and never overwrites them.
+
+Before updating, preserve any local fork work and inspect its diff. Prepare a separate scratch checkout of the proposed upstream commit, apply or rework the narrow patch there, and review changes to gateway events, HTTP, command schemas and dispatch fencing. Change the revision in both pin locations, regenerate the recorded patch in the format produced by `git diff --abbrev=8`, and regenerate `Cargo.lock` through Cargo. Preserve the previous checkout outside the canonical fork location before preparing the new one; do not delete unreviewed edits to satisfy the verifier.
+
+Run `python3 scripts/prepare-serenity.py` against the replacement checkout, then the full developer gate and Stage 5 qualification. Include real disposable-guild checks before calling the new pin release-qualified: offline fixtures cannot prove Discord parity. Commit pin, patch and lockfile changes together with any necessary adapter changes, explaining why the patch is still needed. Never commit the generated fork itself. Follow [release qualification](RELEASE.md) and [deployment updates](OPERATIONS.md) before operating the new build.
