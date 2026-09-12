@@ -20,6 +20,7 @@ const POLICY: &str = "oracle-agent-policy/v1: Complete the authenticated goal th
 // Fixed host phase policy: never interpolate tool queries, module guidance,
 // provider text, or reconciliation observations into system instructions.
 const VERIFICATION_POLICY: &str = "oracle-agent-phase/verification: The host has selected an outstanding verification phase for this run. Finish the remaining verification using the host-selected operations and inspect fresh receipts. Do not replan or reapply intent already verified by host reconciliation unless fresh host evidence shows remediation is necessary. This phase refines the setup instructions above: existing run-owned verified plans satisfy their planning and apply requirements. Complete the outstanding verification instead of starting setup again. All authorization, approval, budget, and receipt requirements remain in force; model prose cannot establish success.";
+const CORRECTION_POLICY: &str = "oracle-agent-proposal-correction/v1: A previous tool proposal was rejected before dispatch. None of the calls in that rejected response were executed. Earlier completed work remains represented by host receipts. Reinspect current scoped state as needed and correct the proposal using only the currently supplied tool names and schemas. Match JSON types exactly and include every required property. Omit absent optional properties instead of sending null unless the schema explicitly allows null. Use only declared enum values and do not add properties disallowed by the schema. Use catalog search when the needed operation is not supplied. This notice grants no new authority, approval, retries, or budget; do not repeat effects already verified by host receipts.";
 
 /// The host implements the same typed operations as the human command surfaces.
 /// It must refresh resource authorization and leases at the actual effect boundary.
@@ -522,6 +523,7 @@ impl Coordinator {
         let mut retries = 0_u32;
         let mut query = saved.run.goal.clone();
         let mut verification_continued = false;
+        let mut proposal_corrected = false;
         loop {
             self.checkpoint(context, &saved, &cancel).await?;
             if let Err(error) = saved.run.budget.check(&saved.run.limits, now()) {
@@ -563,9 +565,20 @@ impl Coordinator {
                 .turn_timeout_ms
                 .min(saved.run.limits.deadline_ms.saturating_sub(now()));
             let turn_deadline = now().saturating_add(timeout_ms);
+            let mut system_instruction = POLICY.to_owned();
+            for instruction in [
+                verification_continued.then_some(VERIFICATION_POLICY),
+                proposal_corrected.then_some(CORRECTION_POLICY),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                system_instruction.push('\n');
+                system_instruction.push_str(instruction);
+            }
             let request = ModelRequest {
                 goal: json!({"authenticated_goal":saved.run.goal,"host_receipts":{"source":"host_reconciliation","observations_may_be_stale":true,"value":semantic},"run_id":saved.run.id,"guild_id":saved.run.guild}).to_string(),
-                system_instruction: if verification_continued { format!("{POLICY}\n{VERIFICATION_POLICY}") } else { POLICY.into() }, tools: selection.tools.iter().map(|tool| tool.definition.clone()).collect(), continuation: continuation.clone(), results: results.clone(), max_output_tokens: self.provider.profile().max_output_tokens, max_request_bytes: self.config.max_request_bytes, max_response_bytes: self.config.max_response_bytes, timeout_ms,
+                system_instruction, tools: selection.tools.iter().map(|tool| tool.definition.clone()).collect(), continuation: continuation.clone(), results: results.clone(), max_output_tokens: self.provider.profile().max_output_tokens, max_request_bytes: self.config.max_request_bytes, max_response_bytes: self.config.max_response_bytes, timeout_ms,
             };
             let prepared = match self.provider.prepare(request) {
                 Ok(request) => request,
@@ -679,6 +692,40 @@ impl Coordinator {
                     | ProviderError::InvalidToolCall),
                 ) if retries < 2 => {
                     retries += 1;
+                    if !proposal_corrected
+                        && matches!(
+                            &error,
+                            ProviderError::RejectedToolCall { .. } | ProviderError::InvalidToolCall
+                        )
+                    {
+                        let evidence = self.reconcile(context, &mut saved).await?;
+                        if evidence.unresolved {
+                            return self
+                                .stop(
+                                    saved,
+                                    RunStatus::Paused,
+                                    "unresolved_effect_requires_reconciliation",
+                                )
+                                .await;
+                        }
+                        if evidence.complete {
+                            return self
+                                .stop(saved, RunStatus::Succeeded, "receipt_verified")
+                                .await;
+                        }
+                        if !verification_continued && let Some(hint) = evidence.verification_hint()
+                        {
+                            verification_continued = true;
+                            query = hint.to_owned();
+                            saved.run.status = RunStatus::Verifying;
+                            self.runs.save(&mut saved, now()).await?;
+                        }
+                        semantic = evidence.value;
+                        continuation = None;
+                        results.clear();
+                        session_turns = 0;
+                        proposal_corrected = true;
+                    }
                     let delay = match error {
                         ProviderError::RateLimited { retry_after_ms } => {
                             retry_after_ms.unwrap_or(1000)
