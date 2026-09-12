@@ -244,14 +244,14 @@ impl CoreService {
                     .await?;
                 Ok(verified)
             }
-            Err(_) => {
+            Err(cause) => {
                 self.repository
                     .transition_effect(guild, &sent.id, sent.revision, EffectState::Unknown, None)
                     .await?;
                 self.repository
                     .finish_operation(guild, &operation.id, OperationState::RecoveryRequired)
                     .await?;
-                Err(Error::new(ErrorCode::UnknownOutcome))
+                Err(Error::with_source(ErrorCode::UnknownOutcome, cause))
             }
         }
     }

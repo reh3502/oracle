@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 struct World {
     snapshot: Mutex<Snapshot>,
     writes: AtomicUsize,
+    reads: AtomicUsize,
     lose_response: AtomicUsize,
     wait: tokio::sync::Semaphore,
     entered: tokio::sync::Notify,
@@ -19,6 +20,7 @@ struct World {
 #[async_trait]
 impl StructureBackend for World {
     async fn inspect(&self, context: &PolicyContext, _guild: &GuildId) -> Result<Snapshot> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         let mut s = self.snapshot.lock().unwrap().clone();
         s.observed_at = now();
         if let PolicyContext::Discord { user, .. } = context {
@@ -55,7 +57,10 @@ impl StructureBackend for World {
             Ok(channel)
         })?;
         if self.lose_response.swap(0, Ordering::SeqCst) > 0 {
-            Err(Error::new(ErrorCode::Io))
+            Err(Error::with_detail(
+                ErrorCode::Io,
+                ErrorDetail::NetworkTimeout,
+            ))
         } else {
             Ok(result)
         }
@@ -87,6 +92,7 @@ fn world() -> Arc<World> {
             observed_at: now(),
         }),
         writes: AtomicUsize::new(0),
+        reads: AtomicUsize::new(0),
         lose_response: AtomicUsize::new(0),
         wait: tokio::sync::Semaphore::new(0),
         entered: tokio::sync::Notify::new(),
@@ -173,12 +179,18 @@ async fn saved_plan_survives_restart_and_repeated_setup_is_a_noop() {
     assert_eq!(world.writes.load(Ordering::SeqCst), 3);
     let repeated = executor.plan(&context, &guild, &setup).await.unwrap();
     assert!(repeated.steps.iter().all(|s| s.change == Change::Reuse));
+    let reads_before = world.reads.load(Ordering::SeqCst);
     let done = executor
         .apply(&context, &guild, &repeated.id, &CancellationToken::new())
         .await
         .unwrap();
     assert!(matches!(done.state, PlanState::Complete));
     assert_eq!(world.writes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        world.reads.load(Ordering::SeqCst) - reads_before,
+        1,
+        "reuse is verified by the fresh apply snapshot without redundant channel-list reads"
+    );
     store.close().await.unwrap();
 }
 #[tokio::test]
@@ -197,6 +209,29 @@ async fn lost_create_response_keeps_reservation_and_prevents_duplicate_after_res
         .unwrap();
     assert!(matches!(partial.state, PlanState::Partial));
     assert_eq!(partial.last_error, Some(ErrorCode::UnknownOutcome));
+    assert_eq!(
+        partial.last_failure,
+        Some(ErrorDiagnostic {
+            code: ErrorCode::UnknownOutcome,
+            cause: Some(ErrorCode::Io),
+            detail: Some(ErrorDetail::NetworkTimeout),
+        })
+    );
+    let saved = store
+        .workflow_get(&guild, WorkflowKind::StructurePlan, &plan.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let restored: StructurePlan = serde_json::from_value(saved.value.clone()).unwrap();
+    assert_eq!(restored.last_failure, partial.last_failure);
+    let mut legacy = saved.value;
+    legacy.as_object_mut().unwrap().remove("last_failure");
+    assert!(
+        serde_json::from_value::<StructurePlan>(legacy)
+            .unwrap()
+            .last_failure
+            .is_none()
+    );
     assert_eq!(world.writes.load(Ordering::SeqCst), 1);
     drop(executor);
     store.close().await.unwrap();

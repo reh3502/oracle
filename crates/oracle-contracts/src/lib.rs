@@ -30,13 +30,32 @@ pub enum ErrorCode {
     RecoveryRequired,
     Io,
 }
+/// Allowlisted operational context; never contains provider text or credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorDetail {
+    ReadDeadline,
+    NetworkTimeout,
+    HttpFailure,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorDiagnostic {
+    pub code: ErrorCode,
+    pub cause: Option<ErrorCode>,
+    pub detail: Option<ErrorDetail>,
+}
 pub struct Error {
     pub code: ErrorCode,
+    detail: Option<ErrorDetail>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 impl Error {
     pub fn new(code: ErrorCode) -> Self {
-        Self { code, source: None }
+        Self {
+            code,
+            detail: None,
+            source: None,
+        }
     }
     pub fn with_source(
         code: ErrorCode,
@@ -44,7 +63,30 @@ impl Error {
     ) -> Self {
         Self {
             code,
+            detail: None,
             source: Some(Box::new(source)),
+        }
+    }
+}
+impl Error {
+    pub fn with_detail(code: ErrorCode, detail: ErrorDetail) -> Self {
+        Self {
+            code,
+            detail: Some(detail),
+            source: None,
+        }
+    }
+    pub fn diagnostic(&self) -> ErrorDiagnostic {
+        let cause = self
+            .source
+            .as_ref()
+            .and_then(|source| source.downcast_ref::<Error>());
+        ErrorDiagnostic {
+            code: self.code,
+            cause: cause.map(|error| error.code),
+            detail: self
+                .detail
+                .or_else(|| cause.and_then(|error| error.diagnostic().detail)),
         }
     }
 }
@@ -255,3 +297,28 @@ pub use modules::*;
 
 mod workflows;
 pub use workflows::*;
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_propagates_only_allowlisted_typed_context() {
+        let error = Error::with_source(
+            ErrorCode::UnknownOutcome,
+            Error::with_detail(ErrorCode::Io, ErrorDetail::ReadDeadline),
+        );
+        assert_eq!(
+            error.diagnostic(),
+            ErrorDiagnostic {
+                code: ErrorCode::UnknownOutcome,
+                cause: Some(ErrorCode::Io),
+                detail: Some(ErrorDetail::ReadDeadline),
+            }
+        );
+        let error = Error::with_source(ErrorCode::Io, std::io::Error::other("secret-token"));
+        let encoded = serde_json::to_string(&error.diagnostic()).unwrap();
+        assert!(!encoded.contains("secret-token"));
+        assert_eq!(error.diagnostic().cause, None);
+        assert_eq!(error.diagnostic().detail, None);
+    }
+}

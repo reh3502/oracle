@@ -151,6 +151,8 @@ pub struct StructurePlan {
     pub receipts: Vec<StepReceipt>,
     pub state: PlanState,
     pub last_error: Option<ErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<oracle_core::ErrorDiagnostic>,
 }
 impl StructurePlan {
     fn hash(&self) -> Result<String> {
@@ -244,6 +246,7 @@ impl StructureExecutor {
             receipts: vec![],
             state: PlanState::Planned,
             last_error: None,
+            last_failure: None,
         };
         plan.hash = plan.hash()?;
         self.repository
@@ -441,6 +444,9 @@ impl StructureExecutor {
             };
             guard.revoke();
             let outcome = match outcome {
+                // The initial apply snapshot already verifies unchanged resources.
+                // Every actual mutation still refreshes authority and verifies its readback.
+                Ok(channel) if reuse => Ok((channel, snapshot.clone())),
                 Ok(channel) => self
                     .verify_transition(context, guild, &snapshot, &mutation, &channel)
                     .await
@@ -467,10 +473,12 @@ impl StructureExecutor {
                     plan.fingerprint = snapshot.fingerprint()?;
                     plan.state = PlanState::Partial;
                     plan.last_error = None;
+                    plan.last_failure = None;
                     revision = self.save(&plan, revision).await?;
                 }
                 Err(e) => {
                     plan.last_error = Some(e.code);
+                    plan.last_failure = Some(e.diagnostic());
                     plan.state = PlanState::Partial;
                     self.save(&plan, revision).await?;
                     return Ok(plan);
