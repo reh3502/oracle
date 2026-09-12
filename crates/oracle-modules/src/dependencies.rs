@@ -167,6 +167,7 @@ mod tests {
     use oracle_core::ProvidedContract;
     fn module(id: &str) -> ModuleManifest {
         ModuleManifest {
+            runtime: None,
             configuration: None,
             subscriptions: vec![],
             commands: None,

@@ -343,6 +343,7 @@ fn catalog_unprojectable_or_colliding_module_tools_cannot_remove_core_operations
         generation: 1,
         epoch: 1,
         operations: vec![ModuleOperation {
+            audience: oracle_core::ModuleAudience::Operator,
             name: name.into(),
             description: "Inspect unrelated state".into(),
             input_schema: schema,

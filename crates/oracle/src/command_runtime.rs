@@ -215,6 +215,8 @@ mod tests {
                 namespace: namespace.into(),
                 description: "Sample module".into(),
                 routes: vec![ModuleCommandRoute {
+                    input: None,
+                    presentation: None,
                     name: "status".into(),
                     description: "Read module status".into(),
                     operation: "private_status_operation".into(),

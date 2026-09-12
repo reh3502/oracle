@@ -1,6 +1,7 @@
 //! Static, local installation of operator-trusted native ELF packages. Never executes code.
 use oracle_core::{
-    Error, ErrorCode, InstalledModule, ModuleManifest, ModuleOperation, ModulePackage, Result,
+    Error, ErrorCode, InstalledModule, ModuleAudience, ModuleCommandInput, ModuleCommandOptionType,
+    ModuleManifest, ModuleOperation, ModulePackage, ModulePresentation, Result,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -120,10 +121,269 @@ fn validate_schema(schema: &Value, value: &Value) -> Result<()> {
         .validate(value)
         .map_err(|_| err(ErrorCode::SchemaInvalid))
 }
+// Typed command schemas deliberately use a small direct subset. This lets install
+// prove descriptor/schema equivalence without approximating arbitrary JSON Schema.
+fn validate_typed_options(
+    options: &[oracle_core::ModuleCommandOption],
+    schema: &Value,
+) -> Result<()> {
+    fn invalid() -> Error {
+        err(ErrorCode::InvalidInput)
+    }
+    fn keys(value: &Value, allowed: &[&str]) -> bool {
+        value
+            .as_object()
+            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
+    }
+    if options.len() > 25
+        || !unique(options.iter().map(|o| o.name.as_str()))
+        || !keys(
+            schema,
+            &[
+                "type",
+                "properties",
+                "required",
+                "additionalProperties",
+                "title",
+                "description",
+                "$schema",
+            ],
+        )
+        || schema["type"] != "object"
+        || schema["additionalProperties"] != false
+    {
+        return Err(invalid());
+    }
+    let properties = schema["properties"].as_object().ok_or_else(invalid)?;
+    let required: Vec<&str> = match schema.get("required") {
+        None => vec![],
+        Some(value) => value
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|v| v.as_str().ok_or_else(invalid))
+            .collect::<Result<_>>()?,
+    };
+    if properties.len() != options.len()
+        || !unique(required.iter().copied())
+        || required.iter().any(|r| !properties.contains_key(*r))
+    {
+        return Err(invalid());
+    }
+    let mut saw_optional = false;
+    for option in options {
+        if option.name.is_empty()
+            || option.name.len() > 32
+            || !option
+                .name
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase())
+            || !option
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || option.description.is_empty()
+            || option.description.chars().count() > 100
+            || option.description.chars().any(char::is_control)
+            || (option.required && saw_optional)
+            || option.required != required.contains(&option.name.as_str())
+        {
+            return Err(invalid());
+        }
+        saw_optional |= !option.required;
+        let property = properties.get(&option.name).ok_or_else(invalid)?;
+        let compatible = match &option.value_type {
+            ModuleCommandOptionType::String {
+                min_length,
+                max_length,
+                choices,
+            } => {
+                min_length <= max_length
+                    && *max_length <= 6000
+                    && *max_length > 0
+                    && choices.len() <= 25
+                    && unique(choices.iter().map(String::as_str))
+                    && choices.iter().all(|c| {
+                        !c.is_empty()
+                            && c.chars().count() <= 100
+                            && c.chars().count() >= *min_length as usize
+                            && c.chars().count() <= *max_length as usize
+                            && !c.chars().any(char::is_control)
+                    })
+                    && keys(
+                        property,
+                        &[
+                            "type",
+                            "minLength",
+                            "maxLength",
+                            "enum",
+                            "title",
+                            "description",
+                        ],
+                    )
+                    && property["type"] == "string"
+                    && property
+                        .get("minLength")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        == u64::from(*min_length)
+                    && property["maxLength"].as_u64() == Some(u64::from(*max_length))
+                    && if choices.is_empty() {
+                        property.get("enum").is_none()
+                    } else {
+                        property.get("enum") == Some(&serde_json::json!(choices))
+                    }
+            }
+            ModuleCommandOptionType::Integer {
+                min_value,
+                max_value,
+            } => {
+                const SAFE: i64 = 9_007_199_254_740_991;
+                *min_value >= -SAFE
+                    && *max_value <= SAFE
+                    && min_value <= max_value
+                    && keys(
+                        property,
+                        &["type", "minimum", "maximum", "title", "description"],
+                    )
+                    && property["type"] == "integer"
+                    && property["minimum"].as_i64() == Some(*min_value)
+                    && property["maximum"].as_i64() == Some(*max_value)
+            }
+            ModuleCommandOptionType::Boolean => {
+                keys(property, &["type", "title", "description"]) && property["type"] == "boolean"
+            }
+        };
+        if !compatible {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+fn validate_presentation(pointer: &str, schema: &Value) -> Result<()> {
+    // Presentation remains host-owned; only this fixed, schema-declared field opts in.
+    // Exclude schema forms (notably draft-7 $ref siblings and prefixItems) that
+    // could make the visible descriptor weaker than the effective output schema.
+    fn keys(value: &Value, allowed: &[&str]) -> bool {
+        value
+            .as_object()
+            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
+    }
+    if !keys(
+        schema,
+        &[
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "title",
+            "description",
+            "$schema",
+        ],
+    ) || pointer != "/reply"
+        || schema["type"] != "object"
+        || !schema["required"]
+            .as_array()
+            .is_some_and(|r| r.contains(&serde_json::json!("reply")))
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
+    let reply = &schema["properties"]["reply"];
+    if !keys(
+        reply,
+        &[
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "title",
+            "description",
+        ],
+    ) || reply["type"] != "object"
+        || reply["additionalProperties"] != false
+        || !reply["properties"]
+            .as_object()
+            .is_some_and(|p| p.len() == 2 && p.contains_key("text") && p.contains_key("citations"))
+        || !reply["required"].as_array().is_some_and(|r| {
+            r.len() == 2
+                && r.contains(&serde_json::json!("text"))
+                && r.contains(&serde_json::json!("citations"))
+        })
+        || reply["properties"]["text"]["type"] != "string"
+        || reply["properties"]["citations"]["type"] != "array"
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
+    let text = &reply["properties"]["text"];
+    let citations = &reply["properties"]["citations"];
+    let item = &citations["items"];
+    let label = &item["properties"]["label"];
+    let revision = &item["properties"]["revision"];
+    if !keys(
+        text,
+        &["type", "minLength", "maxLength", "title", "description"],
+    ) || !keys(
+        citations,
+        &[
+            "type",
+            "minItems",
+            "maxItems",
+            "items",
+            "title",
+            "description",
+        ],
+    ) || !keys(
+        item,
+        &[
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "title",
+            "description",
+        ],
+    ) || !keys(
+        label,
+        &["type", "minLength", "maxLength", "title", "description"],
+    ) || !keys(
+        revision,
+        &["type", "minimum", "maximum", "title", "description"],
+    ) || !text["minLength"].as_u64().is_some_and(|n| n >= 1)
+        || !label["minLength"].as_u64().is_some_and(|n| n >= 1)
+        || !text["maxLength"]
+            .as_u64()
+            .is_some_and(|n| (1..=1800).contains(&n))
+        || citations["maxItems"].as_u64() != Some(5)
+        || item["type"] != "object"
+        || item["additionalProperties"] != false
+        || !item["required"].as_array().is_some_and(|r| {
+            r.len() == 2
+                && r.contains(&serde_json::json!("label"))
+                && r.contains(&serde_json::json!("revision"))
+        })
+        || !item["properties"]
+            .as_object()
+            .is_some_and(|p| p.len() == 2 && p.contains_key("label") && p.contains_key("revision"))
+        || label["type"] != "string"
+        || !label["maxLength"]
+            .as_u64()
+            .is_some_and(|n| (1..=120).contains(&n))
+        || revision["type"] != "integer"
+        || !revision["minimum"].as_u64().is_some_and(|n| n >= 1)
+        || !revision["maximum"]
+            .as_u64()
+            .is_some_and(|n| n <= 9_007_199_254_740_991)
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
+    Ok(())
+}
 pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
-    if manifest.manifest_version != 1
-        || manifest.protocol_major != 1
-        || manifest.protocol_minor_min != 0
+    if !matches!(
+        (manifest.manifest_version, manifest.protocol_minor_min),
+        (1, 0) | (2, 1)
+    ) || manifest.protocol_major != 1
         || manifest.target != HOST_TARGET
     {
         return Err(err(ErrorCode::Compatibility));
@@ -131,7 +391,28 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     semver::Version::parse(&manifest.version).map_err(|_| err(ErrorCode::Compatibility))?;
     let host =
         semver::VersionReq::parse(&manifest.host_api).map_err(|_| err(ErrorCode::Compatibility))?;
-    if !host.matches(&semver::Version::new(1, 0, 0)) {
+    if !host.matches(&semver::Version::new(
+        1,
+        u64::from(manifest.manifest_version - 1),
+        0,
+    )) || (manifest.manifest_version == 2
+        && (host.matches(&semver::Version::new(1, 0, 0))
+            || host.matches(&semver::Version::new(1, 0, u64::MAX))))
+    {
+        return Err(err(ErrorCode::Compatibility));
+    }
+    if manifest.manifest_version == 1
+        && (manifest.runtime.is_some()
+            || manifest
+                .operations
+                .iter()
+                .any(|o| o.audience != ModuleAudience::Operator)
+            || manifest.commands.as_ref().is_some_and(|c| {
+                c.routes
+                    .iter()
+                    .any(|r| r.input.is_some() || r.presentation.is_some())
+            }))
+    {
         return Err(err(ErrorCode::Compatibility));
     }
     if manifest.capabilities.len() > 16
@@ -258,10 +539,36 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                 .ok_or_else(|| err(ErrorCode::InvalidInput))?;
             if !slug(&route.name, 32)
                 || !description(&route.description)
-                || (!route.input_required
+                || (route.input.is_none()
+                    && !route.input_required
                     && !schema_validator(&operation.input_schema)?.is_valid(&serde_json::json!({})))
             {
                 return Err(err(ErrorCode::InvalidInput));
+            }
+            if manifest.manifest_version == 2 {
+                let input = route
+                    .input
+                    .as_ref()
+                    .ok_or_else(|| err(ErrorCode::InvalidInput))?;
+                if route.input_required {
+                    return Err(err(ErrorCode::InvalidInput));
+                }
+                match input {
+                    ModuleCommandInput::Json { required } => {
+                        if !required
+                            && !schema_validator(&operation.input_schema)?
+                                .is_valid(&serde_json::json!({}))
+                        {
+                            return Err(err(ErrorCode::InvalidInput));
+                        }
+                    }
+                    ModuleCommandInput::Typed { options } => {
+                        validate_typed_options(options, &operation.input_schema)?
+                    }
+                }
+                if let Some(ModulePresentation::PlainTextV1 { pointer }) = &route.presentation {
+                    validate_presentation(pointer, &operation.output_schema)?;
+                }
             }
         }
     }
@@ -275,6 +582,35 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                 .iter()
                 .any(|c| !manifest.capabilities.contains(c))
             || !unique(operation.capabilities.iter().map(String::as_str))
+        {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+        if operation.audience == ModuleAudience::MemberRead
+            && (!operation.capabilities.is_empty()
+                || operation.ai.is_some()
+                || manifest
+                    .migrations
+                    .iter()
+                    .any(|m| m.operation == operation.name)
+                || manifest
+                    .provides
+                    .iter()
+                    .any(|p| p.operation == operation.name)
+                || [
+                    "configuration.",
+                    "config.",
+                    "migration.",
+                    "event.",
+                    "guild.",
+                    "lifecycle.",
+                    "host.",
+                ]
+                .iter()
+                .any(|prefix| operation.name.starts_with(prefix))
+                || matches!(
+                    operation.name.as_str(),
+                    "initialize" | "shutdown" | "activate" | "deactivate"
+                ))
         {
             return Err(err(ErrorCode::InvalidInput));
         }
@@ -941,5 +1277,184 @@ mod tests {
         let operation = &package.manifest.operations[0];
         assert!(validate_input(operation, &json!({"id":"123"})).is_ok());
         assert!(validate_input(operation, &json!({"id":123})).is_err());
+    }
+    fn member_manifest() -> ModuleManifest {
+        let output_schema = json!({"type":"object","required":["reply"],"properties":{"reply":{
+                    "type":"object","additionalProperties":false,"required":["text","citations"],"properties":{
+                        "text":{"type":"string","minLength":1,"maxLength":1800},
+                        "citations":{"type":"array","maxItems":5,"items":{"type":"object","additionalProperties":false,
+                            "required":["label","revision"],"properties":{"label":{"type":"string","minLength":1,"maxLength":120},
+                            "revision":{"type":"integer","minimum":1,"maximum":9007199254740991_u64}}}}}}}});
+        serde_json::from_value(json!({
+            "manifest_version":2,"id":"game.test","version":"1.0.0","target":HOST_TARGET,
+            "protocol_major":1,"protocol_minor_min":1,"host_api":"^1.1.0","data_version":1,
+            "readable_data_versions":[1],"runtime":{"data_directory_required":true},
+            "operations":[{"name":"lookup@1","description":"Lookup","audience":"member_read",
+                "input_schema":{"type":"object","additionalProperties":false,"required":["name"],"properties":{
+                    "name":{"type":"string","minLength":1,"maxLength":100},
+                    "limit":{"type":"integer","minimum":1,"maximum":10},
+                    "details":{"type":"boolean"}}},
+                "output_schema":output_schema,
+                "timeout_ms":1000}],
+            "commands":{"namespace":"dw","description":"Wiki queries","routes":[{"name":"lookup","description":"Lookup an entity","operation":"lookup@1",
+                "input":{"kind":"typed","options":[
+                    {"name":"name","description":"Entity name","required":true,"type":"string","min_length":1,"max_length":100},
+                    {"name":"limit","description":"Result limit","required":false,"type":"integer","min_value":1,"max_value":10},
+                    {"name":"details","description":"Include details","required":false,"type":"boolean"}]},
+                "presentation":{"kind":"plain_text_v1","pointer":"/reply"}}]}
+        })).unwrap()
+    }
+    #[test]
+    fn v2_requires_new_protocol_host_api_and_typed_schema_equivalence() {
+        let manifest = member_manifest();
+        validate_manifest(&manifest).unwrap();
+        for (pointer, replacement) in [
+            ("/protocol_minor_min", json!(0)),
+            ("/host_api", json!("^1.0")),
+            ("/host_api", json!("^1.0.1")),
+            ("/commands/routes/0/input/options/1/max_value", json!(11)),
+            ("/commands/routes/0/input/options/0/max_length", json!(101)),
+            ("/commands/routes/0/input/options/0/required", json!(false)),
+            ("/commands/routes/0/input/options/1/name", json!("unknown")),
+            (
+                "/operations/0/input_schema/additionalProperties",
+                json!(true),
+            ),
+            (
+                "/operations/0/input_schema/properties/name/pattern",
+                json!("a+"),
+            ),
+            ("/commands/routes/0/input_required", json!(true)),
+            (
+                "/operations/0/output_schema/properties/reply/properties/citations/prefixItems",
+                json!([true]),
+            ),
+            (
+                "/operations/0/output_schema/properties/reply/$ref",
+                json!("#"),
+            ),
+            ("/commands/routes/0/presentation/pointer", json!("/other")),
+            (
+                "/operations/0/output_schema/properties/reply/additionalProperties",
+                json!(true),
+            ),
+            (
+                "/operations/0/output_schema/properties/reply/properties/citations/maxItems",
+                json!(6),
+            ),
+        ] {
+            let mut value = serde_json::to_value(&manifest).unwrap();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            value
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), replacement);
+            let altered: ModuleManifest = serde_json::from_value(value).unwrap();
+            assert!(
+                validate_manifest(&altered).is_err(),
+                "accepted invalid descriptor {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_read_cannot_acquire_privileged_registration_or_callbacks() {
+        let manifest = member_manifest();
+        let mut bad = manifest.clone();
+        bad.capabilities = vec!["host.echo".into()];
+        bad.operations[0].capabilities = bad.capabilities.clone();
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        bad.operations[0].ai = Some(oracle_core::ModuleAiOperation {
+            kind: oracle_core::ModuleAiOperationKind::Inspection,
+            success_pointer: None,
+        });
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        bad.migrations.push(oracle_core::ModuleMigration {
+            from: 0,
+            to: 1,
+            operation: bad.operations[0].name.clone(),
+        });
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        bad.provides.push(oracle_core::ProvidedContract {
+            name: "read".into(),
+            version: "1.0.0".into(),
+            operation: bad.operations[0].name.clone(),
+        });
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest;
+        bad.operations[0].name = "event.deliver".into();
+        bad.commands.as_mut().unwrap().routes[0].operation = "event.deliver".into();
+        assert!(validate_manifest(&bad).is_err());
+    }
+    #[test]
+    fn typed_choices_order_duplicates_and_safe_integer_bounds_are_enforced() {
+        let manifest = member_manifest();
+        let mut bad = manifest.clone();
+        let Some(ModuleCommandInput::Typed { options }) =
+            &mut bad.commands.as_mut().unwrap().routes[0].input
+        else {
+            panic!()
+        };
+        options.swap(0, 1);
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        let Some(ModuleCommandInput::Typed { options }) =
+            &mut bad.commands.as_mut().unwrap().routes[0].input
+        else {
+            panic!()
+        };
+        options.push(options[0].clone());
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = manifest.clone();
+        let Some(ModuleCommandInput::Typed { options }) =
+            &mut bad.commands.as_mut().unwrap().routes[0].input
+        else {
+            panic!()
+        };
+        options[1].value_type = ModuleCommandOptionType::Integer {
+            min_value: 1,
+            max_value: 9_007_199_254_740_992,
+        };
+        bad.operations[0].input_schema["properties"]["limit"]["maximum"] =
+            json!(9_007_199_254_740_992_u64);
+        assert!(validate_manifest(&bad).is_err());
+        let mut choices = manifest;
+        let Some(ModuleCommandInput::Typed { options }) =
+            &mut choices.commands.as_mut().unwrap().routes[0].input
+        else {
+            panic!()
+        };
+        let ModuleCommandOptionType::String {
+            choices: values, ..
+        } = &mut options[0].value_type
+        else {
+            panic!()
+        };
+        *values = vec!["Pebble".into(), "Astro".into()];
+        choices.operations[0].input_schema["properties"]["name"]["enum"] =
+            json!(["Pebble", "Astro"]);
+        validate_manifest(&choices).unwrap();
+        choices.operations[0].input_schema["properties"]["name"]["enum"] = json!(["Pebble"]);
+        assert!(validate_manifest(&choices).is_err());
+    }
+
+    #[test]
+    fn v2_package_install_preserves_versioned_descriptors_and_digest() {
+        let (temp, mut package) = fixture();
+        package.manifest = member_manifest();
+        write(&temp, &package);
+        let store = ArtifactStore::new(temp.0.join("store")).unwrap();
+        let installed = store.install(&temp.0.join("source"), true).unwrap();
+        assert_eq!(installed.package.manifest, package.manifest);
+        store.verify(&installed).unwrap();
+        assert_eq!(
+            store.install(&temp.0.join("source"), true).unwrap(),
+            installed
+        );
     }
 }
