@@ -622,6 +622,7 @@ impl QueryEngine {
         let mut field = None;
         let mut name = None;
         for prefix in [
+            "what happens during ",
             "what does ",
             "what are ",
             "what is ",
@@ -647,6 +648,15 @@ impl QueryEngine {
         let Some(mut name) = name else {
             return unsupported();
         };
+        if q.starts_with("what happens during ") {
+            for article in ["a ", "an ", "the "] {
+                if let Some(rest) = name.strip_prefix(article) {
+                    name = rest;
+                    break;
+                }
+            }
+            kind = Some(Kind::Mechanic);
+        }
         if q.starts_with("what does ") {
             let Some(n) = name.strip_suffix(" do") else {
                 return unsupported();

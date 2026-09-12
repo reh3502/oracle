@@ -82,6 +82,35 @@ fn lookup(name: &str) -> QueryRequest {
     }
 }
 #[test]
+fn event_questions_consume_the_complete_topic() {
+    let mut d = data();
+    let mut blackout = entity("mechanic:4", "Blackouts", Kind::Mechanic);
+    blackout.aliases.push("Blackout".into());
+    d.entities.push(blackout);
+    let e = engine(d);
+    let r = e
+        .execute(
+            QueryRequest::Ask {
+                question: "What happens during a blackout?".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(r.status, "answered");
+    assert_eq!(r.candidates[0].id, "mechanic:4");
+    let r = e
+        .execute(
+            QueryRequest::Ask {
+                question: "What happens during a blackout and give free items?".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(r.status, "unsupported_query");
+    assert!(r.answer_blocks.is_empty());
+}
+
+#[test]
 fn exact_names_aliases_ids_and_ambiguity() {
     let e = engine(data());
     let r = e.execute(lookup("Pebble"), NOW).unwrap();

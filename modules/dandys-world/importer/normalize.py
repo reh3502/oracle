@@ -111,6 +111,11 @@ class Normalizer:
         return fact
 
     def stat(self,entity,row,field,raw):
+        explicit_stealth=re.fullmatch(r'\s*\{\{Star\}\}(?:\s|<br\s*/?>)*\{\{Small\|\((-?\d+)\)\}\}\s*',raw)
+        if field=='stealth' and explicit_stealth:
+            return self.fact(entity,row,field,raw,'Infobox / '+field,
+                             value={'stars':1,'priority':int(explicit_stealth[1])},
+                             conditions=['explicit source statistic; not calculated from star rating'])
         source=self.corpus.by_title.get('Template:StatComp')
         instances=[t for t in mw.parse(raw).filter_templates() if normalize_name(t.name)=='StatComp']
         valid=source and sha(source['raw'])==STAT_HASH
@@ -324,7 +329,7 @@ class Normalizer:
         for row in self.corpus.rows:
             if row['namespace']!=0 or redirect(row['raw']):continue
             title=row['title']
-            if '/' in title or title.startswith('Unused Content') or any(word in title for word in ['Gallery','Dialogue','Skins','Stickers','Changelog','Main Page','Disambiguation']):
+            if '/' in title or title.startswith('Unused Content') or any(word in title for word in ['Dialogue','Skins','Stickers','Changelog','Main Page','Disambiguation']):
                 self.excluded.append({'page_id':row['page_id'],'title':title,'reason':'Historical, media/dialogue, navigation, or subpage outside current game lookup scope.'});continue
             entity=self.entity(row,self.classify(row))
             for box in templates(row['raw']):

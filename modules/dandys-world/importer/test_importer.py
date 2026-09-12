@@ -125,6 +125,12 @@ class RenderingTests(unittest.TestCase):
 
 
 class InfoboxTests(unittest.TestCase):
+    def test_explicit_negative_stealth_is_not_inferred_from_stars(self):
+        c = corpus([('Syntax', '{{Toons|stealth={{Star}}<br>{{Small|(-99)}}}}')], False)
+        f = infobox(c, 'Syntax')['stealth']
+        self.assertEqual(f['value'], {'stars':1,'priority':-99})
+        self.assertEqual(f['state'], 'supported')
+
     def test_floor_event_infobox_retains_effect_and_chance(self):
         c = corpus([('Syntax', '{{EffectofEvent|effect=Visibility reduced|chance=Only after floor 3}}')], False)
         f = infobox(c, 'Syntax', 'mechanic')
@@ -273,6 +279,7 @@ class TableAndAliasTests(unittest.TestCase):
 
     def test_complete_synthetic_pipeline_covers_all_categories_and_attribution(self):
         pages = [
+            ('Art Gallery', 'A named playable floor. [[Category:Floors]]'),
             ('Example Toon', '{{Toons|heart1=Heart|ability_1=Example effect}}'),
             ('Twisted Example Toon', '{{Twisted|mechanic=Example Toon counterpart}}'),
             ('Example Trinket', '{{Trinket|effect=Example effect}}'),
@@ -293,6 +300,9 @@ class TableAndAliasTests(unittest.TestCase):
         prices = {f['conditions'][0]: f['value'] for f in item['facts'] if f['key'] == 'price'}
         self.assertEqual(prices, {'normal': 10, 'Dandy Plush': 5, 'Frugal Card': 9, 'both discounts': 4})
         self.assertFalse(result['coverage']['unresolved_redirects'])
+        gallery = next(e for e in result['entities'] if e['name'] == 'Art Gallery')
+        self.assertEqual(gallery['kind'], 'floor')
+        self.assertTrue(any('playable floor' in f['text'] for f in gallery['facts']))
         sources = {r['source']['id']: r for r in c.rows}
         for entity in result['entities']:
             for fact in entity['facts']:
