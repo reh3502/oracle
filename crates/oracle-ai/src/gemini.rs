@@ -176,6 +176,7 @@ impl GeminiProvider {
         }) {
             return Err(ProviderError::ProtocolMismatch);
         }
+        let usage = wire.usage.map(Usage::from);
         let mut calls = Vec::new();
         let mut text = String::new();
         // Validate the complete response before releasing any proposals or visible text.
@@ -191,17 +192,6 @@ impl GeminiProvider {
                         name,
                         arguments,
                     };
-                    check_call(&call, &native.tools, &mut history.seen)?;
-                    if !historical_tools.iter().any(|tool| tool.name == call.name) {
-                        historical_tools.push(
-                            native
-                                .tools
-                                .iter()
-                                .find(|tool| tool.name == call.name)
-                                .ok_or(ProviderError::ProtocolMismatch)?
-                                .clone(),
-                        );
-                    }
                     calls.push(call);
                 }
                 Step::Thought {} => {}
@@ -228,6 +218,28 @@ impl GeminiProvider {
         {
             return Err(ProviderError::ProtocolMismatch);
         }
+        // Wire shape, status, and model must all be valid before attaching any
+        // reported usage to a rejected proposal. Nothing from a rejected batch
+        // becomes a ModelTurn or reusable native continuation.
+        for call in &calls {
+            check_call(call, &native.tools, &mut history.seen).map_err(|error| match error {
+                ProviderError::RejectedToolCall { reason, .. } => ProviderError::RejectedToolCall {
+                    reason,
+                    usage: usage.clone(),
+                },
+                error => error,
+            })?;
+            if !historical_tools.iter().any(|tool| tool.name == call.name) {
+                historical_tools.push(
+                    native
+                        .tools
+                        .iter()
+                        .find(|tool| tool.name == call.name)
+                        .ok_or(ProviderError::ProtocolMismatch)?
+                        .clone(),
+                );
+            }
+        }
         if stop != StopReason::ToolCalls {
             calls.clear();
         }
@@ -246,7 +258,7 @@ impl GeminiProvider {
                 opaque: bounded_json(&state, MAX_CONTINUATION_BYTES)
                     .map_err(|_| ProviderError::ProtocolMismatch)?,
             },
-            usage: wire.usage.unwrap_or_default().into(),
+            usage: usage.unwrap_or_default(),
             stop,
             model: wire.model,
         })
@@ -657,15 +669,25 @@ fn check_call(
     tools: &[NativeTool],
     seen: &mut BTreeSet<String>,
 ) -> Result<(), ProviderError> {
-    if call.id.is_empty() || !seen.insert(call.id.clone()) || !call.arguments.is_object() {
-        return Err(ProviderError::InvalidToolCall);
+    let rejected = |reason| ProviderError::RejectedToolCall {
+        reason,
+        usage: None,
+    };
+    if call.id.is_empty() {
+        return Err(rejected(ToolCallRejection::EmptyId));
+    }
+    if !seen.insert(call.id.clone()) {
+        return Err(rejected(ToolCallRejection::DuplicateId));
+    }
+    if !call.arguments.is_object() {
+        return Err(rejected(ToolCallRejection::NonObjectArguments));
     }
     let tool = tools
         .iter()
         .find(|t| t.name == call.name)
-        .ok_or(ProviderError::InvalidToolCall)?;
+        .ok_or_else(|| rejected(ToolCallRejection::UnknownTool))?;
     schema::validate(&tool.parameters, &call.arguments).map_err(|error| match error {
-        ProviderError::ProtocolMismatch => ProviderError::InvalidToolCall,
+        ProviderError::ProtocolMismatch => rejected(ToolCallRejection::InvalidArguments),
         error => error,
     })
 }
@@ -698,7 +720,9 @@ fn check_history(input: &[Box<RawValue>], tools: &[NativeTool]) -> Result<Histor
                     arguments,
                 };
                 check_call(&call, tools, &mut h.seen).map_err(|error| match error {
-                    ProviderError::InvalidToolCall => ProviderError::InvalidRequest,
+                    ProviderError::InvalidToolCall | ProviderError::RejectedToolCall { .. } => {
+                        ProviderError::InvalidRequest
+                    }
                     error => error,
                 })?;
                 h.pending.push(call);

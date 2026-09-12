@@ -98,6 +98,17 @@ pub struct PreparedTurn {
     pub timeout_ms: u64,
 }
 
+/// Safe contract-rejection categories; no model-supplied names or arguments.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallRejection {
+    EmptyId,
+    DuplicateId,
+    NonObjectArguments,
+    UnknownTool,
+    InvalidArguments,
+}
+
 /// Fixed categories only: provider bodies, URLs and credentials are not diagnostics.
 #[derive(Clone, Debug, thiserror::Error, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -123,8 +134,24 @@ pub enum ProviderError {
     /// A parsed model response proposed a call outside its advertised contract.
     #[error("provider returned an invalid tool call")]
     InvalidToolCall,
+    /// A rejected proposal from an otherwise valid provider envelope. Reported
+    /// numbers still require normal budget validation before any refund.
+    #[error("provider rejected tool call ({reason:?})")]
+    RejectedToolCall {
+        reason: ToolCallRejection,
+        usage: Option<Usage>,
+    },
     #[error("provider request cancelled")]
     Cancelled,
+}
+
+impl ProviderError {
+    pub fn reported_usage(&self) -> Option<&Usage> {
+        match self {
+            Self::RejectedToolCall { usage, .. } => usage.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
