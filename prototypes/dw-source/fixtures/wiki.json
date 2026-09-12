@@ -1,0 +1,380 @@
+[
+  {
+    "title": "Pebble",
+    "kind": "toon",
+    "selection": {
+      "mode": "infobox",
+      "selector": "Toons",
+      "start": 215,
+      "end": 1369
+    },
+    "pageid": 193,
+    "revision_id": 261239,
+    "revision_timestamp": "2026-09-09T20:52:54Z",
+    "retrieved_at": "2026-09-12T22:33:46.347101+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Pebble",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=261239",
+    "full_source_sha256": "cbe5214d8456612b92d644ec8f12da815e2212340712ff3a7668bf68c8784486",
+    "excerpt_sha256": "e9a801d07b8378709a9eef686ae8f9e5a226f12770280b8440bcd24806c5fa85",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Toons\n|title1=Pebble Dancifer Jr.\n|image1=<gallery>\nPebble Render.png|Render\nPebble Full Render.png|Full Render\nPebble Icon.png|Icon/Full Icon\n</gallery>\n|heart1=Main Heart\n|heart2=Heart\n|heart3=Heart\n|skill_check={{StatComp|Skill|3}}\n|movement_speed={{StatComp|Move|5}}\n|stamina={{StatComp|Stam|4}}\n|stealth={{StatComp|Stealth|3}}\n|extraction_speed={{StatComp|Extract|1}}\n|ability_1={{Center|{{AI|Pebble|name=true}}<br>{{Small|''(Active)''}}}}<br>This Toon can bark loudly, drastically decreasing Stealth to a value of -40 and alerting any Twisteds nearby to his location. Has a cooldown of 60. \n|ability_2={{Center|'''Fetch!'''<br>{{Small|''(Passive)''}}}}<br>\n{{Center|This Toon can sniff out items, causing them to be highlighted when in the Toon's vicinity.}}\n|requirement_1=3750 [[Ichor]]\n|requirement_2=100% [[Research]] on {{CI|Twisted Pebble|name=true}}\n|requirement_3=Complete all [[Mastery]] Quests on {{CI|Toodles|name=true}}\n|skins=*Vintage\n*Loyal Bud\n*Thorned Geode\n*Star-Time\n*Served Eggy\n*Extra Cheese\n*Gleeful Gift\n*Bunny Wabbit\n|gender=Male\n|pronouns=He/Him/His\n|designation=M-001\n|release_date=06/14/2024 {{Small|(Alpha Release)}}\n}}"
+  },
+  {
+    "title": "Twisted Pebble",
+    "kind": "twisted",
+    "selection": {
+      "mode": "infobox",
+      "selector": "Twisted",
+      "start": 238,
+      "end": 675
+    },
+    "pageid": 1926,
+    "revision_id": 259722,
+    "revision_timestamp": "2026-09-01T02:20:05Z",
+    "retrieved_at": "2026-09-12T22:33:58.363792+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Twisted_Pebble",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=259722",
+    "full_source_sha256": "75654dd91bfe54c28d540e56a7d10d1b603ad64fb56285c50cde9c7599293ce0",
+    "excerpt_sha256": "b30466238f22cadbfcf300759e5cb995e26e4545577fb73fb51207835b897065",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Twisted\n|title1={{PAGENAME}}\n|image1=<gallery>\nTwisted Pebble Render.png|Render\nTwisted Pebble Full Render.png|Full Render\n</gallery>\n|type={{Type|Main}}\n|speed={{TSpeed|10|24}}<ref name=\"stats\">[[File:{{PAGENAME}} Stats.jpg|200px]]</ref>\n|mechanic=None\n|attention_span=3 seconds<ref name=\"stats\"/>\n|detection_range=35 {{Small|(circular vision)}}<br>125 {{Small|(direct vision)}}<br>200 {{Small|(hearing radius)}}<ref name=\"stats\"/>\n}}"
+  },
+  {
+    "title": "Bone",
+    "kind": "trinket",
+    "selection": {
+      "mode": "infobox",
+      "selector": "Trinket",
+      "start": 0,
+      "end": 321
+    },
+    "pageid": 1213,
+    "revision_id": 259793,
+    "revision_timestamp": "2026-09-01T15:57:10Z",
+    "retrieved_at": "2026-09-12T22:33:31.988801+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Bone",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=259793",
+    "full_source_sha256": "766e241eff7b70bdc12889ffe0ea32ed1d441f146f4296dda2d00915acd86127",
+    "excerpt_sha256": "11eb6db52d01c7c0dc2fae235c88f496423ecf1569b1284dd18c822904ca5019",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Trinket\n|title1=Bone\n|image1=Bone Trinket.png\n|effect=Increases both Walk and Run Speed by 25% when picking up an [[Item]] for 4 seconds. Effect can stack but caps at 40 speed. (Does not include [[Capsules]] and  {{Tape|name=true}})\n|requirement_1=100% [[Research]] on {{CI|Twisted Pebble|name=true}}\n|caption-image1=}}"
+  },
+  {
+    "title": "Dyle's Floor",
+    "kind": "floor",
+    "selection": {
+      "mode": "lead",
+      "selector": "",
+      "start": 0,
+      "end": 872
+    },
+    "pageid": 16858,
+    "revision_id": 261688,
+    "revision_timestamp": "2026-09-12T19:47:54Z",
+    "retrieved_at": "2026-09-12T22:33:37.304782+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Dyle%27s_Floor",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=261688",
+    "full_source_sha256": "95b672e35facb59e895ecf6141e66cd84c50f5bc6a2205425ff63c009f70e0e5",
+    "excerpt_sha256": "c437f8534fb2c9ad40cd72995adfafda0645deb7b48e6bbeefaf52dfb56fb187",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Stub}}{{MissingInformation|*Layout of Dyle's Floor}}\n'''Dyle's Floor''' is the first and only Challenge [[Floor]], and to enter it, the player(s) must choose the {{CDI|TIME'S UP|name=true}} [[Card]] during a Card vote, which is only available on odd Floors. The player(s) must be on Floor 9+ for a chance to get the Card. It also has only one variant. When on this map, the player(s) must complete a total of 25 [[Machines]], regardless of what Floor they're on. The Floor will also spawn 3+ {{Type|Common}} [[Twisteds]], with [[Floor Events]] also being able to happen, along with {{CI|Twisted Dyle|name=true}}. The reward when completing this Floor is +50 Stamina capacity for the rest of the run. \n\nDo note that all available Card options run dry by Floor 43 (45 during [[Events]]), meaning any runs that go past that Floor will be forced to complete Dyle's Floor. \n\n"
+  },
+  {
+    "title": "Floors",
+    "kind": "floor_rules",
+    "selection": {
+      "mode": "prefix",
+      "selector": "The bigger your team",
+      "start": 0,
+      "end": 1628
+    },
+    "pageid": 277,
+    "revision_id": 261289,
+    "revision_timestamp": "2026-09-10T04:14:37Z",
+    "retrieved_at": "2026-09-12T22:33:39.356601+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Floors",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=261289",
+    "full_source_sha256": "dbf66eb43e58027b2adba86bafb631059da2541e311b75a522312896dd1cb709",
+    "excerpt_sha256": "4c5df6b4171ae285b574fc3d662159cd541f304308e5522e210c7b6c537b1f79",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{MissingInformation|*New machine spawning for runs under 5 players}}\n\n'''Floors''' are locations where the survival aspect of [[Dandy's World]] occurs. Floors come in a sequence, where the game generates a new Floor after the current one is completed. There is a set of premade Floor types and variants the game can choose from, but their contents can vary heavily.\n\n==Mechanics==\n[[File:DO NOT OPEN Elevator polished screenshot.png|thumb]]\nUpon generating a new Floor, the game will select a Floor type as well as a random variant from that Floor type. There are {{FloorTypeAmount}} different Floor types, each having between 1 and 7 variants. Every Floor variant has two [[Elevators]], one of which is the functional Elevator, and the other being taped off by yellow tape that reads 'DO NOT OPEN'. All Floors have [[Items]], 2 or more [[Machines]] {{Small|(with a maximum of 20)}}, and 2 or more [[Twisteds]] {{Small|(with a maximum of 8)}} on them. Their distribution is randomized in each own way, but there are algorithms that further determine this.\n\nThe amount of {{TI|Ichor|name=true}} you can earn per Floor is limited, being dependent on how many [[Research Capsules]] you pick up and how many Machines you do. \n\nThe amount of Twisteds and Machines on a Floor is also limited, with more Twisteds and Machines spawning the deeper you go. The maximum amount of Twisteds that can spawn is 8 (formerly 6 before [[Changelog|v0.15.1]]), but if you are in a solo run, the maximum is six. The maximum amount of Machines to be completed on a single Floor is 20 (unless you are on the [[Dyle's Floor]], which spawns with 25).\n\n"
+  },
+  {
+    "title": "Research",
+    "kind": "mechanic",
+    "selection": {
+      "mode": "section",
+      "selector": "Unlocking Research",
+      "start": 515,
+      "end": 3515
+    },
+    "pageid": 544,
+    "revision_id": 256746,
+    "revision_timestamp": "2026-08-16T00:57:23Z",
+    "retrieved_at": "2026-09-12T22:33:48.464912+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Research",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=256746",
+    "full_source_sha256": "8ceecef2bf4a8ef96ccedd030c27ee1f525925917856b036e2e23774de7757dd",
+    "excerpt_sha256": "10b02efdd27c2c95d6c01384ecfa2a1e447ab8b6524024de42fea8a60740083b",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "==Unlocking Research==\nThere are two ways to obtain Research, those being: \n\n*[[Research Capsules]]: Two Research Capsules will spawn for each [[Twisted]] that is present on any given Floor. These give 1% of Research on the Twisted the Capsule belongs to and tell the player which. \n**Capsules are client-sided, meaning that even if you pick up the Capsule, it will still be there for other Players. This makes it more convenient for players in the game to collect more Research without having to fight for it.\n**{{CI|Twisted Rodger|name=true}} appears as a fake capsule that lacks the tapes in the middle. If picked up, he will attack and apply {{Debuff|Confused|III}} and {{Debuff|Slow|III}} to the player that opened the fake capsule (the latter removed when {{TI|Train Whistle|name=true}} is equipped). His capsule is not client-sided. Normal capsules have tapes wrapped around them, yet Twisted Rodger's does not.\n*Encountering a Twisted: Encountering a Twisted gives you 5% Research on the Twisted. This method is limited to once per floor, meaning if you get chased by the same Twisted twice, you won't get any extra Research. The research is given at the same time as tapes, so if you're unsure if you've been given the research, listen for the sound of tapes being collected. Encounters can be equated to either being in chase or going into the detection range depending on the Twisted, so '''you do not need to take damage''' to gain the Research for any Twisted. Other than the following, all Twisteds must detect you to give an encounter, so while they are chasing someone else, if your Stealth is higher than their victim they <u>will not</u> detect you.\n**{{CI|Twisted Razzle & Dazzle|name=true}} and Twisted Rodger both must be awake and the user must be in their line of sight to obtain encounter research.\n**{{CI|Twisted Glisten|name=true}} and {{CI|Twisted Connie|name=true}} are counted as encountered even if not in an aggressive state, but require being in their aggro radius and not just sight line. If Twisted Glisten is in his aggressive state, Stealth mechanics apply.\n**{{CI|Twisted Blot|name=true}} is the only Twisted to not give research by going near him. Instead, you need to go near the hands Twisted Blot summons to get the research.\n\n{{CI|Rodger|name=true}} gains double the amount of Research, so Research Capsules give 2%, and encounters give 10%. This is the only way to modify the amount of Research gained.\n\nFor the most Research per Floor, it is recommended to play as Rodger, get both Capsules for the Twisted you want to research, then encounter the Twisted. If done correctly, you should get 14% Research every time the Twisted spawns on a floor. This allows you to complete a Twisted's research in 7 encounters as Rodger plus another capsule, assuming you have no prior research. If playing as anyone else, 100% research takes 14 full ventures plus two capsules or one encounter. {{TI|Research Map|name=true}} can also help you to find research capsules.\n\n"
+  },
+  {
+    "title": "Items",
+    "kind": "item",
+    "selection": {
+      "mode": "table",
+      "selector": "Bandage",
+      "start": 5951,
+      "end": 6054
+    },
+    "pageid": 203,
+    "revision_id": 260097,
+    "revision_timestamp": "2026-09-03T09:33:32Z",
+    "retrieved_at": "2026-09-12T22:33:43.537232+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Items",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=260097",
+    "full_source_sha256": "9519ec3f6bb6cc4e3331c2fc5b7559f8a6dd5d92e7b2d1cc4fe6928cd29a718b",
+    "excerpt_sha256": "2d4cda6b928a5b43a86cc1108eff81889b8b2de50a621fd2a3de208a96f845df",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "|'''{{II|Bandage|name=false|size=100}}'''\n|Upon use, restores 1 {{Heart}}.\n|Healing\n|No\n|60\n|30\n|54\n|24"
+  },
+  {
+    "title": "Machines",
+    "kind": "machine",
+    "selection": {
+      "mode": "section",
+      "selector": "Default Machine",
+      "start": 1441,
+      "end": 2745
+    },
+    "pageid": 16596,
+    "revision_id": 260747,
+    "revision_timestamp": "2026-09-06T15:19:24Z",
+    "retrieved_at": "2026-09-12T22:33:45.002078+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Machines",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=260747",
+    "full_source_sha256": "b359ac7127e2a1e4711c6e18fc36a0ec4469f7c79afa1ffaa013f5ee38a5cdd4",
+    "excerpt_sha256": "54f4b9e775ea5b34fcf049d6abd171ada87c0ac4e82d9ae5a125d39fef94ef79",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "===Default Machine===\nThe default Machine, also known as the normal or striped Machine, is the most common Machine found on [[Floors]], with a 100% spawn chances in Floor 1, a 70% chance in Floors 2-4, a 55% chance in Floors 5-9, and a 40% chance the rest of the game. This Machine is quite simple—Your [[Toons]]' [[Extraction Speed]] determines how fast [[Ichor]] drips down from the Machine, meaning more {{Star}} for Extraction Speed make Machines finish faster. However, that isn't the only factor at play; [[Skill Check]] also determines how difficult they are when they appear. At a random time, a Skill Check will appear. It looks like a long gray bar with a much smaller silver bar placed randomly on it, as well as a golden bar in the middle of the silver bar. When hitting the silver bar, there will be text that says \"Good Job!\", while hitting the golden bar says \"Great Job!\" and adds a slight amount of completion to it, and failing to hit either of these results in nearby [[Twisteds]] being alerted to your location and Machine progress being halted. How large the gray/gold area and the completion given all depends on the Stars you have on Skill Check. When the [[Ichor]] is completely filled up, the Machine will no longer be extractable and will have an indicator for its completion.\n\n"
+  },
+  {
+    "title": "Dandy",
+    "kind": "npc",
+    "selection": {
+      "mode": "infobox",
+      "selector": "Toons",
+      "start": 236,
+      "end": 1078
+    },
+    "pageid": 232,
+    "revision_id": 261597,
+    "revision_timestamp": "2026-09-12T04:32:48Z",
+    "retrieved_at": "2026-09-12T22:33:35.751001+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Dandy",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=261597",
+    "full_source_sha256": "59143ae5684d5a9770025c0e7b5e948da4eb5cd4256293b80cb40759adfdff24",
+    "excerpt_sha256": "e2bc014b3b702d8c6c35537b326272e5c0b06ac9391a0ac5283febeb14bd0760",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Toons\n|title1=Dandicus Dancifer\n|image1=<gallery>\nDandy Render.png |Render\nDandy Full Render.png|Full Render\nDandy Icon.png|Icon\nDandicus Dancifer.png|Full Artwork\nFlavor Frenzy Dandy.png|Flavor Frenzy\nDandyPreRelease.png|Pre-Release\n</gallery>\n|heart1=Heart\n|heart2=Heart\n|heart3=Heart\n|skill_check={{StatComp|Skill|5}}\n|movement_speed={{StatComp|Move|5}}\n|stamina={{StatComp|Stam|5}}\n|stealth={{StatComp|Stealth|5}}\n|extraction_speed={{StatComp|Extract|5}}\n|ability_1={{Center|'''Dandy's World'''<br>{{Small|''(Passive)''}}}}<br>The star of the show.\n|requirement_1=Only playable to developers.\n|skins=*Christmas\n*Easter\n|gender=Male\n|pronouns=He/Him/They/Them/It/Its<ref>https://discord.com/channels/969934252844138496/1004155758574841897/1169101466414370826</ref>\n|designation=L-001\n|release_date=06/14/2024 {{Small|(Alpha Release)}}\n}}"
+  },
+  {
+    "title": "Events",
+    "kind": "event",
+    "selection": {
+      "mode": "prefix",
+      "selector": "===List of Events",
+      "start": 0,
+      "end": 849
+    },
+    "pageid": 8107,
+    "revision_id": 256909,
+    "revision_timestamp": "2026-08-16T20:56:52Z",
+    "retrieved_at": "2026-09-12T22:33:38.655835+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Events",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=256909",
+    "full_source_sha256": "004a3742c16cb04babf2b3580256f38145d31cd8f161911c7501922ef95dccbb",
+    "excerpt_sha256": "934e9479d472e498b1f3c172a81f824440097193333fc8e6a4d60e75b24d77c5",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Limited}}\n{{LinkToCategory}}\nEvents are limited time updates that occur during certain holidays.\n\n==Events==\n===Contents===\nEvents will usually contain limited time content which are [[Holiday Toons]], [[Holiday Twisteds]], [[Holiday Trinkets]], a decorated [[Lobby]], Holiday [[Skins]], a [[Holiday Floor]], Holiday [[Stickers]], and a new [[Currency]]. Events will come back annually and will last about a month. After the Event ends, any Holiday Toons, Trinkets, Stickers, and Skins you collected will be usable year-round, and any Holiday Twisted Research you collected can still be viewed. However, any Event Currency you obtained will disappear, and not be retained for future Events.\n\nCollabs, on the other hand, will contain limited time Skins which can be bought using Robux, and 1 can be unlocked for free by completing in-game quests.\n\n"
+  },
+  {
+    "title": "Cards",
+    "kind": "mechanic",
+    "selection": {
+      "mode": "prefix",
+      "selector": "Certain Cards",
+      "start": 0,
+      "end": 723
+    },
+    "pageid": 651,
+    "revision_id": 259128,
+    "revision_timestamp": "2026-08-28T13:44:58Z",
+    "retrieved_at": "2026-09-12T22:33:32.891647+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Cards",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=259128",
+    "full_source_sha256": "254240ca568871ed58f70fb209cefb8a9a5d5313faed125c105ba17e549d974b",
+    "excerpt_sha256": "432fd369f6bbb2a34bc6e52507205c66d36b6250b678f455b795c0d9afabb7bc",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Thumbnail\n|image1=<gallery>\nPoppy With Cards.png\n</gallery>}}'''Cards''' are a mechanic in [[Dandy's World]]. They can give permanent buffs, [[Items]], or {{Heart}}s. They occur on every odd-numbered [[Floor]]. Players vote on which Cards get played, with the majority vote being the Card selected. If a tie occurs, a Card will be chosen randomly. 3 random Cards out of the 21 options will have a chance to appear until all are eventually voted for. Cards can only be used once until players cycle through the 21 options. Once all Card options have been used (which occurs at Floor 45 {{Small|(Floor 47 in [[Events]])}}), the prompt to vote will stop appearing and the [[Elevator]] will simply move onto the next Floor.\n\n"
+  },
+  {
+    "title": "Pebble's Floor",
+    "kind": "unreleased",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 60
+    },
+    "pageid": 17635,
+    "revision_id": 198379,
+    "revision_timestamp": "2026-01-26T22:35:05Z",
+    "retrieved_at": "2026-09-12T22:33:46.347101+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Pebble%27s_Floor",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=198379",
+    "full_source_sha256": "a936416b6eb1552c182f1b4c5a154f7935cd29b98996dd852e15435936cbcc38",
+    "excerpt_sha256": "a936416b6eb1552c182f1b4c5a154f7935cd29b98996dd852e15435936cbcc38",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "{{Unreleased}}\n\n[[Category:Floors]]\n[[Category:Main Floors]]"
+  },
+  {
+    "title": "Template:StatComp",
+    "kind": "dependency",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 558
+    },
+    "pageid": 18184,
+    "revision_id": 218816,
+    "revision_timestamp": "2026-03-22T03:07:12Z",
+    "retrieved_at": "2026-09-12T22:34:35.570982+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Template%3AStatComp",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=218816",
+    "full_source_sha256": "8629aabe5ba771b1ccdc644f44934e24e219054847ef4f1e1e069f71859ff8f4",
+    "excerpt_sha256": "8629aabe5ba771b1ccdc644f44934e24e219054847ef4f1e1e069f71859ff8f4",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "<onlyinclude>{{StarRow|{{{2}}}}}<br>{{Small|{{#switch: {{{1}}}\n|Skill = (Chance 25%/Size {{#expr: {{{2}}}*50}}/Value {{#expr: ({{{2}}}+1)*0.5}}{{#ifeq:{{#expr: {{{2}}} mod 2}}|1|.0|}}0/Speed {{{2}}})\n|Move = (Walk {{#expr: {{{2}}}*2.5+7.5}}/Sprint {{#expr: {{{2}}}*2.5+17.5}})\n|Stam = ({{#expr: ({{{2}}}+3)*25}})\n|Stealth= ({{#expr: ({{{2}}}-1)*5}})\n|Extract= ({{#expr: ({{{2}}}^4-10*{{{2}}}^3+47*{{{2}}}^2-38*{{{2}}}+360)/480}})\n|}}}}</onlyinclude>\n{{StatComp|Skill|1}}\n\n{{StatComp|Skill|2}}\n\n{{StatComp|Skill|3}}\n\n{{StatComp|Skill|4}}\n\n{{StatComp|Skill|5}}"
+  },
+  {
+    "title": "Template:AI",
+    "kind": "dependency",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 34
+    },
+    "pageid": 11557,
+    "revision_id": 84705,
+    "revision_timestamp": "2025-04-10T13:36:02Z",
+    "retrieved_at": "2026-09-12T22:34:03.084139+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Template%3AAI",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=84705",
+    "full_source_sha256": "5cd7b41b0a74c18c4da93ba7002d8b2af0f09f3a0a4e6201ecdf56be8a73d4c0",
+    "excerpt_sha256": "5cd7b41b0a74c18c4da93ba7002d8b2af0f09f3a0a4e6201ecdf56be8a73d4c0",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "#Redirect [[Template:AbilityIcon]]"
+  },
+  {
+    "title": "Template:AbilityIcon",
+    "kind": "dependency",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 798
+    },
+    "pageid": 11558,
+    "revision_id": 254733,
+    "revision_timestamp": "2026-08-08T23:46:03Z",
+    "retrieved_at": "2026-09-12T22:34:03.084139+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Template%3AAbilityIcon",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=254733",
+    "full_source_sha256": "da6e0123746d45520b324c6d243c26668f7cd5b0b8f90556ff81020d53d47757",
+    "excerpt_sha256": "da6e0123746d45520b324c6d243c26668f7cd5b0b8f90556ff81020d53d47757",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "<onlyinclude>[[File:{{{1}}} Ability Icon.png|{{{size|25}}}px|link=Abilities]]{{#ifeq: {{{name}}}|true|'''{{#switch:{{{1}}}|Astro=Nap Time|Bassie=Springful Sharing|Blot=Blot Jr.|Bobette=Precious Packaging|Brightney=Night Light|Brusha=Artistic Inspiration|Coal=Scout|Cocoa=Bonbon|Connie=Haunting Escape|Cosmo=Sharing is Caring|Flutter=Floaty Dash|Flyte=Gust|Gigi=Surprise!|Ginger=Baked with Care!|Glisten=Reflection|Goob=Hug!|Gourdy=Trick or Treat|Pebble=Speak!|Old Pebble=Sniff|Rudie=Antler Charge|Scraps=Crafty Grapple|Shelly=Inspiration|Sprout=Baked Sweets|Squirm=Distressed Delicacy|Teagan=Tea Time|Tisha=Tidy Up!|Toodles=Beginner's Luck|Vee=Mic Check|Waxwell=Ignite|#default={{{1}}}}}'''|}}</onlyinclude>\n<noinclude>\n{{AI|Scraps|name=true}}\n{{AI|Scraps}}\n[[Category:Icon templates]]\n</noinclude>"
+  },
+  {
+    "title": "Template:TSpeed",
+    "kind": "dependency",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 1806
+    },
+    "pageid": 32973,
+    "revision_id": 240609,
+    "revision_timestamp": "2026-05-22T12:39:42Z",
+    "retrieved_at": "2026-09-12T22:34:37.231178+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Template%3ATSpeed",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=240609",
+    "full_source_sha256": "7b1baa8d5a4e60614d4d6540a50bbc9e5d68abcc1a48edaf5e882167125d1227",
+    "excerpt_sha256": "7b1baa8d5a4e60614d4d6540a50bbc9e5d68abcc1a48edaf5e882167125d1227",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "<includeonly><span style=\"line-height: 0.5;\">\n{{#switch: {{PAGENAME}}\n|Twisted Dyle={{{1}}} walking, {{{2}}} chasing at his slowest speed<br>\n{{Small|Panic Mode: {{#expr: {{{1}}} * 1.20 round 2}} walking, {{#expr: {{{2}}} * 1.20 round 2}} chasing<br>Suppression: {{#expr: {{{1}}} * 1.15 round 2}} walking, {{#expr: {{{2}}} * 1.15 round 2}} chasing}}<br>\n{{#expr: {{{1}}} + 13.5 round 2}} walking, {{#expr: {{{2}}} + 24 round 2}} chasing at his highest speed<br>\n{{Small|Panic Mode: {{#expr: ({{{1}}} + 13.5) * 1.20 round 2}} walking, {{#expr: ({{{2}}} + 24) * 1.20 round 2}} chasing<br>Suppression: {{#expr: ({{{1}}} + 13.5) * 1.15 round 2}} walking, {{#expr: ({{{2}}} + 24) * 1.15 round 2}} chasing}}\n|Twisted Razzle & Dazzle|Twisted Rodger|Twisted Blot=None (Static)\n|Twisted Coal='''Normal Floors:''' {{{1}}} walking, {{{2}}} chasing<br>\n{{Small|Panic Mode: {{#expr: {{{1}}} * 1.20 round 2}} walking, {{#expr: {{{2}}} * 1.20 round 2}} chasing<br>Suppression: {{#expr: {{{1}}} * 1.15 round 2}} walking, {{#expr: {{{2}}} * 1.15 round 2}} chasing}}<br>\n'''Blackouts:''' {{#expr: {{{1}}} + 2 round 2}} walking, {{#expr: {{{2}}} + 9 round 2}} chasing<br>\n{{Small|Panic Mode: {{#expr: {{{1}}} + 2 * 1.20 round 2}} walking, {{#expr: {{{2}}} + 9 * 1.20 round 2}} chasing<br>Suppression: {{#expr: {{{1}}} + 2 * 1.15 round 2}} walking, {{#expr: {{{2}}} + 9 * 1.15 round 2}} chasing}}\n|#default={{#switch: {{PAGENAME}}|Twisted Glisten=6 walking (When passive)<br>|Twisted Gourdy=None (When passive)<br>}}{{{1}}} walking, {{{2}}} chasing<br>\n{{Small|Panic Mode: {{#expr: {{{1}}} * 1.20 round 2}} walking, {{#expr: {{{2}}} * 1.20 round 2}} chasing<br>Suppression: {{#expr: {{{1}}} * 1.15 round 2}} walking, {{#expr: {{{2}}} * 1.15 round 2}} chasing}}\n}}\n</span></includeonly>\n<noinclude>\n{{TSpeed|8|16}}\n</noinclude>"
+  },
+  {
+    "title": "Template:FloorTypeAmount",
+    "kind": "dependency",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 2
+    },
+    "pageid": 28265,
+    "revision_id": 209343,
+    "revision_timestamp": "2026-02-27T20:04:21Z",
+    "retrieved_at": "2026-09-12T22:34:13.791127+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Template%3AFloorTypeAmount",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=209343",
+    "full_source_sha256": "6b51d431df5d7f141cbececcf79edf3dd861c3b4069f0b11661a3eefacbba918",
+    "excerpt_sha256": "6b51d431df5d7f141cbececcf79edf3dd861c3b4069f0b11661a3eefacbba918",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "12"
+  },
+  {
+    "title": "Template:FloorAmount",
+    "kind": "dependency",
+    "selection": {
+      "mode": "all",
+      "selector": "",
+      "start": 0,
+      "end": 2
+    },
+    "pageid": 28266,
+    "revision_id": 217557,
+    "revision_timestamp": "2026-03-20T18:59:08Z",
+    "retrieved_at": "2026-09-12T22:34:13.791127+00:00",
+    "source_url": "https://dandys-world-robloxhorror.fandom.com/wiki/Template%3AFloorAmount",
+    "revision_url": "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=217557",
+    "full_source_sha256": "e29c9c180c6279b0b02abd6a1801c7c04082cf486ec027aa13515e4f3884bb6b",
+    "excerpt_sha256": "e29c9c180c6279b0b02abd6a1801c7c04082cf486ec027aa13515e4f3884bb6b",
+    "license": "CC-BY-SA-3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "wikitext": "32"
+  }
+]
