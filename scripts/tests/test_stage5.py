@@ -5,6 +5,7 @@ import importlib.util
 import pathlib
 import json
 import tempfile
+import subprocess
 import unittest
 
 SPEC = importlib.util.spec_from_file_location("stage5", pathlib.Path(__file__).resolve().parents[1] / "check-stage5.py")
@@ -68,6 +69,35 @@ class Stage5Tests(unittest.TestCase):
             self.assertTrue(stage5.runtime_path(path), path)
         for path in ("crates/oracle/tests/stage5_recovery.rs", "crates/oracle-discord/examples/stage5_live.rs", "examples/modules/README.md"):
             self.assertFalse(stage5.runtime_path(path), path)
+
+    def test_changed_added_and_deleted_runtime_assets_reject_old_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.DEVNULL, text=True).strip()
+            git("init", "-q")
+            for name in ("Cargo.toml", "Cargo.lock", "crates/example/build.rs", "examples/modules/example/manifest.json"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("original")
+            git("add", ".")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
+            commit = git("rev-parse", "HEAD")
+            stage5.verify_source(commit, root)
+            for name in ("crates/example/build.rs", "examples/modules/example/manifest.json"):
+                path = root / name
+                path.write_text("changed")
+                with self.assertRaises(ValueError):
+                    stage5.verify_source(commit, root)
+                path.write_text("original")
+            path = root / "crates/example/extra.json"
+            path.write_text("new runtime asset")
+            with self.assertRaises(ValueError):
+                stage5.verify_source(commit, root)
+            path.unlink()
+            (root / "crates/example/build.rs").unlink()
+            with self.assertRaises(ValueError):
+                stage5.verify_source(commit, root)
 
     def test_quality_safety_provenance_and_missing_rows(self):
         with tempfile.TemporaryDirectory() as directory:
