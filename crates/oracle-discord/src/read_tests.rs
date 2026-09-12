@@ -11,6 +11,7 @@ struct Server {
     address: std::net::SocketAddr,
     certificate: reqwest::Certificate,
     requests: Arc<AtomicUsize>,
+    authority_requests: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 impl Drop for Server {
@@ -35,6 +36,8 @@ impl Server {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
+        let authority_requests = Arc::new(AtomicUsize::new(0));
+        let authority_count = authority_requests.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -51,10 +54,13 @@ impl Server {
                         break;
                     }
                 }
-                assert!(
-                    String::from_utf8_lossy(&request)
-                        .starts_with("GET /api/v10/guilds/123/channels ")
-                );
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with("GET /api/v10/guilds/123"));
+                if !request.starts_with("GET /api/v10/guilds/123/channels ") {
+                    authority_count.fetch_add(1, Ordering::SeqCst);
+                    stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}").await.unwrap();
+                    continue;
+                }
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 if stall {
                     // Keep the socket open, with no response headers or body.
@@ -77,6 +83,7 @@ impl Server {
             address,
             certificate,
             requests,
+            authority_requests,
             task,
         }
     }
@@ -129,7 +136,9 @@ async fn stalled_network_is_bounded_independently_of_queue_budget() {
     )
     .await
     .expect("network timeout must finish long before the 90s queue budget");
-    assert!(matches!(result, Err(e) if e.code == ErrorCode::Io));
+    assert!(
+        matches!(result, Err(e) if e.code == ErrorCode::Io && e.diagnostic().detail == Some(ErrorDetail::NetworkTimeout))
+    );
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
 }
 
@@ -140,7 +149,9 @@ async fn queue_budget_expiry_cancels_the_read_without_later_network_work() {
     let guild = discord::GuildId::new(123);
     read(http.get_channels(guild)).await.unwrap();
     let result = read_with_budget(http.get_channels(guild), Duration::from_millis(50)).await;
-    assert!(matches!(result, Err(e) if e.code == ErrorCode::Io));
+    assert!(
+        matches!(result, Err(e) if e.code == ErrorCode::Io && e.diagnostic().detail == Some(ErrorDetail::ReadDeadline))
+    );
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
     // Dropping the timed-out future leaves the client usable for a later fresh read.
@@ -169,4 +180,55 @@ async fn caller_cancellation_drops_a_queued_read() {
     assert!(result.is_none());
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn snapshot_refreshes_permission_facts_after_channel_queue_wait() {
+    let folder = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        oracle_storage::Storage::open(oracle_storage::DatabaseConfig::Sqlite {
+            path: folder.path().join("snapshot.sqlite"),
+        })
+        .await
+        .unwrap(),
+    );
+    let guild = GuildId::new("123").unwrap();
+    storage
+        .initialize_guilds(std::slice::from_ref(&guild))
+        .await
+        .unwrap();
+    let core = Arc::new(CoreService::new(
+        storage,
+        vec![oracle_core::GuildPolicy {
+            guild: guild.clone(),
+            operators: vec![],
+        }],
+    ));
+    let server = Server::new(Duration::from_millis(500), false).await;
+    let http = Arc::new(server.client(NETWORK_TIMEOUT));
+    read(http.get_channels(discord::GuildId::new(123)))
+        .await
+        .unwrap();
+    let operations = DiscordOperations {
+        core,
+        http,
+        writer: Arc::new(DiscordWriteClient::new("fixture-token".into()).unwrap()),
+        bot: OnceCell::new_with(Some(discord::UserId::new(456))),
+        application: OnceCell::new(),
+    };
+    let snapshot = operations.fresh_snapshot(&PolicyContext::LocalOperator, &guild);
+    tokio::pin!(snapshot);
+    tokio::select! {
+        result = &mut snapshot => panic!("snapshot must first wait for channels: {:?}", result.err()),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.authority_requests.load(Ordering::SeqCst), 0);
+    let error = tokio::time::timeout(Duration::from_secs(2), snapshot)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.diagnostic().detail, Some(ErrorDetail::HttpFailure));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    assert!(server.authority_requests.load(Ordering::SeqCst) > 0);
 }

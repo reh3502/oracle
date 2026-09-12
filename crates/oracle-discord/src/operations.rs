@@ -2,7 +2,7 @@
 use crate::transport::{DiscordWriteClient, FreshCheck, WriteResponse};
 use async_trait::async_trait;
 use hyper::Method;
-use oracle_core::{CoreService, Error, ErrorCode, GuildId, PolicyContext, Result};
+use oracle_core::{CoreService, Error, ErrorCode, ErrorDetail, GuildId, PolicyContext, Result};
 use oracle_operations::{
     commands::{CommandBackend, PublishedCommand, canonical_definition},
     executor::{ChannelMutation, SendGuard, StructureBackend, now},
@@ -53,8 +53,18 @@ async fn read_with_budget<T>(
 ) -> Result<T> {
     tokio::time::timeout(budget, future)
         .await
-        .map_err(|_| error(ErrorCode::Io))?
-        .map_err(|_| error(ErrorCode::Io))
+        .map_err(|_| Error::with_detail(ErrorCode::Io, ErrorDetail::ReadDeadline))?
+        .map_err(|failure| {
+            let detail = match failure {
+                serenity::Error::Http(serenity::http::HttpError::Request(ref request))
+                    if request.is_timeout() =>
+                {
+                    ErrorDetail::NetworkTimeout
+                }
+                _ => ErrorDetail::HttpFailure,
+            };
+            Error::with_detail(ErrorCode::Io, detail)
+        })
 }
 
 pub struct DiscordOperations {
@@ -114,9 +124,11 @@ impl DiscordOperations {
                 discord::UserId::new(sid(user.as_str())?)
             }
         };
-        let (details, channels, actor, bot) = tokio::try_join!(
+        // Channel inventory has a minute-long rate-limit bucket. Refresh
+        // permission facts after that queue wait, before using them for writes.
+        let channels = read(self.http.get_channels(guild_id)).await?;
+        let (details, actor, bot) = tokio::try_join!(
             read(self.http.get_guild(guild_id)),
-            read(self.http.get_channels(guild_id)),
             read(self.http.get_member(guild_id, actor_id)),
             read(self.http.get_member(guild_id, bot_id))
         )?;

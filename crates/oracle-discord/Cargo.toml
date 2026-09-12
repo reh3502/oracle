@@ -23,6 +23,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 webpki-roots = "1"
 
 [dev-dependencies]
+tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 oracle-storage = { path = "../oracle-storage" }
 rustls = { version = "0.23", default-features = false, features = ["std"] }
