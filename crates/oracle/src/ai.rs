@@ -212,6 +212,23 @@ fn rejected_plan_reference() -> HostOutcome {
         search_query: None,
     }
 }
+
+// Membership is rejected before receipt lookup; no external effect was attempted.
+fn rejected_read_reference() -> HostOutcome {
+    HostOutcome {
+        value: json!({
+            "error":"invalid_read_reference",
+            "host_error_code":ErrorCode::ForbiddenScope,
+            "next_action":"Use a reference issued in this run. Configuration inspection may show a prior run's receipt; inspect current state or prepare the requested run-owned plan instead."
+        }),
+        is_error: true,
+        unknown: false,
+        progress: false,
+        references: vec![],
+        wait: None,
+        search_query: None,
+    }
+}
 /// Match only host-issued plans in this run's finished configuration ledger.
 /// Equal current intent is evidence of equivalent state, never evidence that an
 /// earlier apply happened or that a plan from another run was authorized here.
@@ -311,7 +328,7 @@ fn core_entries() -> Vec<Entry> {
             "Inspect visible guild channels roles and permissions before planning server structure. This observation alone cannot complete a setup request; plan and apply the desired state even if it already exists.",
             object(json!({}), &[]),
             "core:inspect:1".into(),
-            false,
+            true,
         ),
         entry(
             "core_discord_plan_v1",
@@ -328,7 +345,7 @@ fn core_entries() -> Vec<Entry> {
             "Apply a run-owned structure plan after required exact human approval. Never invent plan IDs.",
             object(json!({"reference":string()}), &["reference"]),
             "core:apply:1".into(),
-            false,
+            true,
         ),
     ]
 }
@@ -610,6 +627,9 @@ impl ToolHost for HostTools {
             }
             "core_operation_get_v1" => {
                 let reference: Reference = decode(call.arguments.clone())?;
+                if require_reference(run, &reference.reference).is_err() {
+                    return Ok(rejected_read_reference());
+                }
                 outcome(
                     self.inspect_reference(context, run, &reference.reference)
                         .await?,
@@ -650,7 +670,7 @@ impl ToolHost for HostTools {
                 let Some(plan) = plan_reference(run, &reference.reference, "structure:") else {
                     return Ok(rejected_plan_reference());
                 };
-                outcome(
+                let mut result = outcome(
                     host.execute(
                         context,
                         &run.guild,
@@ -658,7 +678,9 @@ impl ToolHost for HostTools {
                         cancel,
                     )
                     .await?,
-                )
+                );
+                result.references.push(reference.reference);
+                result
             }
             _ => {
                 let parts: Vec<_> = selected.binding.split(':').collect();
@@ -771,7 +793,7 @@ impl ToolHost for HostTools {
                         let Some(plan) = plan_reference(run, &reference.reference, &prefix) else {
                             return Ok(rejected_plan_reference());
                         };
-                        outcome(
+                        let mut result = outcome(
                             host.execute(
                                 context,
                                 &run.guild,
@@ -782,7 +804,9 @@ impl ToolHost for HostTools {
                                 cancel,
                             )
                             .await?,
-                        )
+                        );
+                        result.references.push(reference.reference);
+                        result
                     }
                     _ => return Err(invalid()),
                 }
@@ -880,6 +904,7 @@ impl ToolHost for HostTools {
             complete &= verified;
             receipts.push(json!({"reference":reference,"receipt":receipt,"verified":verified}));
         }
+        let receipts_verified = complete;
         let mut pending_verification = Vec::new();
         let snapshot = self
             .host()?
@@ -972,8 +997,9 @@ impl ToolHost for HostTools {
                 .iter()
                 .any(|resolved| resolved.call_id == call.call_id)
         });
-        let verification_query = (!unresolved && !pending_verification.is_empty())
-            .then(|| pending_verification.join(" "));
+        let verification_query =
+            (receipts_verified && !unresolved && !pending_verification.is_empty())
+                .then(|| pending_verification.join(" "));
         Ok(Reconciliation {
             verification_query,
             resolved_calls,

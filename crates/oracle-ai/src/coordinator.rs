@@ -544,11 +544,13 @@ impl Coordinator {
                         )
                         .await;
                 }
-                if !verification_continued && let Some(hint) = evidence.verification_hint() {
-                    verification_continued = true;
+                if let Some(hint) = evidence.verification_hint() {
                     query = hint.to_owned();
-                    saved.run.status = RunStatus::Verifying;
-                    self.runs.save(&mut saved, now()).await?;
+                    if !verification_continued {
+                        verification_continued = true;
+                        saved.run.status = RunStatus::Verifying;
+                        self.runs.save(&mut saved, now()).await?;
+                    }
                 }
                 semantic = evidence.value;
                 continuation = None;
@@ -816,6 +818,7 @@ impl Coordinator {
             self.runs.save(&mut saved, now()).await?;
             results.clear();
             let mut progress = false;
+            let mut returned_references = false;
             let mut wait = None;
             for call in &turn.calls {
                 self.checkpoint(context, &saved, &cancel).await?;
@@ -916,12 +919,13 @@ impl Coordinator {
                     )
                     .await?;
                 if bounded {
-                    if let Some(discovered) = outcome
-                        .search_query
-                        .filter(|query| !query.trim().is_empty() && query.len() <= 4096)
-                    {
+                    if let Some(discovered) = outcome.search_query.filter(|query| {
+                        !verification_continued && !query.trim().is_empty() && query.len() <= 4096
+                    }) {
                         query = discovered;
                     }
+                    // Existing references matter too: apply may finish an already-owned plan.
+                    returned_references |= !outcome.references.is_empty();
                     for reference in outcome.references {
                         if !saved.run.references.contains(&reference) {
                             saved.run.references.push(reference);
@@ -955,6 +959,35 @@ impl Coordinator {
                 return self
                     .stop(saved, status, "host_requires_input_or_reconciliation")
                     .await;
+            }
+            // Successful reference-bearing rounds may advance the host's pending
+            // verification query. Ordinary discovery does not trigger reconciliation.
+            if returned_references && results.iter().all(|result| !result.is_error) {
+                let evidence = self.reconcile(context, &mut saved).await?;
+                if evidence.unresolved {
+                    return self
+                        .stop(
+                            saved,
+                            RunStatus::Paused,
+                            "unresolved_effect_requires_reconciliation",
+                        )
+                        .await;
+                }
+                if let Some(hint) = evidence.verification_hint() {
+                    query = hint.to_owned();
+                    // Refresh selection only from host reconciliation. A later hint
+                    // does not grant another semantic restart or completion attempt.
+                    if !verification_continued {
+                        verification_continued = true;
+                        semantic = evidence.value;
+                        saved.run.status = RunStatus::Verifying;
+                        self.runs.save(&mut saved, now()).await?;
+                        continuation = None;
+                        results.clear();
+                        session_turns = 0;
+                        continue;
+                    }
+                }
             }
             continuation = Some(turn.continuation);
         }

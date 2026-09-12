@@ -512,6 +512,202 @@ async fn agent_host_rejects_reference_copied_from_another_run() {
 }
 
 #[tokio::test]
+async fn agent_host_keeps_inspection_and_apply_available_after_unrelated_search() {
+    let (_root, host, _) = fixture().await;
+    let run = coordinator(&host, None)
+        .create(
+            &PolicyContext::LocalOperator,
+            GuildId::new("100").unwrap(),
+            "Set up Minecraft".into(),
+        )
+        .await
+        .unwrap();
+    let tools = HostTools {
+        host: Arc::downgrade(&host),
+    };
+    let catalog = tools
+        .catalog(&PolicyContext::LocalOperator, &run.run)
+        .await
+        .unwrap();
+    for query in ["unrelatedlexicalquery", "", "receipt"] {
+        let selection = catalog.select(query, 12).unwrap();
+        for name in ["core_guild_inspect_v1", "core_discord_apply_v1"] {
+            let tool = selection
+                .tools
+                .iter()
+                .find(|t| t.definition.name == name)
+                .expect("inspection and authorized apply remain available regardless of query");
+            let baseline = catalog.select("structure inspect apply", 12).unwrap();
+            let original = baseline
+                .tools
+                .iter()
+                .find(|t| t.definition.name == name)
+                .unwrap();
+            assert_eq!(tool.descriptor_hash, original.descriptor_hash);
+        }
+        catalog.validate(&selection).unwrap();
+    }
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_host_rejects_unissued_read_references_without_unknown_effects() {
+    let (_root, host, world) = fixture().await;
+    let ai = coordinator(&host, None);
+    let guild = GuildId::new("100").unwrap();
+    let first = ai
+        .ask(
+            &PolicyContext::LocalOperator,
+            guild.clone(),
+            "Set up Minecraft".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.run.status, RunStatus::Succeeded);
+    let mut second = ai
+        .create(
+            &PolicyContext::LocalOperator,
+            guild.clone(),
+            "Read receipts".into(),
+        )
+        .await
+        .unwrap()
+        .run;
+    let tools = HostTools {
+        host: Arc::downgrade(&host),
+    };
+    let selection = tools
+        .catalog(&PolicyContext::LocalOperator, &second)
+        .await
+        .unwrap()
+        .select("receipt", 12)
+        .unwrap();
+    second.catalog_revision = Some(selection.revision);
+    let tool = selection
+        .tools
+        .iter()
+        .find(|t| t.definition.name == "core_operation_get_v1")
+        .unwrap();
+    let foreign = first.run.references[0].clone();
+    for reference in [
+        foreign.as_str(),
+        "structure:unissued",
+        "config:community.activity-log:unissued",
+        "verify:community.activity-log:unissued",
+    ] {
+        let call = ToolCall {
+            id: "read-unissued".into(),
+            name: tool.definition.name.clone(),
+            arguments: json!({"reference":reference}),
+        };
+        let rejection = tools
+            .execute(
+                &PolicyContext::LocalOperator,
+                &second,
+                tool,
+                &call,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("an unissued receipt read is a known rejection");
+        assert!(rejection.is_error);
+        assert!(!rejection.unknown);
+        assert!(!rejection.progress);
+        assert!(rejection.wait.is_none());
+        assert!(rejection.references.is_empty());
+        assert_eq!(
+            rejection.value["host_error_code"],
+            json!(ErrorCode::ForbiddenScope)
+        );
+        assert_eq!(rejection.value["error"], "invalid_read_reference");
+        assert!(rejection.value.get("receipt").is_none());
+        // Direct receipt inspection must still enforce current-run ownership.
+        assert_eq!(
+            tools
+                .inspect_reference(&PolicyContext::LocalOperator, &second, reference)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ForbiddenScope
+        );
+    }
+    assert!(second.references.is_empty());
+    let mut owned = first.run.clone();
+    owned.catalog_revision = Some(selection.revision);
+    let call = ToolCall {
+        id: "read-owned".into(),
+        name: tool.definition.name.clone(),
+        arguments: json!({"reference":foreign}),
+    };
+    let read = tools
+        .execute(
+            &PolicyContext::LocalOperator,
+            &owned,
+            tool,
+            &call,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!read.is_error && !read.unknown);
+    assert_eq!(read.value["state"], "complete");
+    let apply_selection = tools
+        .catalog(&PolicyContext::LocalOperator, &owned)
+        .await
+        .unwrap()
+        .select("structure apply", 12)
+        .unwrap();
+    let apply_tool = apply_selection
+        .tools
+        .iter()
+        .find(|t| t.definition.name == "core_discord_apply_v1")
+        .unwrap();
+    let applied = tools
+        .execute(
+            &PolicyContext::LocalOperator,
+            &owned,
+            apply_tool,
+            &ToolCall {
+                id: "apply-owned".into(),
+                name: apply_tool.definition.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        applied.references, owned.references,
+        "apply notifies reconciliation of an already-owned reference"
+    );
+    assert!(!applied.is_error && !applied.unknown);
+    assert_eq!(
+        applied.value, read.value,
+        "receipt JSON contract is unchanged"
+    );
+    let other_owner = PolicyContext::Discord {
+        guild,
+        user: UserId::new("99").unwrap(),
+        manage_guild: true,
+    };
+    assert_eq!(
+        tools
+            .execute(&other_owner, &owned, tool, &call, &CancellationToken::new())
+            .await
+            .err()
+            .expect("foreign owner must remain forbidden")
+            .code,
+        ErrorCode::ForbiddenScope
+    );
+    assert_eq!(
+        world.writes.load(Ordering::SeqCst),
+        4,
+        "reads must not mutate structure"
+    );
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn agent_permission_expansion_waits_for_exact_authenticated_approval() {
     let (_root, host, world) = fixture().await;
     world.snapshot.lock().unwrap().channels.push(Channel {

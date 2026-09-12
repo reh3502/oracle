@@ -211,11 +211,9 @@ impl ModelProvider for Script {
                 "community_activity_log_config_apply_v1",
                 json!({"reference":input["results"][0]["value"]["reference"]}),
             )),
-            // Premature completion after stored/active configuration readback
-            // must trigger the host's bounded verification follow-up.
-            6 => None,
-            7 => Some(("community_activity_log_probe_v1", json!({}))),
-            8 => Some(("community_activity_log_status_v1", json!({}))),
+            // Apply has already triggered the host's verification handoff.
+            6 => Some(("community_activity_log_probe_v1", json!({}))),
+            7 => Some(("community_activity_log_status_v1", json!({}))),
             _ => None,
         };
         let calls = proposal
@@ -298,6 +296,268 @@ pub(super) fn coordinator_with_provider(
         },
     )
     .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
+async fn agent_logging_repeat_recovers_from_prior_run_receipt_read() {
+    struct RepeatRead {
+        inner: Script,
+        injected: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl ModelProvider for RepeatRead {
+        fn profile(&self) -> &ModelProfile {
+            self.inner.profile()
+        }
+        fn prepare(
+            &self,
+            request: ModelRequest,
+        ) -> std::result::Result<PreparedTurn, ProviderError> {
+            self.inner.prepare(request)
+        }
+        async fn send(
+            &self,
+            request: PreparedTurn,
+            cancel: &CancellationToken,
+        ) -> std::result::Result<ModelTurn, ProviderError> {
+            let input: Value = serde_json::from_str(&request.body).unwrap();
+            let step = self.inner.step.load(Ordering::SeqCst);
+            let inject = step == 2 && !self.injected.swap(true, Ordering::SeqCst);
+            if step == 2 && !inject {
+                let rejected = &input["results"][0];
+                assert_eq!(rejected["is_error"], true);
+                assert_eq!(rejected["value"]["error"], "invalid_read_reference");
+                assert_eq!(rejected["value"]["host_error_code"], "forbidden_scope");
+            }
+            let mut turn = self.inner.send(request, cancel).await?;
+            if inject {
+                let config = &input["results"][0]["value"];
+                assert_eq!(config["stored_revision"], 1);
+                let prior_plan = config["receipt"]["plan"].as_str().unwrap();
+                turn.calls[0] = ToolCall {
+                    id: "foreign-receipt-read".into(),
+                    name: "core_operation_get_v1".into(),
+                    arguments: json!({"reference":format!("config:community.activity-log:{prior_plan}")}),
+                };
+                // Retry the fake's normal planning step after the known rejection.
+                self.inner.step.store(2, Ordering::SeqCst);
+            }
+            Ok(turn)
+        }
+    }
+    let (root, host, world) = super::tests::fixture().await;
+    let (_, transport) = services(&host).await;
+    let module = install(root.path(), &host, true).await;
+    let guild = GuildId::new("100").unwrap();
+    let original = coordinator(&host, "456")
+        .ask(
+            &PolicyContext::LocalOperator,
+            guild.clone(),
+            "Set up moderate logging and verify delivery".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.run.status, RunStatus::Succeeded);
+    let before = host
+        .modules
+        .configuration_inspect(&PolicyContext::LocalOperator, &guild, &module)
+        .await
+        .unwrap();
+    let repeated = coordinator_with_provider(
+        &host,
+        Arc::new(RepeatRead {
+            inner: Script {
+                step: AtomicUsize::new(0),
+                destination: "456".into(),
+            },
+            injected: AtomicBool::new(false),
+        }),
+    )
+    .ask(
+        &PolicyContext::LocalOperator,
+        guild.clone(),
+        "Configure community.activity-log and verify delivery".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated.run.status,
+        RunStatus::Succeeded,
+        "{:?}",
+        repeated.run.problem
+    );
+    let after = host
+        .modules
+        .configuration_inspect(&PolicyContext::LocalOperator, &guild, &module)
+        .await
+        .unwrap();
+    assert_eq!(after.stored_revision, before.stored_revision);
+    assert_eq!(after.values, before.values);
+    assert_eq!(
+        transport.messages.lock().unwrap().len(),
+        1,
+        "repeat must reuse original delivery"
+    );
+    assert_eq!(world.writes.load(Ordering::SeqCst), 0);
+    let calls = RunStore::new(host.core.clone(), host.storage.clone())
+        .calls(&repeated)
+        .await
+        .unwrap();
+    assert!(
+        calls
+            .iter()
+            .all(|r| r.call.state == oracle_ai::state::CallState::Finished)
+    );
+    let errors: Vec<_> = calls.iter().filter(|r| r.call.is_error).collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].call.name, "core_operation_get_v1");
+    let rejected_reference = errors[0].call.arguments["reference"].as_str().unwrap();
+    assert!(
+        original
+            .run
+            .references
+            .iter()
+            .any(|r| r == rejected_reference)
+    );
+    assert!(
+        !repeated
+            .run
+            .references
+            .iter()
+            .any(|r| r == rejected_reference),
+        "read must not import foreign ownership"
+    );
+    assert_eq!(
+        repeated
+            .run
+            .references
+            .iter()
+            .filter(|r| r.starts_with("config:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        repeated
+            .run
+            .references
+            .iter()
+            .find(|r| r.starts_with("verify:")),
+        original
+            .run
+            .references
+            .iter()
+            .find(|r| r.starts_with("verify:"))
+    );
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires separately built ORACLE_ACTIVITY_LOG"]
+async fn agent_logging_verification_hint_waits_for_effective_receipts() {
+    let (root, host, _) = super::tests::fixture().await;
+    let (_, transport) = services(&host).await;
+    install(root.path(), &host, true).await;
+    let guild = GuildId::new("100").unwrap();
+    let mut run = coordinator(&host, "456")
+        .create(
+            &PolicyContext::LocalOperator,
+            guild,
+            "Configure activity logging".into(),
+        )
+        .await
+        .unwrap()
+        .run;
+    let tools = HostTools {
+        host: Arc::downgrade(&host),
+    };
+    let selection = tools
+        .catalog(&PolicyContext::LocalOperator, &run)
+        .await
+        .unwrap()
+        .select("community.activity-log configuration plan apply", 12)
+        .unwrap();
+    run.catalog_revision = Some(selection.revision);
+    let plan_tool = selection
+        .tools
+        .iter()
+        .find(|t| t.definition.name == "community_activity_log_config_plan_v1")
+        .unwrap();
+    let planned = tools
+        .execute(
+            &PolicyContext::LocalOperator,
+            &run,
+            plan_tool,
+            &ToolCall {
+                id: "plan".into(),
+                name: plan_tool.definition.name.clone(),
+                arguments: json!({"preset":"moderate/v1","values":{"destination":"456"}}),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    run.references.extend(planned.references);
+    let pending = tools
+        .reconcile(&PolicyContext::LocalOperator, &run, &[])
+        .await
+        .unwrap();
+    assert!(!pending.complete && !pending.unresolved);
+    assert_eq!(
+        pending.value["pending_verification"],
+        json!(["community_activity_log_probe_v1"])
+    );
+    assert!(
+        pending.verification_query.is_none(),
+        "a merely planned configuration must not enter verification phase"
+    );
+    let apply_tool = selection
+        .tools
+        .iter()
+        .find(|t| t.definition.name == "community_activity_log_config_apply_v1")
+        .unwrap();
+    let applied = tools
+        .execute(
+            &PolicyContext::LocalOperator,
+            &run,
+            apply_tool,
+            &ToolCall {
+                id: "apply".into(),
+                name: apply_tool.definition.name.clone(),
+                arguments: json!({"reference":run.references[0]}),
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.references, run.references);
+    assert_eq!(applied.value["state"], "effective");
+    assert!(
+        applied.value.get("reference").is_none(),
+        "do not change apply receipt JSON"
+    );
+    assert!(!applied.is_error && !applied.unknown);
+    let ready = tools
+        .reconcile(&PolicyContext::LocalOperator, &run, &[])
+        .await
+        .unwrap();
+    assert!(
+        !ready.complete && !ready.unresolved,
+        "delivery still needs verification"
+    );
+    assert_eq!(
+        ready.verification_query.as_deref(),
+        Some("community_activity_log_probe_v1")
+    );
+    assert_eq!(
+        ready.value["pending_verification"],
+        pending.value["pending_verification"]
+    );
+    assert!(
+        transport.messages.lock().unwrap().is_empty(),
+        "reconciliation must not send a probe"
+    );
+    host.close().await.unwrap();
 }
 
 #[tokio::test]
