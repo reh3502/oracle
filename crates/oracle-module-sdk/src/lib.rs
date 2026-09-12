@@ -8,11 +8,12 @@ use oracle_contracts::{
 pub use oracle_rpc::RpcError;
 use oracle_rpc::{RpcHandler, RpcPeer};
 pub use oracle_task_scope::{HostTasks, SpawnError, TaskError, TaskId, TaskStats};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     future::Future,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -36,6 +37,16 @@ fn encode<T: serde::Serialize>(value: T) -> Result<Value> {
 pub enum Mode {
     Normal,
     Migration,
+}
+
+/// Host-supplied initialization settings for protocol 1.1 modules.
+/// Paths are selected and validated by the operator's host, never by a manifest
+/// or invocation. This is configuration, not a filesystem sandbox.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_directory: Option<PathBuf>,
 }
 
 /// A tracked scope exposes no host client and no storage authority.
@@ -168,6 +179,16 @@ pub trait Module: Send + Sync + 'static {
     async fn initialize(&self, _mode: Mode, _global: TaskScope) -> Result<()> {
         Ok(())
     }
+    /// Protocol 1.1 initialization. The default preserves the original hook.
+    /// Protocol 1.0 modules receive only `initialize`, with no runtime payload.
+    async fn initialize_with_runtime(
+        &self,
+        mode: Mode,
+        global: TaskScope,
+        _runtime: RuntimeConfiguration,
+    ) -> Result<()> {
+        self.initialize(mode, global).await
+    }
     async fn activate(&self, _context: GuildContext) -> Result<()> {
         Ok(())
     }
@@ -236,6 +257,14 @@ struct Initialize {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct InitializeV11 {
+    session: String,
+    generation: u64,
+    mode: Mode,
+    runtime: RuntimeConfiguration,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Activation {
     guild: GuildId,
     epoch: u64,
@@ -281,6 +310,7 @@ struct GuildState {
 #[derive(Default)]
 struct State {
     hello: Option<(String, u64)>,
+    protocol_minor: Option<u32>,
     mode: Option<Mode>,
     stopping: bool,
     guilds: BTreeMap<GuildId, GuildState>,
@@ -440,7 +470,9 @@ impl<M: Module> RpcHandler for Driver<M> {
                 let request: Hello = decode(params)?;
                 let manifest = self.module.manifest();
                 if request.protocol_major != 1
-                    || request.protocol_minor < manifest.protocol_minor_min
+                    || manifest.protocol_major != 1
+                    || manifest.protocol_minor_min > 1
+                    || request.protocol_minor != manifest.protocol_minor_min
                     || request.session.is_empty()
                 {
                     return Err(denied());
@@ -450,10 +482,33 @@ impl<M: Module> RpcHandler for Driver<M> {
                     return Err(denied());
                 }
                 state.hello = Some((request.session, request.generation));
-                Ok(json!({"protocol_major":1,"protocol_minor":0,"manifest":manifest}))
+                state.protocol_minor = Some(request.protocol_minor);
+                Ok(
+                    json!({"protocol_major":1,"protocol_minor":request.protocol_minor,"manifest":manifest}),
+                )
             }
             "initialize" => {
-                let request: Initialize = decode(params)?;
+                let minor = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .protocol_minor
+                    .ok_or_else(denied)?;
+                let (request, runtime) = match minor {
+                    0 => (decode::<Initialize>(params)?, None),
+                    1 => {
+                        let request: InitializeV11 = decode(params)?;
+                        (
+                            Initialize {
+                                session: request.session,
+                                generation: request.generation,
+                                mode: request.mode,
+                            },
+                            Some(request.runtime),
+                        )
+                    }
+                    _ => return Err(denied()),
+                };
                 {
                     let state = self.state.lock().unwrap();
                     if state.mode.is_some()
@@ -463,9 +518,18 @@ impl<M: Module> RpcHandler for Driver<M> {
                         return Err(denied());
                     }
                 }
-                self.module
-                    .initialize(request.mode, self.global.clone())
-                    .await?;
+                match runtime {
+                    Some(runtime) => {
+                        self.module
+                            .initialize_with_runtime(request.mode, self.global.clone(), runtime)
+                            .await?
+                    }
+                    None => {
+                        self.module
+                            .initialize(request.mode, self.global.clone())
+                            .await?
+                    }
+                }
                 self.state.lock().unwrap().mode = Some(request.mode);
                 Ok(json!({"initialized":true}))
             }
@@ -774,6 +838,188 @@ mod tests {
             self.peer.close().await;
             self.server.close().await;
         }
+    }
+    struct RuntimeProbe {
+        minor: u32,
+        received: Mutex<Vec<(Mode, RuntimeConfiguration)>>,
+    }
+    #[async_trait]
+    impl Module for RuntimeProbe {
+        fn manifest(&self) -> ModuleManifest {
+            let mut manifest = Probe {
+                saved: Mutex::new(None),
+                entered: tokio::sync::Notify::new(),
+            }
+            .manifest();
+            manifest.protocol_minor_min = self.minor;
+            manifest
+        }
+        async fn initialize_with_runtime(
+            &self,
+            mode: Mode,
+            _global: TaskScope,
+            runtime: RuntimeConfiguration,
+        ) -> Result<()> {
+            self.received.lock().unwrap().push((mode, runtime));
+            Ok(())
+        }
+        async fn invoke(
+            &self,
+            _context: CallContext,
+            _operation: &str,
+            _input: Value,
+        ) -> Result<Value> {
+            Err(denied())
+        }
+    }
+    fn runtime_peers(minor: u32) -> (RpcPeer, RpcPeer, Arc<RuntimeProbe>) {
+        let module = Arc::new(RuntimeProbe {
+            minor,
+            received: Mutex::new(Vec::new()),
+        });
+        let (a, b) = tokio::io::duplex(65536);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        (
+            RpcPeer::new(
+                ar,
+                aw,
+                Arc::new(Host {
+                    calls: AtomicUsize::new(0),
+                }),
+            ),
+            RpcPeer::new(br, bw, Arc::new(Driver::new(module.clone()))),
+            module,
+        )
+    }
+    async fn rpc(peer: &RpcPeer, method: &str, params: Value) -> Result<Value> {
+        peer.call(method, params, Duration::from_secs(3)).await
+    }
+    fn hello(major: u32, minor: u32) -> Value {
+        json!({"protocol_major":major,"protocol_minor":minor,"session":"session-one","generation":7})
+    }
+    #[tokio::test]
+    async fn protocol_selection_rejects_unknown_and_mismatched_versions() {
+        for (required, major, offered) in [(0, 1, 1), (1, 1, 0), (1, 1, 2), (2, 1, 2), (0, 2, 0)] {
+            let (peer, server, module) = runtime_peers(required);
+            assert!(rpc(&peer, "hello", hello(major, offered)).await.is_err());
+            assert!(
+                rpc(
+                    &peer,
+                    "initialize",
+                    json!({"session":"session-one","generation":7,"mode":"normal","runtime":{}})
+                )
+                .await
+                .is_err()
+            );
+            assert!(module.received.lock().unwrap().is_empty());
+            peer.close().await;
+            server.close().await;
+        }
+    }
+    #[tokio::test]
+    async fn protocol_10_retains_exact_payloads_and_original_hook() {
+        let h = Harness::new();
+        assert_eq!(
+            h.call("hello", hello(1, 0)).await.unwrap(),
+            json!({"protocol_major":1,"protocol_minor":0,"manifest":h.driver.module.manifest()})
+        );
+        for runtime in [Value::Null, json!({}), json!({"data_directory":"/srv/dw"})] {
+            assert!(h.call("initialize", json!({"session":"session-one","generation":7,"mode":"normal","runtime":runtime})).await.is_err());
+        }
+        assert_eq!(
+            h.call(
+                "initialize",
+                json!({"session":"session-one","generation":7,"mode":"normal"})
+            )
+            .await
+            .unwrap(),
+            json!({"initialized":true})
+        );
+        assert_eq!(h.driver.global.stats().counts.running, 1);
+        h.close().await;
+    }
+    #[tokio::test]
+    async fn protocol_11_requires_strict_runtime_and_binds_identity_before_hook() {
+        let (peer, server, module) = runtime_peers(1);
+        assert_eq!(
+            rpc(&peer, "hello", hello(1, 1)).await.unwrap(),
+            json!({"protocol_major":1,"protocol_minor":1,"manifest":module.manifest()})
+        );
+        let valid = json!({"session":"session-one","generation":7,"mode":"normal","runtime":{"data_directory":"/srv/oracle/data/dw"}});
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("runtime");
+        let mut bad_cases = vec![missing];
+        for (key, value) in [
+            ("runtime", Value::Null),
+            ("runtime", json!({"extra":true})),
+            ("runtime", json!({"data_directory":42})),
+            ("session", json!("wrong")),
+            ("generation", json!(8)),
+            ("mode", json!("unknown")),
+            ("extra", json!(true)),
+        ] {
+            let mut bad = valid.clone();
+            bad[key] = value;
+            bad_cases.push(bad);
+        }
+        for bad in bad_cases {
+            assert!(rpc(&peer, "initialize", bad).await.is_err());
+            assert!(module.received.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            rpc(&peer, "initialize", valid.clone()).await.unwrap(),
+            json!({"initialized":true})
+        );
+        assert_eq!(
+            *module.received.lock().unwrap(),
+            vec![(
+                Mode::Normal,
+                RuntimeConfiguration {
+                    data_directory: Some(PathBuf::from("/srv/oracle/data/dw"))
+                }
+            )]
+        );
+        assert!(rpc(&peer, "initialize", valid).await.is_err());
+        assert!(rpc(&peer, "hello", hello(1, 1)).await.is_err());
+        assert_eq!(module.received.lock().unwrap().len(), 1);
+        peer.close().await;
+        server.close().await;
+    }
+    #[tokio::test]
+    async fn protocol_11_allows_absent_directory_and_migration_mode() {
+        for runtime in [json!({}), json!({"data_directory":null})] {
+            let (peer, server, module) = runtime_peers(1);
+            rpc(&peer, "hello", hello(1, 1)).await.unwrap();
+            rpc(&peer, "initialize", json!({"session":"session-one","generation":7,"mode":"migration","runtime":runtime})).await.unwrap();
+            assert_eq!(
+                *module.received.lock().unwrap(),
+                vec![(Mode::Migration, RuntimeConfiguration::default())]
+            );
+            assert!(
+                rpc(&peer, "activate", json!({"guild":"100","epoch":2}))
+                    .await
+                    .is_err()
+            );
+            peer.close().await;
+            server.close().await;
+        }
+    }
+    #[tokio::test]
+    async fn runtime_hook_default_delegates_to_existing_initialization() {
+        let probe = Probe {
+            saved: Mutex::new(None),
+            entered: tokio::sync::Notify::new(),
+        };
+        let scope = TaskScope::new();
+        probe
+            .initialize_with_runtime(Mode::Normal, scope.clone(), RuntimeConfiguration::default())
+            .await
+            .unwrap();
+        assert_eq!(scope.stats().counts.running, 1);
+        scope.seal();
+        scope.tasks.shutdown(GRACE).await;
+        assert_eq!(scope.stats().counts.running, 0);
     }
     #[tokio::test]
     async fn authority_rejection_precedes_callbacks_and_typed_clients_preserve_opaque_lease() {
