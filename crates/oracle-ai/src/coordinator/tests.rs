@@ -78,6 +78,9 @@ impl ModelProvider for Provider {
     }
 }
 struct Host {
+    catalog_delay_ms: AtomicUsize,
+    execute_delay_ms: AtomicUsize,
+    reconcile_delay_ms: AtomicUsize,
     effects: AtomicUsize,
     failure: Mutex<Option<ErrorCode>>,
     verification_query: Mutex<Option<String>>,
@@ -97,6 +100,10 @@ struct Host {
 impl ToolHost for Host {
     async fn catalog(&self, _: &PolicyContext, _: &Run) -> Result<Catalog> {
         let count = self.catalogs.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(
+            self.catalog_delay_ms.load(Ordering::SeqCst) as u64,
+        ))
+        .await;
         Catalog::new(
             if self.stale && count > 0 { 2 } else { 1 },
             vec![
@@ -154,6 +161,10 @@ impl ToolHost for Host {
             cancel.cancelled().await;
             return Err(Error::new(ErrorCode::Conflict));
         }
+        tokio::time::sleep(Duration::from_millis(
+            self.execute_delay_ms.load(Ordering::SeqCst) as u64,
+        ))
+        .await;
         if let Some(outcome) = self.outcomes.lock().unwrap().remove(&call.id) {
             return Ok(outcome);
         }
@@ -174,6 +185,10 @@ impl ToolHost for Host {
         calls: &[CallRecord],
     ) -> Result<Reconciliation> {
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(
+            self.reconcile_delay_ms.load(Ordering::SeqCst) as u64,
+        ))
+        .await;
         let finished = calls
             .iter()
             .filter(|call| call.state == CallState::Finished && !call.is_error)
@@ -272,6 +287,9 @@ async fn setup(
         requests: Mutex::new(vec![]),
     });
     let host = Arc::new(Host {
+        catalog_delay_ms: AtomicUsize::new(0),
+        execute_delay_ms: AtomicUsize::new(0),
+        reconcile_delay_ms: AtomicUsize::new(0),
         effects: AtomicUsize::new(0),
         failure: Mutex::new(None),
         verification_query: Mutex::new(None),
@@ -1626,4 +1644,118 @@ async fn active_verification_refreshes_host_query_without_another_continuation()
             }
         }
     }
+}
+
+#[tokio::test]
+async fn host_phases_and_multiple_calls_outlive_provider_turn_deadline() {
+    let (_folder, _storage, mut coordinator, provider, host, guild) = setup(
+        vec![vec![call("one"), call("two")]],
+        2,
+        false,
+        false,
+        false,
+        4,
+    )
+    .await;
+    Arc::get_mut(&mut coordinator)
+        .unwrap()
+        .config
+        .turn_timeout_ms = 20;
+    host.catalog_delay_ms.store(80, Ordering::SeqCst);
+    host.execute_delay_ms.store(80, Ordering::SeqCst);
+    host.reconcile_delay_ms.store(80, Ordering::SeqCst);
+    let result = coordinator
+        .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
+        .await
+        .unwrap();
+    assert_eq!(result.run.status, RunStatus::Succeeded);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 2);
+    let calls = coordinator.runs.calls(&result).await.unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.call.state == CallState::Finished && !call.call.is_error)
+    );
+}
+
+#[tokio::test]
+async fn host_effect_timeout_respects_run_deadline_and_remains_unknown() {
+    let (_folder, _storage, mut coordinator, provider, host, guild) = setup(
+        vec![vec![call("one"), call("two")]],
+        2,
+        true,
+        false,
+        true,
+        4,
+    )
+    .await;
+    Arc::get_mut(&mut coordinator)
+        .unwrap()
+        .config
+        .run_timeout_ms = 200;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        coordinator.ask(&PolicyContext::LocalOperator, guild, "inspect".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.run.status, RunStatus::Paused);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 1);
+    let calls = coordinator.runs.calls(&result).await.unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.call.state == CallState::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn host_inspection_deadlines_and_cancellation_are_bounded() {
+    let (_folder, _storage, coordinator, provider, host, guild) =
+        setup(vec![], 1, false, false, false, 4).await;
+    let mut saved = coordinator
+        .create(&PolicyContext::LocalOperator, guild, "inspect".into())
+        .await
+        .unwrap();
+    host.catalog_delay_ms.store(300, Ordering::SeqCst);
+    host.reconcile_delay_ms.store(300, Ordering::SeqCst);
+    let cancel = CancellationToken::new();
+    saved.run.limits.deadline_ms = now() + 40;
+    assert!(
+        matches!(coordinator.catalog(&PolicyContext::LocalOperator, &saved, &cancel).await, Err(error) if error.code == ErrorCode::Conflict)
+    );
+    saved.run.limits.deadline_ms = now() + 40;
+    assert!(
+        matches!(coordinator.reconcile(&PolicyContext::LocalOperator, &mut saved, &cancel).await, Err(error) if error.code == ErrorCode::Conflict)
+    );
+    saved.run.limits.deadline_ms = now() + 10_000;
+    for reconciliation in [false, true] {
+        let cancel = CancellationToken::new();
+        let (_, result) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                cancel.cancel();
+            },
+            async {
+                if reconciliation {
+                    coordinator
+                        .reconcile(&PolicyContext::LocalOperator, &mut saved, &cancel)
+                        .await
+                        .map(|_| ())
+                } else {
+                    coordinator
+                        .catalog(&PolicyContext::LocalOperator, &saved, &cancel)
+                        .await
+                        .map(|_| ())
+                }
+            }
+        );
+        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+    }
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 0);
 }
