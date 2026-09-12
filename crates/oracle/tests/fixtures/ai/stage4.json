@@ -725,7 +725,7 @@
     "id": "R19",
     "split": "holdout",
     "seed": 1078,
-    "goal": "Set up Minecraft and retain reservation when usage fields contradict each other.",
+    "goal": "Set up Minecraft: one Minecraft category, minecraft-chat and minecraft-info text channels, and Minecraft Voice. Retain reservation when usage fields contradict each other.",
     "state": "empty",
     "oracle": "minecraft",
     "fault": "inconsistent_usage"
