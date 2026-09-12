@@ -350,7 +350,19 @@ impl Coordinator {
         }
         self.recover_spend(&mut saved).await?;
         saved = self.runs.recover(context, guild, id, now()).await?;
-        let evidence = self.reconcile(context, &mut saved, &cancel).await?;
+        // Expiry forbids new model requests and effects, but must not prevent
+        // receipt-only recovery of work completed before a process restart.
+        let evidence = if saved.run.limits.deadline_ms <= now() {
+            self.reconcile_with_budget(
+                context,
+                &mut saved,
+                &cancel,
+                Duration::from_millis(HOST_OPERATION_TIMEOUT_MS),
+            )
+            .await?
+        } else {
+            self.reconcile(context, &mut saved, &cancel).await?
+        };
         if evidence.unresolved {
             return self
                 .stop(
@@ -401,6 +413,17 @@ impl Coordinator {
         saved: &mut SavedRun,
         cancel: &CancellationToken,
     ) -> Result<Reconciliation> {
+        let budget = self.host_timeout(&saved.run);
+        self.reconcile_with_budget(context, saved, cancel, budget)
+            .await
+    }
+    async fn reconcile_with_budget(
+        &self,
+        context: &PolicyContext,
+        saved: &mut SavedRun,
+        cancel: &CancellationToken,
+        budget: Duration,
+    ) -> Result<Reconciliation> {
         let calls = self
             .runs
             .calls(saved)
@@ -410,7 +433,7 @@ impl Coordinator {
             .collect::<Vec<_>>();
         let evidence = tokio::select! {
             _ = cancel.cancelled() => return Err(Error::new(ErrorCode::Cancelled)),
-            result = tokio::time::timeout(self.host_timeout(&saved.run), self.host.reconcile(context, &saved.run, &calls)) => {
+            result = tokio::time::timeout(budget, self.host.reconcile(context, &saved.run, &calls)) => {
                 result.map_err(|_| Error::new(ErrorCode::Conflict))??
             }
         };

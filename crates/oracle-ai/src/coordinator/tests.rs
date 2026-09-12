@@ -1759,3 +1759,27 @@ async fn host_inspection_deadlines_and_cancellation_are_bounded() {
     assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
     assert_eq!(host.effects.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn expired_run_can_recover_receipts_without_new_provider_or_effects() {
+    let (_folder, _storage, coordinator, provider, host, guild) =
+        setup(vec![], 0, false, false, false, 4).await;
+    let mut saved = coordinator
+        .create(
+            &PolicyContext::LocalOperator,
+            guild.clone(),
+            "inspect".into(),
+        )
+        .await
+        .unwrap();
+    saved.run.limits.deadline_ms = 1;
+    coordinator.runs.save(&mut saved, now()).await.unwrap();
+    host.reconcile_delay_ms.store(40, Ordering::SeqCst);
+    let result = coordinator
+        .resume(&PolicyContext::LocalOperator, &guild, &saved.run.id)
+        .await
+        .unwrap();
+    assert_eq!(result.run.status, RunStatus::Succeeded);
+    assert_eq!(provider.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 0);
+}
