@@ -107,6 +107,10 @@ pub enum ToolCallRejection {
     NonObjectArguments,
     UnknownTool,
     InvalidArguments,
+    ArgumentTypeMismatch,
+    ArgumentEnumMismatch,
+    MissingRequiredArgument,
+    UnexpectedArgument,
 }
 
 /// Fixed categories only: provider bodies, URLs and credentials are not diagnostics.

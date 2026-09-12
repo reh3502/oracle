@@ -687,8 +687,15 @@ fn check_call(
         .find(|t| t.name == call.name)
         .ok_or_else(|| rejected(ToolCallRejection::UnknownTool))?;
     schema::validate(&tool.parameters, &call.arguments).map_err(|error| match error {
-        ProviderError::ProtocolMismatch => rejected(ToolCallRejection::InvalidArguments),
-        error => error,
+        schema::ValidationError::InvalidSchema => ProviderError::InvalidRequest,
+        schema::ValidationError::TypeMismatch => rejected(ToolCallRejection::ArgumentTypeMismatch),
+        schema::ValidationError::EnumMismatch => rejected(ToolCallRejection::ArgumentEnumMismatch),
+        schema::ValidationError::MissingRequired => {
+            rejected(ToolCallRejection::MissingRequiredArgument)
+        }
+        schema::ValidationError::UnexpectedProperty => {
+            rejected(ToolCallRejection::UnexpectedArgument)
+        }
     })
 }
 #[derive(Default)]

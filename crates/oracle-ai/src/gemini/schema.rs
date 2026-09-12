@@ -112,29 +112,38 @@ fn type_matches(kind: &str, value: &Value) -> bool {
         _ => false,
     }
 }
-pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), ProviderError> {
+/// Fixed failure categories only; never carry schema keys or argument values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ValidationError {
+    InvalidSchema,
+    TypeMismatch,
+    EnumMismatch,
+    MissingRequired,
+    UnexpectedProperty,
+}
+pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), ValidationError> {
     if !type_matches(
         schema["type"]
             .as_str()
-            .ok_or(ProviderError::InvalidRequest)?,
+            .ok_or(ValidationError::InvalidSchema)?,
         value,
     ) {
-        return Err(ProviderError::ProtocolMismatch);
+        return Err(ValidationError::TypeMismatch);
     }
     if schema
         .get("enum")
         .is_some_and(|e| !e.as_array().unwrap().contains(value))
     {
-        return Err(ProviderError::ProtocolMismatch);
+        return Err(ValidationError::EnumMismatch);
     }
     if let Some(obj) = value.as_object() {
         let properties = schema["properties"]
             .as_object()
-            .ok_or(ProviderError::InvalidRequest)?;
+            .ok_or(ValidationError::InvalidSchema)?;
         if let Some(required) = schema.get("required") {
             for key in required.as_array().unwrap() {
                 if !obj.contains_key(key.as_str().unwrap()) {
-                    return Err(ProviderError::ProtocolMismatch);
+                    return Err(ValidationError::MissingRequired);
                 }
             }
         }
@@ -142,7 +151,7 @@ pub(super) fn validate(schema: &Value, value: &Value) -> Result<(), ProviderErro
             if let Some(s) = properties.get(key) {
                 validate(s, value)?;
             } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-                return Err(ProviderError::ProtocolMismatch);
+                return Err(ValidationError::UnexpectedProperty);
             }
         }
     }

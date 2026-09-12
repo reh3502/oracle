@@ -921,7 +921,7 @@ fn rejected_call_reasons_are_typed_and_batches_remain_atomic() {
         ),
         (
             json!({"type":"function_call","id":"second","name":"oracle_probe","arguments":{"round":9,"prior":"none"}}),
-            ToolCallRejection::InvalidArguments,
+            ToolCallRejection::ArgumentEnumMismatch,
         ),
     ] {
         let mut wire: Value = serde_json::from_str(FIRST).unwrap();
@@ -1010,6 +1010,12 @@ fn rejected_calls_in_supplied_history_remain_invalid_requests() {
         ("name", json!("unadvertised")),
         ("arguments", json!([])),
         ("arguments", json!({"round":9,"prior":"none"})),
+        ("arguments", json!({"round":"PRIVATE_VALUE","prior":"none"})),
+        ("arguments", json!({"prior":"none"})),
+        (
+            "arguments",
+            json!({"round":1,"prior":"none","PRIVATE_EXTRA":true}),
+        ),
     ] {
         let mut turn = first(&p);
         let mut state: Value = serde_json::from_str(&turn.continuation.opaque).unwrap();
@@ -1027,5 +1033,93 @@ fn rejected_calls_in_supplied_history_remain_invalid_requests() {
             .unwrap();
         assert_eq!(error, ProviderError::InvalidRequest);
         assert!(error.reported_usage().is_none());
+    }
+}
+
+#[test]
+fn argument_rejections_are_specific_atomic_and_redacted() {
+    let p = provider();
+    let schema = json!({"type":"object","properties":{"PRIVATE_ITEMS":{"type":"array","items":{"type":"object","properties":{"PRIVATE_CHOICE":{"type":"string","enum":["allowed"]}},"required":["PRIVATE_CHOICE"],"additionalProperties":false}}},"required":["PRIVATE_ITEMS"],"additionalProperties":false});
+    let valid = json!({"PRIVATE_ITEMS":[{"PRIVATE_CHOICE":"allowed"}]});
+    for (bad, reason) in [
+        (
+            json!({"PRIVATE_ITEMS":[{"PRIVATE_CHOICE":17}]}),
+            ToolCallRejection::ArgumentTypeMismatch,
+        ),
+        (
+            json!({"PRIVATE_ITEMS":[{"PRIVATE_CHOICE":"PRIVATE_VALUE"}]}),
+            ToolCallRejection::ArgumentEnumMismatch,
+        ),
+        (
+            json!({"PRIVATE_ITEMS":[{}]}),
+            ToolCallRejection::MissingRequiredArgument,
+        ),
+        (
+            json!({"PRIVATE_ITEMS":[{"PRIVATE_CHOICE":"allowed","PRIVATE_EXTRA":"PRIVATE_VALUE"}]}),
+            ToolCallRejection::UnexpectedArgument,
+        ),
+    ] {
+        for usage in [
+            Some(json!({"total_tokens":23})),
+            None,
+            Some(json!({"total_tokens":-1})),
+        ] {
+            let mut r = request();
+            r.tools[0].parameters = schema.clone();
+            let mut wire: Value = serde_json::from_str(FIRST).unwrap();
+            wire["steps"][1]["arguments"] = valid.clone();
+            wire["steps"].as_array_mut().unwrap().push(
+                json!({"type":"function_call","id":"second","name":"oracle_probe","arguments":bad}),
+            );
+            match &usage {
+                Some(value) => wire["usage"] = value.clone(),
+                None => {
+                    wire.as_object_mut().unwrap().remove("usage");
+                }
+            }
+            let error = decode(&p, p.prepare(r).unwrap(), &wire.to_string())
+                .err()
+                .unwrap();
+            if usage.as_ref().is_some_and(|u| u["total_tokens"] == -1) {
+                assert_eq!(error, ProviderError::ProtocolMismatch);
+            } else {
+                assert_eq!(
+                    error,
+                    ProviderError::RejectedToolCall {
+                        reason,
+                        usage: usage.as_ref().map(|_| Usage {
+                            total_tokens: Some(23),
+                            ..Default::default()
+                        })
+                    }
+                );
+            }
+            let rendered = format!(
+                "{error:?} {error} {}",
+                serde_json::to_string(&error).unwrap()
+            );
+            for private in [
+                "PRIVATE_ITEMS",
+                "PRIVATE_CHOICE",
+                "PRIVATE_EXTRA",
+                "PRIVATE_VALUE",
+                "oracle_probe",
+                "synthetic-key",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+            // The valid prefix is not released; a fresh valid batch is unaffected.
+            wire["steps"].as_array_mut().unwrap().pop();
+            wire["usage"] = json!({"total_tokens":23});
+            let mut r = request();
+            r.tools[0].parameters = schema.clone();
+            assert_eq!(
+                decode(&p, p.prepare(r).unwrap(), &wire.to_string())
+                    .unwrap()
+                    .calls
+                    .len(),
+                1
+            );
+        }
     }
 }
