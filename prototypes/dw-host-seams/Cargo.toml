@@ -1,0 +1,13 @@
+[package]
+name = "dw-host-seams"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Stage 0 is deliberately isolated from the production workspace.
+[workspace]
+
+[dependencies]
+oracle-contracts = { path = "../../crates/oracle-contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
