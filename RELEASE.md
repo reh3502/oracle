@@ -42,6 +42,8 @@ The runner builds the canary and writes `target/stage5-live/run-*/report.json`. 
 
 This proves the listed live adapter paths. It does **not** exercise a human slash-command invocation, real moderation-event logging coverage, or Gemini against live Discord. Those remain separately described evidence scopes; do not relabel this canary as those checks. A failed or interrupted run requires cleanup inspection before another attempt; see [operations](OPERATIONS.md#live-canary-failures).
 
+The canary uses a paced workload and records its inspection/mutation interval. This is not a burst-throughput qualification. Discord route limits vary: a measured channel-inventory route allowed ten reads per minute, while the production adapter bounds each read at fifteen seconds. A longer rate-limit wait can therefore produce an unavailable or partial outcome. Preserve its receipts and reconcile before retrying. Keep failed burst runs and any separate owned-resource recovery report alongside the paced qualification evidence.
+
 ## Release decision
 
 Require passing deterministic authority/adversarial checks with **zero unauthorized effects**, both database drills, executable unload/reaping, joined shutdown, durable restart recovery, and reproducible module staging/reload/upgrade. Verify the framework starts with zero feature modules installed and AI disabled without a provider key. Review measured resource limits for the recorded workload rather than inventing universal throughput or memory limits.
