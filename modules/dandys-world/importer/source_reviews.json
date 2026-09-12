@@ -1,0 +1,202 @@
+[
+  {
+    "entity": "Boxten",
+    "keys": [
+      "ability_1"
+    ],
+    "reason": "The same wiki field gives a 48% maximum and a tooltip claiming approximately 59.4%; the maximum is disputed.",
+    "revisions": {
+      "Boxten": 261487
+    },
+    "evidence": {
+      "Boxten": "{{Center|'''Wind-Up'''<br>{{Small|''(Passive)''}}}}<br>\n{{Tooltip|This Toon gains 6% more Extraction Speed for every alive Toon in the round. Maxes at 48%.|The extra Extraction Speed compounds, so instead of maxing out at 48%, it maxes out at ~59.4%.}}"
+    }
+  },
+  {
+    "entity": "Bandage",
+    "keys": [
+      "price"
+    ],
+    "reason": "The combined-discount price differs between the Items table and Health article; do not choose one as definitive.",
+    "revisions": {
+      "Items": 260097,
+      "Health": 261240
+    },
+    "evidence": {
+      "Items": "|'''{{II|Bandage|name=false|size=100}}'''\n|Upon use, restores 1 {{Heart}}.\n|Healing\n|No\n|60\n|30\n|54\n|24",
+      "Health": "*{{II|Bandage|name=true}} (Restores one heart for the user; single use.)\n**Can be picked up from the floor by {{CI|Bassie|name=true}} and given to players, found on the floor, obtained using {{CI|Gigi|name=true}}, or buying them for 60 tapes (54 with {{CDI|Frugal|name=true}}, 30 with {{TI|Dandy Plush|name=true}}, and 27 with both) at Dandy's Shop."
+    },
+    "contains": [
+      "both discounts"
+    ]
+  },
+  {
+    "entity": "Health Kit",
+    "keys": [
+      "price"
+    ],
+    "reason": "The combined-discount price differs between the Items table and Health article; do not choose one as definitive.",
+    "revisions": {
+      "Items": 260097,
+      "Health": 261240
+    },
+    "evidence": {
+      "Items": "|'''{{II|Health Kit|name=false|size=100}}'''\n|Upon use, restores {{Heart}} to the maximum.\n|Healing\n|No\n|100\n|50 \n|90\n|40 ",
+      "Health": "*{{II|Health Kit|name=false}} (Fully restores Health to the maximum number of Hearts for the user; single use.)\n**Can be picked up by Bassie and given to players, obtained using Gigi, or buying them for 100 Tapes (90 with Frugal, 50 Tapes with Dandy's Plush, and 45 with both) at Dandy's Shop."
+    },
+    "contains": [
+      "both discounts"
+    ]
+  },
+  {
+    "entity": "Dyle's Floor",
+    "keys": [
+      "overview",
+      "description",
+      "requirements"
+    ],
+    "reason": "Dyle’s Floor and Cards disagree about late-run card exhaustion and forced floor behavior.",
+    "revisions": {
+      "Dyle's Floor": 261688,
+      "Cards": 259128
+    },
+    "evidence": {
+      "Dyle's Floor": "Do note that all available Card options run dry by Floor 43 (45 during [[Events]]), meaning any runs that go past that Floor will be forced to complete Dyle's Floor. ",
+      "Cards": "{{Thumbnail\n|image1=<gallery>\nPoppy With Cards.png\n</gallery>}}'''Cards''' are a mechanic in [[Dandy's World]]. They can give permanent buffs, [[Items]], or {{Heart}}s. They occur on every odd-numbered [[Floor]]. Players vote on which Cards get played, with the majority vote being the Card selected. If a tie occurs, a Card will be chosen randomly. 3 random Cards out of the 21 options will have a chance to appear until all are eventually voted for. Cards can only be used once until players cycle through the 21 options. Once all Card options have been used (which occurs at Floor 45 {{Small|(Floor 47 in [[Events]])}}), the prompt to vote will stop appearing and the [[Elevator]] will simply move onto the next Floor."
+    },
+    "contains": [
+      "43",
+      "45",
+      "forced"
+    ]
+  },
+  {
+    "entity": "Dyle's Floor",
+    "keys": [
+      "overview"
+    ],
+    "reason": "The floor article says 3+ Common Twisteds, while the floor overview specifies an exact total with holiday substitution.",
+    "revisions": {
+      "Dyle's Floor": 261688,
+      "Floors": 261289
+    },
+    "evidence": {
+      "Dyle's Floor": "{{Stub}}{{MissingInformation|*Layout of Dyle's Floor}}\n'''Dyle's Floor''' is the first and only Challenge [[Floor]], and to enter it, the player(s) must choose the {{CDI|TIME'S UP|name=true}} [[Card]] during a Card vote, which is only available on odd Floors. The player(s) must be on Floor 9+ for a chance to get the Card. It also has only one variant. When on this map, the player(s) must complete a total of 25 [[Machines]], regardless of what Floor they're on. The Floor will also spawn 3+ {{Type|Common}} [[Twisteds]], with [[Floor Events]] also being able to happen, along with {{CI|Twisted Dyle|name=true}}. The reward when completing this Floor is +50 Stamina capacity for the rest of the run. ",
+      "Floors": "A Challenge Floor called the '[[Dyle's Floor]]' can be spawned if the {{CDI|TIME'S UP|name=true}} Card is picked on any odd-numbered Floor, starting at Floor 9. Completing the Dyle's Floor earns you 50 maximum Stamina for the rest of the run. In the Floor, there are guaranteed 25 [[Machines]] to be completed and 4 [[Twisteds]], 3 {{Type|Common}} Twisteds (though a [[Holiday Twisted]] may replace one Common) and the elusive, difficult and {{Type|Lethal}} {{CI|Twisted Dyle|name=true}}."
+    },
+    "contains": [
+      "3+"
+    ]
+  },
+  {
+    "entity": "Floors",
+    "keys": [
+      "mechanics",
+      "floor_events",
+      "floor_dependent_mechanics",
+      "overview"
+    ],
+    "reason": "The stated probability increments and stated cap floor are not consistent; no calculated schedule is supplied.",
+    "revisions": {
+      "Floors": 261289
+    },
+    "evidence": {
+      "Floors": "The Floor Events' chance of spawning starts on Floor 3 with 5.0% chance, then increases by 2% after 2 Floors are completed. The maximum percentage of a Floor Event chance is 30%, which is achieved by reaching Floor 16. More than one Floor Event can occur; a maximum of two Floor Events."
+    },
+    "contains": [
+      "30%"
+    ]
+  },
+  {
+    "entity": "Floors",
+    "keys": [
+      "mechanics",
+      "floor_events",
+      "floor_dependent_mechanics",
+      "overview"
+    ],
+    "reason": "The stated probability increments and stated cap floor are not consistent; no calculated schedule is supplied.",
+    "revisions": {
+      "Floors": 261289
+    },
+    "evidence": {
+      "Floors": "The chance of a Floor Event is reduced through specific [[Cards]] by up to 16.7% less chance to spawn (a 30% deduction to 25% is a 16.7% reduction). Instead of a 2% increase after completing 2 Floors, it is reduced to 1.5%."
+    },
+    "contains": [
+      "30%"
+    ]
+  },
+  {
+    "entity": "Health",
+    "keys": [
+      "restoring_hearts"
+    ],
+    "reason": "The combined-discount price differs between the Items table and Health article; do not choose one as definitive.",
+    "revisions": {
+      "Items": 260097,
+      "Health": 261240
+    },
+    "evidence": {
+      "Items": "|'''{{II|Bandage|name=false|size=100}}'''\n|Upon use, restores 1 {{Heart}}.\n|Healing\n|No\n|60\n|30\n|54\n|24",
+      "Health": "*{{II|Bandage|name=true}} (Restores one heart for the user; single use.)\n**Can be picked up from the floor by {{CI|Bassie|name=true}} and given to players, found on the floor, obtained using {{CI|Gigi|name=true}}, or buying them for 60 tapes (54 with {{CDI|Frugal|name=true}}, 30 with {{TI|Dandy Plush|name=true}}, and 27 with both) at Dandy's Shop."
+    },
+    "contains": [
+      "27 with both"
+    ]
+  },
+  {
+    "entity": "Health",
+    "keys": [
+      "restoring_hearts"
+    ],
+    "reason": "The combined-discount price differs between the Items table and Health article; do not choose one as definitive.",
+    "revisions": {
+      "Items": 260097,
+      "Health": 261240
+    },
+    "evidence": {
+      "Items": "|'''{{II|Health Kit|name=false|size=100}}'''\n|Upon use, restores {{Heart}} to the maximum.\n|Healing\n|No\n|100\n|50 \n|90\n|40 ",
+      "Health": "*{{II|Health Kit|name=false}} (Fully restores Health to the maximum number of Hearts for the user; single use.)\n**Can be picked up by Bassie and given to players, obtained using Gigi, or buying them for 100 Tapes (90 with Frugal, 50 Tapes with Dandy's Plush, and 45 with both) at Dandy's Shop."
+    },
+    "contains": [
+      "45 with both"
+    ]
+  },
+  {
+    "entity": "Cards",
+    "keys": [
+      "overview"
+    ],
+    "reason": "Dyle’s Floor and Cards disagree about late-run card exhaustion and forced floor behavior.",
+    "revisions": {
+      "Dyle's Floor": 261688,
+      "Cards": 259128
+    },
+    "evidence": {
+      "Dyle's Floor": "Do note that all available Card options run dry by Floor 43 (45 during [[Events]]), meaning any runs that go past that Floor will be forced to complete Dyle's Floor. ",
+      "Cards": "{{Thumbnail\n|image1=<gallery>\nPoppy With Cards.png\n</gallery>}}'''Cards''' are a mechanic in [[Dandy's World]]. They can give permanent buffs, [[Items]], or {{Heart}}s. They occur on every odd-numbered [[Floor]]. Players vote on which Cards get played, with the majority vote being the Card selected. If a tie occurs, a Card will be chosen randomly. 3 random Cards out of the 21 options will have a chance to appear until all are eventually voted for. Cards can only be used once until players cycle through the 21 options. Once all Card options have been used (which occurs at Floor 45 {{Small|(Floor 47 in [[Events]])}}), the prompt to vote will stop appearing and the [[Elevator]] will simply move onto the next Floor."
+    },
+    "contains": [
+      "Floor 45",
+      "run out of Cards"
+    ]
+  },
+  {
+    "entity": "Floors",
+    "keys": [
+      "dyle_s_floor"
+    ],
+    "reason": "The floor article says 3+ Common Twisteds, while the floor overview specifies an exact total with holiday substitution.",
+    "revisions": {
+      "Dyle's Floor": 261688,
+      "Floors": 261289
+    },
+    "evidence": {
+      "Dyle's Floor": "{{Stub}}{{MissingInformation|*Layout of Dyle's Floor}}\n'''Dyle's Floor''' is the first and only Challenge [[Floor]], and to enter it, the player(s) must choose the {{CDI|TIME'S UP|name=true}} [[Card]] during a Card vote, which is only available on odd Floors. The player(s) must be on Floor 9+ for a chance to get the Card. It also has only one variant. When on this map, the player(s) must complete a total of 25 [[Machines]], regardless of what Floor they're on. The Floor will also spawn 3+ {{Type|Common}} [[Twisteds]], with [[Floor Events]] also being able to happen, along with {{CI|Twisted Dyle|name=true}}. The reward when completing this Floor is +50 Stamina capacity for the rest of the run. ",
+      "Floors": "A Challenge Floor called the '[[Dyle's Floor]]' can be spawned if the {{CDI|TIME'S UP|name=true}} Card is picked on any odd-numbered Floor, starting at Floor 9. Completing the Dyle's Floor earns you 50 maximum Stamina for the rest of the run. In the Floor, there are guaranteed 25 [[Machines]] to be completed and 4 [[Twisteds]], 3 {{Type|Common}} Twisteds (though a [[Holiday Twisted]] may replace one Common) and the elusive, difficult and {{Type|Lethal}} {{CI|Twisted Dyle|name=true}}."
+    },
+    "contains": [
+      "4 Twisteds"
+    ]
+  }
+]
