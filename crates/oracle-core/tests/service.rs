@@ -349,14 +349,25 @@ async fn member_read_is_distinct_from_operator_and_respects_pause_and_scope() {
             .code,
         ErrorCode::ForbiddenScope
     );
-    repository
-        .records
-        .lock()
-        .unwrap()
-        .guilds
-        .get_mut(&guild_a())
-        .unwrap()
-        .paused = true;
+    let module = ModuleId::new("test.reader").unwrap();
+    let gate = service.member_read_gate();
+    gate.configure(
+        guild_a(),
+        module.clone(),
+        Some(member_read::MemberReadPolicy {
+            channels: Default::default(),
+            roles: Default::default(),
+            per_user_per_minute: 2,
+            per_guild_per_minute: 4,
+        }),
+    )
+    .unwrap();
+    let permit = gate.admit(&member, &guild_a(), &module).unwrap();
+    service
+        .control(&PolicyContext::LocalOperator, &guild_a(), true, 0)
+        .await
+        .unwrap();
+    assert!(permit.check().is_err());
     assert_eq!(
         service
             .authorize_member_read(&member, &guild_a())

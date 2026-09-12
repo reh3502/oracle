@@ -102,6 +102,41 @@ impl MemberReadPermit {
     }
 }
 impl MemberReadGate {
+    /// Check catalog visibility without consuming invocation quota.
+    pub fn check_access(
+        &self,
+        context: &MemberContext,
+        guild: &GuildId,
+        module: &ModuleId,
+    ) -> Result<()> {
+        if &context.guild != guild {
+            return Err(Error::new(ErrorCode::ForbiddenScope));
+        }
+        let now = Instant::now();
+        if context.observed_at > now
+            || now.duration_since(context.observed_at) >= IDENTITY_TTL
+            || context.roles.len() > 250
+            || UserId::new(&context.channel).is_err()
+            || context.roles.iter().any(|id| UserId::new(id).is_err())
+        {
+            return Err(Error::new(ErrorCode::ForbiddenPermission));
+        }
+        let state = self.state.lock().unwrap();
+        let entry = state
+            .entries
+            .get(&(guild.clone(), module.clone()))
+            .ok_or_else(|| Error::new(ErrorCode::ForbiddenPermission))?;
+        if entry
+            .invalidated_at
+            .is_some_and(|at| context.observed_at <= at)
+            || (!entry.policy.channels.is_empty()
+                && !entry.policy.channels.contains(&context.channel))
+            || (!entry.policy.roles.is_empty() && entry.policy.roles.is_disjoint(&context.roles))
+        {
+            return Err(Error::new(ErrorCode::ForbiddenPermission));
+        }
+        Ok(())
+    }
     /// Host configuration only. Installing/enabling a module alone grants no member access.
     pub fn configure(
         &self,
@@ -151,6 +186,17 @@ impl MemberReadGate {
                 entry.cancellation = CancellationToken::new();
                 entry.invalidated_at = Some(Instant::now());
             }
+        }
+    }
+    /// Loss of Gateway coverage revokes every pending read. New requests must
+    /// obtain identity after this observation gap; existing quotas are retained.
+    pub fn invalidate_all(&self) {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        for entry in state.entries.values_mut() {
+            entry.cancellation.cancel();
+            entry.cancellation = CancellationToken::new();
+            entry.invalidated_at = Some(now);
         }
     }
     pub fn admit(

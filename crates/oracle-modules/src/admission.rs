@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub(crate) struct Authority {
+    pub audience: oracle_core::ModuleAudience,
     pub guild: GuildId,
     pub epoch: u64,
     pub actor: PolicyContext,
@@ -203,6 +204,7 @@ mod tests {
     use super::*;
     fn authority(guild: &str, epoch: u64) -> Authority {
         Authority {
+            audience: oracle_core::ModuleAudience::Operator,
             guild: guild.parse().unwrap(),
             epoch,
             actor: PolicyContext::LocalOperator,

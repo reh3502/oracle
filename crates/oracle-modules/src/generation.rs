@@ -139,8 +139,23 @@ impl Generation {
         router: Arc<dyn ContractRouter>,
         mode: &str,
         registry: Arc<crate::registry::RegistrySignal>,
+        data_directory: Option<&Path>,
     ) -> Result<Arc<Self>> {
         if !matches!(mode, "normal" | "migration") || number == 0 {
+            return Err(error(ErrorCode::InvalidInput));
+        }
+        let minor = installed.package.manifest.protocol_minor_min;
+        if minor > 1 || (minor == 0 && data_directory.is_some()) {
+            return Err(error(ErrorCode::Compatibility));
+        }
+        if installed
+            .package
+            .manifest
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.data_directory_required)
+            && data_directory.is_none()
+        {
             return Err(error(ErrorCode::InvalidInput));
         }
         let generation = Arc::new(Self {
@@ -164,24 +179,28 @@ impl Generation {
             .files
             .get(&generation.installed.package.entrypoint)
             .ok_or_else(|| error(ErrorCode::ArtifactChanged))?;
-        let process=runtime.spawn(artifact,digest,json!({"protocol_major":1,"protocol_minor":0,"session":generation.session,"generation":number}),Arc::new(Callbacks(Arc::downgrade(&generation)))).await.map_err(runtime_error)?;
+        let process=runtime.spawn(artifact,digest,json!({"protocol_major":1,"protocol_minor":minor,"session":generation.session,"generation":number}),Arc::new(Callbacks(Arc::downgrade(&generation)))).await.map_err(runtime_error)?;
         generation.process.set(process).map_err(|_| unavailable())?;
         let initialized = async {
             let hello: Hello = decode(generation.process().hello().clone())
                 .map_err(|_| error(ErrorCode::Compatibility))?;
             if hello.protocol_major != 1
-                || hello.protocol_minor != 0
+                || hello.protocol_minor != minor
                 || hello.manifest != generation.installed.package.manifest
             {
                 return Err(error(ErrorCode::Compatibility));
             }
+            let mut initialize =
+                json!({"session":generation.session,"generation":number,"mode":mode});
+            if minor == 1 {
+                initialize["runtime"] = match data_directory {
+                    Some(path) => json!({"data_directory":path}),
+                    None => json!({}),
+                };
+            }
             let result = generation
                 .process()
-                .call(
-                    "initialize",
-                    json!({"session":generation.session,"generation":number,"mode":mode}),
-                    Duration::from_secs(5),
-                )
+                .call("initialize", initialize, Duration::from_secs(5))
                 .await
                 .map_err(runtime_error)?;
             if result != json!({"initialized":true}) {
@@ -269,6 +288,55 @@ impl Generation {
         configuration_revision: Option<u64>,
         expected_epoch: Option<u64>,
     ) -> Result<Value> {
+        self.invoke_inner(
+            actor,
+            guild,
+            operation,
+            input,
+            parent,
+            configuration_revision,
+            expected_epoch,
+            None,
+        )
+        .await
+    }
+    pub async fn invoke_member(
+        &self,
+        actor: &oracle_core::member_read::MemberContext,
+        operation: &str,
+        input: Value,
+        epoch: u64,
+        permit: oracle_core::member_read::MemberReadPermit,
+    ) -> Result<Value> {
+        let context = PolicyContext::Discord {
+            guild: actor.guild.clone(),
+            user: actor.user.clone(),
+            manage_guild: false,
+        };
+        self.invoke_inner(
+            context,
+            &actor.guild,
+            operation,
+            input,
+            None,
+            None,
+            Some(epoch),
+            Some(permit),
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)] // Distinct host-only member permit; never taken from module input.
+    async fn invoke_inner(
+        &self,
+        actor: PolicyContext,
+        guild: &GuildId,
+        operation: &str,
+        input: Value,
+        parent: Option<Authority>,
+        configuration_revision: Option<u64>,
+        expected_epoch: Option<u64>,
+        member: Option<oracle_core::member_read::MemberReadPermit>,
+    ) -> Result<Value> {
         if !self.normal || !self.process().is_alive() {
             return Err(unavailable());
         }
@@ -284,6 +352,17 @@ impl Generation {
             .find(|op| op.name == operation)
             .ok_or_else(|| error(ErrorCode::NotFound))?;
         validate_input(operation, &input)?;
+        if member.is_some() && operation.audience != oracle_core::ModuleAudience::MemberRead {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        if operation.audience == oracle_core::ModuleAudience::MemberRead
+            && !operation.capabilities.is_empty()
+        {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        if let Some(permit) = &member {
+            permit.check()?;
+        }
         let active = self
             .activations
             .lock()
@@ -299,6 +378,7 @@ impl Generation {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         let mut authority = Authority {
+            audience: operation.audience,
             guild: guild.clone(),
             epoch: active.epoch,
             actor,
@@ -306,7 +386,9 @@ impl Generation {
             deadline: Instant::now() + Duration::from_millis(operation.timeout_ms),
             depth: 0,
             configuration_revision,
-            cancel: CancellationToken::new(),
+            cancel: member
+                .as_ref()
+                .map_or_else(CancellationToken::new, |permit| permit.cancellation()),
         };
         if let Some(parent) = parent {
             if &parent.guild != guild {
@@ -331,6 +413,9 @@ impl Generation {
         let lease = self.gate.admit(authority)?;
         let result=self.process().call_with_cancel("operation.invoke",json!({"invocation":lease.handle,"session":self.session,"generation":self.number,"guild":guild,"epoch":active.epoch,"operation":operation.name,"input":input}),lease.authority.deadline.saturating_duration_since(Instant::now()),lease.authority.cancel.clone()).await.map_err(runtime_error)?;
         self.gate.authority(&lease.handle)?;
+        if let Some(permit) = &member {
+            permit.check()?;
+        }
         validate_output(operation, &result)?;
         Ok(result)
     }
@@ -363,6 +448,7 @@ impl Generation {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         let authority = Authority {
+            audience: oracle_core::ModuleAudience::Operator,
             guild: guild.clone(),
             epoch: active.epoch,
             actor: PolicyContext::LocalOperator,

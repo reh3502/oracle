@@ -56,6 +56,15 @@ impl Generation {
         if !self.normal {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
+        // Reject every callback from a public read lease before dispatch, including
+        // future callback names. Even operator callers of member routes get no callbacks.
+        let handle = params
+            .get("invocation")
+            .and_then(Value::as_str)
+            .ok_or_else(|| error(ErrorCode::ForbiddenPermission))?;
+        if self.gate.authority(handle)?.audience == oracle_core::ModuleAudience::MemberRead {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
         match method {
             "host.health" => {
                 let request: HealthRequest = decode(params)?;

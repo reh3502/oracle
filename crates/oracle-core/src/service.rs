@@ -34,6 +34,7 @@ impl PolicyContext {
 }
 
 pub struct CoreService {
+    member_reads: crate::member_read::MemberReadGate,
     repository: Arc<dyn Repository>,
     policies: BTreeMap<GuildId, GuildPolicy>,
     modules: RwLock<BTreeMap<ModuleId, BTreeSet<GuildId>>>,
@@ -52,11 +53,15 @@ pub trait EffectAdapter: Send + Sync {
 impl CoreService {
     pub fn new(repository: Arc<dyn Repository>, policies: Vec<GuildPolicy>) -> Self {
         Self {
+            member_reads: crate::member_read::MemberReadGate::default(),
             repository,
             modules: RwLock::new(BTreeMap::new()),
             policies: policies.into_iter().map(|p| (p.guild.clone(), p)).collect(),
             mutation: tokio::sync::Mutex::new(()),
         }
+    }
+    pub fn member_read_gate(&self) -> crate::member_read::MemberReadGate {
+        self.member_reads.clone()
     }
     fn authorize(
         &self,
@@ -103,6 +108,10 @@ impl CoreService {
         } else {
             Err(Error::new(ErrorCode::ForbiddenPermission))
         }
+    }
+    /// Operator-only policy changes may be configured while a guild is paused.
+    pub fn authorize_member_policy(&self, actor: &PolicyContext, guild: &GuildId) -> Result<()> {
+        self.authorize(actor, Some(guild), true)
     }
     /// Verify authenticated membership, known guild scope, and unpaused state.
     pub async fn authorize_member_read(
@@ -153,7 +162,8 @@ impl CoreService {
     ) -> Result<ControlReceipt> {
         self.authorize(context, Some(guild), true)?;
         let _admission = self.mutation.lock().await;
-        self.repository
+        let receipt = self
+            .repository
             .set_paused(
                 guild,
                 paused,
@@ -161,7 +171,11 @@ impl CoreService {
                 &context.actor(),
                 &OperationId::generate(),
             )
-            .await
+            .await?;
+        if paused {
+            self.member_reads.invalidate_guild(guild);
+        }
+        Ok(receipt)
     }
     pub async fn recovery(
         &self,

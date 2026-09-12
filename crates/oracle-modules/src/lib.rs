@@ -5,6 +5,7 @@ pub mod dependencies;
 mod generation;
 mod manager;
 pub mod package;
+pub mod runtime_settings;
 pub use manager::{
     ConfigurationPlan, ConfigurationPolicy, ConfigurationReceipt, ConfigurationStatus,
     ModuleManager,
@@ -16,6 +17,7 @@ pub use manager::{
     EventDispatch, EventHealth, NotificationCheck, NotificationRequest, NotificationTransport,
 };
 
+pub use manager::MemberInvocation;
 pub use manager::ModuleCatalogEntry;
 
 mod registry;

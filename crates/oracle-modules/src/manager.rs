@@ -29,8 +29,11 @@ mod events;
 pub use events::{
     EventDispatch, EventHealth, NotificationCheck, NotificationRequest, NotificationTransport,
 };
+#[path = "member_reads.rs"]
+mod member_reads;
 mod recovery;
 mod upgrade;
+pub use member_reads::MemberInvocation;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModuleCatalogEntry {
@@ -65,6 +68,8 @@ pub struct ModuleAiCatalogSnapshot {
     pub entries: Vec<ModuleAiCatalogEntry>,
 }
 pub struct ModuleManager {
+    runtime_settings: RwLock<BTreeMap<ModuleId, crate::runtime_settings::ModuleRuntimeSettings>>,
+    member_gate: oracle_core::member_read::MemberReadGate,
     registry_signal: Arc<crate::registry::RegistrySignal>,
     event_services: RwLock<Option<events::EventServices>>,
     event_queues: std::sync::Mutex<BTreeMap<(ModuleId, GuildId), events::EventQueue>>,
@@ -316,6 +321,8 @@ impl ModuleManager {
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             registry_signal: Arc::new(crate::registry::RegistrySignal::default()),
+            member_gate: core.member_read_gate(),
+            runtime_settings: RwLock::new(BTreeMap::new()),
             event_services: RwLock::new(None),
             event_queues: std::sync::Mutex::new(BTreeMap::new()),
             event_tasks: tasks::HostTasks::new(),
@@ -493,6 +500,7 @@ impl ModuleManager {
             {
                 self.migrate(&installed, &activation.guild).await?;
             }
+            let runtime_settings = self.runtime_settings(&module);
             let generation = Generation::spawn(
                 &self.runtime,
                 &artifact,
@@ -502,6 +510,9 @@ impl ModuleManager {
                 Arc::new(Router(Arc::downgrade(self))),
                 "normal",
                 self.registry_signal.clone(),
+                runtime_settings
+                    .as_ref()
+                    .and_then(|settings| settings.data_directory.as_deref()),
             )
             .await?;
             let mut provisional = RetainStopping {
@@ -1143,6 +1154,7 @@ impl ModuleManager {
             return Ok(());
         }
         let artifact = self.artifacts.verify(installed)?;
+        let runtime_settings = self.runtime_settings(&manifest.id);
         let migrator = Generation::spawn(
             &self.runtime,
             &artifact,
@@ -1152,6 +1164,7 @@ impl ModuleManager {
             Arc::new(Router(Arc::downgrade(self))),
             "migration",
             self.registry_signal.clone(),
+            runtime_settings.as_ref().and_then(|settings| settings.data_directory.as_deref()),
         )
         .await?;
         let _provisional = Provisional(Some(migrator.clone()));
