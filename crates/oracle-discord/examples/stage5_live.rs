@@ -62,11 +62,55 @@ fn atomic_report(path: &std::path::Path, report: &Value) -> Result<(), &'static 
     .and_then(|file| file.sync_all())
     .map_err(|_| "checkpoint_sync")
 }
+struct Pace {
+    interval: Duration,
+    last: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+}
+impl Pace {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: tokio::sync::Mutex::new(None),
+        }
+    }
+    async fn enter(&self, cancel: &CancellationToken) -> oracle_core::Result<()> {
+        let cancelled = || oracle_core::Error::new(oracle_core::ErrorCode::Cancelled);
+        let mut last = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(cancelled()),
+            last = self.last.lock() => last,
+        };
+        if let Some(previous) = *last {
+            tokio::select! { biased;
+                _ = cancel.cancelled() => return Err(cancelled()),
+                _ = tokio::time::sleep_until(previous + self.interval) => {},
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        *last = Some(tokio::time::Instant::now());
+        Ok(())
+    }
+}
+// Only field names are diagnostic; never persist channel contents.
+fn changed_fields(before: &Value, after: &Value) -> Vec<String> {
+    let keys: BTreeSet<_> = before
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .chain(after.as_object().into_iter().flat_map(|o| o.keys()))
+        .collect();
+    keys.into_iter()
+        .filter(|key| before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
+}
 struct CanaryBackend {
     inner: DiscordOperations,
     http: Arc<Http>,
     recovery: Arc<Recovery>,
     baselines: Mutex<BTreeMap<String, Value>>,
+    pace: Pace,
 }
 #[async_trait::async_trait]
 impl StructureBackend for CanaryBackend {
@@ -75,7 +119,12 @@ impl StructureBackend for CanaryBackend {
         context: &PolicyContext,
         guild: &GuildId,
     ) -> oracle_core::Result<Snapshot> {
-        self.inner.inspect(context, guild).await
+        let started = std::time::Instant::now();
+        self.pace.enter(&CancellationToken::new()).await?;
+        let ready = std::time::Instant::now();
+        let result = self.inner.inspect(context, guild).await;
+        self.recovery.event(json!({"phase":"backend_inspect", "paced_ms":ready.duration_since(started).as_millis(), "request_ms":ready.elapsed().as_millis(), "error":result.as_ref().err().map(|error| error.code)})).map_err(|_| oracle_core::Error::new(oracle_core::ErrorCode::Io))?;
+        result
     }
     async fn mutate(
         &self,
@@ -84,11 +133,14 @@ impl StructureBackend for CanaryBackend {
         mutation: &ChannelMutation,
         guard: &SendGuard,
     ) -> oracle_core::Result<Channel> {
+        self.pace.enter(&guard.cancellation()).await?;
+        let started = std::time::Instant::now();
         let checkpoint_error = |_| oracle_core::Error::new(oracle_core::ErrorCode::Io);
         self.recovery
             .event(json!({"phase":"before_channel_write","name":mutation.desired.name}))
             .map_err(checkpoint_error)?;
         let result = self.inner.mutate(context, guild, mutation, guard).await;
+        self.recovery.event(json!({"phase":"backend_mutate_returned","request_ms":started.elapsed().as_millis(),"error":result.as_ref().err().map(|error| error.code)})).map_err(checkpoint_error)?;
         match &result {
             Ok(channel) => {
                 self.recovery
@@ -100,9 +152,11 @@ impl StructureBackend for CanaryBackend {
                         .parse()
                         .map_err(|_| oracle_core::Error::new(oracle_core::ErrorCode::Integrity))?,
                 );
-                if let Ok(full) = bounded(self.http.get_channel(id.into())).await
-                    && let Ok(value) = serde_json::to_value(full)
-                {
+                let baseline = bounded(self.http.get_channel(id.into()))
+                    .await
+                    .and_then(|full| serde_json::to_value(full).map_err(|_| "baseline_encode"));
+                self.recovery.event(json!({"phase":"baseline_read","channel_id":channel.id,"error":baseline.as_ref().err()})).map_err(checkpoint_error)?;
+                if let Ok(value) = baseline {
                     self.baselines
                         .lock()
                         .unwrap()
@@ -295,8 +349,12 @@ async fn run(report: &mut Value, recovery: Arc<Recovery>) -> Result<(), &'static
         let backend = Arc::new(CanaryBackend {
             inner: DiscordOperations::new(Token::from_env("DISCORD_TOKEN").map_err(|_| "missing_token")?, core.clone()).map_err(|_| "adapter_create")?,
             http: http.clone(), recovery: recovery.clone(), baselines: Mutex::new(BTreeMap::new()),
+            pace: Pace::new(Duration::from_secs(7)),
         });
         let executor = StructureExecutor::new(core, storage.clone(), backend.clone());
+        report["backend_pacing_ms"] = json!(7000);
+        report["workload"] = json!("minimum 7 seconds between shared backend entries; not immediate-repeat throughput qualification");
+        recovery.checkpoint(report, "paced_workload")?;
         let context = PolicyContext::LocalOperator;
         let before = executor
             .inspect(&context, &guild)
@@ -387,7 +445,7 @@ async fn run(report: &mut Value, recovery: Arc<Recovery>) -> Result<(), &'static
             let repeat = executor
                 .plan(&context, &guild, &request)
                 .await
-                .map_err(|_| "repeat_plan")?;
+                .map_err(|error| { report["repeat_plan_error"] = json!(error.code); "repeat_plan" })?;
             if repeat.steps.len() != 3 || repeat.steps.iter().any(|s| s.change != Change::Reuse) {
                 return Err("repeat_not_noop");
             }
@@ -409,6 +467,8 @@ async fn run(report: &mut Value, recovery: Arc<Recovery>) -> Result<(), &'static
             Ok(())
         }
         .await;
+        report["test_failure"] = json!(test_result.as_ref().err());
+        recovery.checkpoint(report, "test_returned_before_cleanup")?;
         // Always recover durable receipts after applying, even on partial results or
         // timeout. Never infer ownership from a matching name after a lost response.
         let saved = executor
@@ -427,17 +487,20 @@ async fn run(report: &mut Value, recovery: Arc<Recovery>) -> Result<(), &'static
         let mut cleanup_ok = true;
         for receipt in saved.receipts.iter().rev() {
             if receipt.change != Change::Create || before_ids.contains(&receipt.channel.id) {
+                recovery.event(json!({"phase":"cleanup_preserved","channel_id":receipt.channel.id,"reason":"ownership_not_proven"}))?;
                 cleanup_ok = false;
                 continue;
             }
             let fresh = match executor.inspect(&context, &guild).await {
                 Ok(s) if s.complete => s,
-                _ => {
+                result => {
+                    recovery.event(json!({"phase":"cleanup_preserved","channel_id":receipt.channel.id,"reason":"snapshot_unavailable_or_incomplete","error":result.as_ref().err().map(|error| error.code)}))?;
                     cleanup_ok = false;
                     continue;
                 }
             };
             let Some(channel) = fresh.channels.iter().find(|c| c.id == receipt.channel.id) else {
+                recovery.event(json!({"phase":"cleanup_already_absent","channel_id":receipt.channel.id}))?;
                 continue;
             };
             // Preserve resources changed by a human and categories with unowned children.
@@ -451,38 +514,34 @@ async fn run(report: &mut Value, recovery: Arc<Recovery>) -> Result<(), &'static
                     .iter()
                     .any(|c| c.parent.as_ref() == Some(&channel.id))
             {
+                recovery.event(json!({"phase":"cleanup_preserved","channel_id":channel.id,"reason":"projected_fields_changed_or_children_present"}))?;
                 cleanup_ok = false;
                 continue;
             }
             let id = ChannelId::new(channel.id.parse().map_err(|_| "receipt_id")?);
             // Compare the complete REST DTO, including fields outside the shared
             // structure projection. Missing baseline/read access fails closed.
-            let full = bounded(http.get_channel(id.into())).await;
+            let full = bounded(http.get_channel(id.into())).await.and_then(|channel| serde_json::to_value(channel).map_err(|_| "channel_encode"));
             let baseline = backend.baselines.lock().unwrap().get(&channel.id).cloned();
-            if baseline.is_none() || full.ok().and_then(|c| serde_json::to_value(c).ok()) != baseline {
+            if baseline.is_none() || full.as_ref().ok() != baseline.as_ref() {
+                let changed = baseline.as_ref().zip(full.as_ref().ok()).map(|(before, after)| changed_fields(before, after));
+                recovery.event(json!({"phase":"cleanup_preserved","channel_id":channel.id,"reason":"full_metadata_unavailable_or_changed","baseline_missing":baseline.is_none(),"read_error":full.as_ref().err(),"changed_fields":changed}))?;
                 cleanup_ok = false;
                 continue;
             }
-            if channel.kind != ChannelKind::Category
-                && !bounded(http.get_messages(id.into(), None, Some(1u8.try_into().unwrap()))).await.is_ok_and(|messages| messages.is_empty()) {
-                cleanup_ok = false;
-                continue;
+            if channel.kind != ChannelKind::Category {
+                let messages = bounded(http.get_messages(id.into(), None, Some(1u8.try_into().unwrap()))).await;
+                if !messages.as_ref().is_ok_and(|messages| messages.is_empty()) {
+                    recovery.event(json!({"phase":"cleanup_preserved","channel_id":channel.id,"reason":"messages_present_or_unreadable","read_error":messages.as_ref().err()}))?;
+                    cleanup_ok = false;
+                    continue;
+                }
             }
             report["cleanup_channel_id"] = json!(channel.id);
             recovery.checkpoint(report, "before_channel_delete")?;
-            if !matches!(
-                tokio::time::timeout(
-                    Duration::from_secs(20),
-                    http.delete_channel(
-                        id.into(),
-                        Some("Oracle Stage 5 receipt-owned canary cleanup")
-                    )
-                )
-                .await,
-                Ok(Ok(_))
-            ) {
-                cleanup_ok = false;
-            }
+            let deleted = bounded(http.delete_channel(id.into(), Some("Oracle Stage 5 receipt-owned canary cleanup"))).await;
+            recovery.event(json!({"phase":"channel_delete_result","channel_id":channel.id,"error":deleted.as_ref().err()}))?;
+            if deleted.is_err() { cleanup_ok = false; }
             recovery.checkpoint(report, "channel_delete_returned")?;
         }
         report["owned_cleanup"] = json!(cleanup_ok);
@@ -559,6 +618,39 @@ async fn main() {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn pacing_separates_admissions_and_cancellation_does_not_consume_a_slot() {
+        let pace = Pace::new(Duration::from_millis(100));
+        pace.enter(&CancellationToken::new()).await.unwrap();
+        let first = pace.last.lock().await.unwrap();
+        let cancel = CancellationToken::new();
+        let (result, ()) = tokio::join!(pace.enter(&cancel), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+        assert_eq!(result.unwrap_err().code, oracle_core::ErrorCode::Cancelled);
+        assert_eq!(*pace.last.lock().await, Some(first));
+        pace.enter(&CancellationToken::new()).await.unwrap();
+        assert!(
+            pace.last.lock().await.unwrap().duration_since(first) >= Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn changed_metadata_reports_field_names_without_values() {
+        let before = json!({"id":"123","topic":null,"nsfw":false,"bitrate":64000});
+        let after = json!({"id":"123","topic":"private-human-text","nsfw":true,"bitrate":96000});
+        assert_eq!(
+            changed_fields(&before, &after),
+            vec!["bitrate", "nsfw", "topic"]
+        );
+        assert!(
+            !serde_json::to_string(&changed_fields(&before, &after))
+                .unwrap()
+                .contains("private-human-text")
+        );
+    }
 
     #[test]
     fn checkpoint_retains_write_receipts_across_outer_phase_updates() {
