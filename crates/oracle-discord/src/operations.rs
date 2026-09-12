@@ -14,6 +14,25 @@ use serenity::all as discord;
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::OnceCell;
 
+// Serenity waits for Discord buckets before starting an HTTP request. Keep that
+// queue budget separate from the network deadline so a normal 60s reset fits.
+const READ_BUDGET: Duration = Duration::from_secs(90);
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+#[path = "read_tests.rs"]
+mod read_tests;
+
+fn read_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder().use_rustls_tls().timeout(timeout)
+}
+
+fn read_client(timeout: Duration) -> Result<reqwest::Client> {
+    read_client_builder(timeout)
+        .build()
+        .map_err(|_| error(ErrorCode::Io))
+}
+
 const MANAGE_GUILD: u64 = 1 << 5;
 fn error(code: ErrorCode) -> Error {
     Error::new(code)
@@ -25,7 +44,14 @@ pub(crate) fn sid(id: &str) -> Result<u64> {
 pub(crate) async fn read<T>(
     future: impl Future<Output = std::result::Result<T, serenity::Error>>,
 ) -> Result<T> {
-    tokio::time::timeout(Duration::from_secs(15), future)
+    read_with_budget(future, READ_BUDGET).await
+}
+
+async fn read_with_budget<T>(
+    future: impl Future<Output = std::result::Result<T, serenity::Error>>,
+    budget: Duration,
+) -> Result<T> {
+    tokio::time::timeout(budget, future)
         .await
         .map_err(|_| error(ErrorCode::Io))?
         .map_err(|_| error(ErrorCode::Io))
@@ -47,7 +73,11 @@ impl DiscordOperations {
         let writer = Arc::new(DiscordWriteClient::new(secret.to_owned())?);
         Ok(Self {
             core,
-            http: Arc::new(discord::Http::new(token)),
+            http: Arc::new(
+                discord::HttpBuilder::new(token)
+                    .client(read_client(NETWORK_TIMEOUT)?)
+                    .build(),
+            ),
             writer,
             bot: OnceCell::new(),
             application: OnceCell::new(),
