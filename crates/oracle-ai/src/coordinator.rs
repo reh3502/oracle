@@ -586,7 +586,8 @@ impl Coordinator {
                 &saved.run.prices,
                 &prepared,
                 now(),
-                saved.run.status == RunStatus::Verifying,
+                // Executing a verification tool does not end the host-selected phase.
+                saved.run.status == RunStatus::Verifying || verification_continued,
             ) {
                 Ok(reservation) => reservation,
                 Err(error) => {

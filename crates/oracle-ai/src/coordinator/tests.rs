@@ -563,14 +563,20 @@ async fn compaction_prioritizes_pending_verification_without_promoting_host_data
 
 #[tokio::test]
 async fn compaction_uses_only_reserved_verification_allowance() {
-    for max_tokens in [39, 40] {
+    for (max_tokens, required, expected_sends, expected_status) in [
+        (39, 3, 2, RunStatus::Paused),
+        (40, 3, 3, RunStatus::Succeeded),
+        (49, 4, 3, RunStatus::Paused),
+        (50, 4, 4, RunStatus::Succeeded),
+    ] {
         let (_folder, _storage, mut coordinator, provider, host, guild) = setup(
             vec![
                 vec![call("effect")],
                 vec![call("read")],
                 vec![call("verify")],
+                vec![call("verify_second")],
             ],
-            3,
+            required,
             false,
             false,
             false,
@@ -585,15 +591,7 @@ async fn compaction_uses_only_reserved_verification_allowance() {
             .ask(&PolicyContext::LocalOperator, guild, "inspect".into())
             .await
             .unwrap();
-        let expected_sends = if max_tokens == 40 { 3 } else { 2 };
-        assert_eq!(
-            saved.run.status,
-            if max_tokens == 40 {
-                RunStatus::Succeeded
-            } else {
-                RunStatus::Paused
-            }
-        );
+        assert_eq!(saved.run.status, expected_status);
         assert_eq!(provider.sends.load(Ordering::SeqCst), expected_sends);
         assert_eq!(host.effects.load(Ordering::SeqCst), expected_sends);
         assert_eq!(saved.run.budget.charged_tokens, expected_sends as u64 * 10);
