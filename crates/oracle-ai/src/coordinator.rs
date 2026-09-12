@@ -70,6 +70,14 @@ pub struct Reconciliation {
     pub verification_query: Option<String>,
 }
 
+impl Reconciliation {
+    fn verification_hint(&self) -> Option<&str> {
+        self.verification_query.as_deref().filter(|hint| {
+            !self.complete && !self.unresolved && !hint.trim().is_empty() && hint.len() <= 4096
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct CoordinatorConfig {
     pub limits: Limits,
@@ -534,6 +542,10 @@ impl Coordinator {
                         )
                         .await;
                 }
+                if !verification_continued && let Some(hint) = evidence.verification_hint() {
+                    verification_continued = true;
+                    query = hint.to_owned();
+                }
                 semantic = evidence.value;
                 continuation = None;
                 results.clear();
@@ -694,13 +706,7 @@ impl Coordinator {
                 saved.run.status = RunStatus::Verifying;
                 self.runs.save(&mut saved, now()).await?;
                 let evidence = self.reconcile(context, &mut saved).await?;
-                if !evidence.complete
-                    && !evidence.unresolved
-                    && !verification_continued
-                    && let Some(hint) = evidence.verification_query.as_deref()
-                    && !hint.trim().is_empty()
-                    && hint.len() <= 4096
-                {
+                if !verification_continued && let Some(hint) = evidence.verification_hint() {
                     // One fresh semantic session may finish a host-known verification
                     // step. All ordinary admission, catalog, and authority checks remain.
                     verification_continued = true;
