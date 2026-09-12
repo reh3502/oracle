@@ -81,71 +81,77 @@ async fn main() {
     let payload = "x".repeat(args[3].parse::<usize>().unwrap());
     let executable = std::env::current_exe().unwrap();
     let digest = format!("{:x}", Sha256::digest(std::fs::read(&executable).unwrap()));
-    let runtime = ProcessRuntime::new().unwrap();
-    let start = Instant::now();
-    for cycle in 0..cycles {
-        let process = runtime
-            .spawn(
-                &executable,
-                &digest,
-                json!({"cycle": cycle}),
-                Arc::new(Guest),
-            )
-            .await
-            .unwrap();
-        assert_eq!(process.hello(), &json!({"cycle": cycle}));
-        let descendant = process
-            .call("descendant", json!({}), Duration::from_secs(2))
-            .await
-            .unwrap()
-            .as_u64()
-            .unwrap();
-        for call in 0..calls {
-            let request = json!({"sequence": call, "payload": payload});
-            assert_eq!(
-                process
-                    .call("echo", request.clone(), Duration::from_secs(2))
-                    .await
-                    .unwrap(),
-                request
+    let owner = Arc::new(ProcessRuntime::new().unwrap());
+    let runtime = owner.clone();
+    // Preserve supervision even when a workload assertion fails or RPC is interrupted.
+    let workload = tokio::spawn(async move {
+        let start = Instant::now();
+        for cycle in 0..cycles {
+            let process = runtime
+                .spawn(
+                    &executable,
+                    &digest,
+                    json!({"cycle": cycle}),
+                    Arc::new(Guest),
+                )
+                .await
+                .unwrap();
+            assert_eq!(process.hello(), &json!({"cycle": cycle}));
+            let descendant = process
+                .call("descendant", json!({}), Duration::from_secs(2))
+                .await
+                .unwrap()
+                .as_u64()
+                .unwrap();
+            for call in 0..calls {
+                let request = json!({"sequence": call, "payload": payload});
+                assert_eq!(
+                    process
+                        .call("echo", request.clone(), Duration::from_secs(2))
+                        .await
+                        .unwrap(),
+                    request
+                );
+            }
+            let guest = resources(process.pid());
+            let stop_start = Instant::now();
+            let mode = ["graceful", "forced", "crash"][cycle % 3];
+            let report = match mode {
+                "graceful" => process.stop(Duration::from_secs(1)).await.unwrap(),
+                "forced" => process.force_stop().await.unwrap(),
+                _ => {
+                    assert!(
+                        process
+                            .call("crash", json!({}), Duration::from_secs(2))
+                            .await
+                            .is_err()
+                    );
+                    process.wait_stopped(Duration::from_secs(5)).await.unwrap()
+                }
+            };
+            assert!(report.cleanup_error.is_none(), "{report:?}");
+            if mode == "forced" {
+                assert!(report.forced);
+            }
+            if mode == "crash" {
+                assert_eq!(report.exit_code, Some(23));
+            }
+            assert!(report.descendants_reaped >= 1);
+            assert!(!Path::new(&format!("/proc/{}", process.pid())).exists());
+            assert!(!Path::new(&format!("/proc/{descendant}")).exists());
+            assert_eq!(runtime.loaded_count(), 0);
+            let stop_ms = stop_start.elapsed().as_secs_f64() * 1000.0;
+            drop(process);
+            // Allow completed supervisor and transport futures to release allocations.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            println!(
+                "{}",
+                json!({"cycle": cycle, "mode": mode, "host": resources(std::process::id()), "guest": guest, "stop_ms": stop_ms, "stop": report, "elapsed_seconds": start.elapsed().as_secs_f64()})
             );
         }
-        let guest = resources(process.pid());
-        let stop_start = Instant::now();
-        let mode = ["graceful", "forced", "crash"][cycle % 3];
-        let report = match mode {
-            "graceful" => process.stop(Duration::from_secs(1)).await.unwrap(),
-            "forced" => process.force_stop().await.unwrap(),
-            _ => {
-                assert!(
-                    process
-                        .call("crash", json!({}), Duration::from_secs(2))
-                        .await
-                        .is_err()
-                );
-                process.wait_stopped(Duration::from_secs(5)).await.unwrap()
-            }
-        };
-        assert!(report.cleanup_error.is_none(), "{report:?}");
-        if mode == "forced" {
-            assert!(report.forced);
-        }
-        if mode == "crash" {
-            assert_eq!(report.exit_code, Some(23));
-        }
-        assert!(report.descendants_reaped >= 1);
-        assert!(!Path::new(&format!("/proc/{}", process.pid())).exists());
-        assert!(!Path::new(&format!("/proc/{descendant}")).exists());
-        assert_eq!(runtime.loaded_count(), 0);
-        let stop_ms = stop_start.elapsed().as_secs_f64() * 1000.0;
-        drop(process);
-        // Allow completed supervisor and transport futures to release allocations.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        println!(
-            "{}",
-            json!({"cycle": cycle, "mode": mode, "host": resources(std::process::id()), "guest": guest, "stop_ms": stop_ms, "stop": report, "elapsed_seconds": start.elapsed().as_secs_f64()})
-        );
-    }
-    runtime.shutdown().await.unwrap();
-    assert_eq!(runtime.loaded_count(), 0);
+    });
+    let outcome = workload.await;
+    owner.shutdown().await.unwrap();
+    assert_eq!(owner.loaded_count(), 0);
+    outcome.unwrap();
 }
