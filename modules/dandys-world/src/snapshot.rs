@@ -671,6 +671,11 @@ impl Store {
         }
         Ok(entries)
     }
+    /// Last-observed disk use for diagnostics. Concurrent worker staging may
+    /// change during this read; admission still uses the writer-locked quota.
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.disk_bytes()
+    }
     fn disk_bytes(&self) -> Result<u64> {
         let mut directories = vec![(self.root.clone(), 0usize)];
         let mut entries = 0usize;

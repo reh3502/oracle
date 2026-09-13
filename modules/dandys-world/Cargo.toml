@@ -16,7 +16,7 @@ libc = "0.2"
 async-trait = "0.1"
 oracle-module-sdk = { path = "../../crates/oracle-module-sdk" }
 oracle-contracts = { path = "../../crates/oracle-contracts" }
-tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "process", "macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 oracle-rpc = { path = "../../crates/oracle-rpc" }

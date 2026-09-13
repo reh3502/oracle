@@ -7,7 +7,7 @@ use oracle_module_sdk::CancellationToken;
 use oracle_rpc::{RpcHandler, RpcPeer};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -582,10 +582,14 @@ async fn status_and_health_report_pinned_snapshot_metadata_without_paths() {
         assert!(text.contains("Entities: 1; source pages: 2."));
         if operation == "health" {
             assert!(text.contains(&format!("oldest {}; latest {}", NOW - 1000, NOW)));
+            assert!(text.contains("Schema: 1"));
+            assert!(text.contains("Unknown/unverified facts:"));
+            assert!(text.contains("Last observed disk bytes:"));
+            assert!(text.contains("Module queries:"));
         } else {
             assert!(text.contains("minutes ago") || text.contains("dated in the future"));
         }
-        assert!(text.contains("Network refresh: disabled."));
+        assert!(text.contains("Network refresh: Disabled"));
         assert!(!text.contains(dir.0.to_str().unwrap()));
         assert!(!text.contains("data_directory"));
         assert!(text.encode_utf16().count() <= 1800);
@@ -625,5 +629,231 @@ async fn status_and_health_report_pinned_snapshot_metadata_without_paths() {
     let text = new_status["reply"]["text"].as_str().unwrap();
     assert!(text.contains(&second.id));
     assert!(text.contains(&format!("latest {}.", NOW + 1000)));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn invalid_refresh_configuration_preserves_queries_and_never_starts_worker() {
+    for settings in [
+        br#"{"url":"https://unapproved.example"}"#.as_slice(),
+        br#"not json"#.as_slice(),
+    ] {
+        let dir = Temp::new();
+        Store::new(&dir.0)
+            .unwrap()
+            .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+            .unwrap();
+        fs::write(dir.0.join("refresh-settings.json"), settings).unwrap();
+        let module = Arc::new(DwModule::default());
+        let h = Harness::new(module.clone());
+        h.hello().await;
+        h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+        assert_eq!(
+            *module.refresh.read().unwrap(),
+            "Disabled: invalid refresh configuration"
+        );
+        assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
+        assert!(!dir.0.join("refresh-schedule.json").exists());
+        h.close().await;
+    }
+}
+
+fn configure_fixture_worker(dir: &Path, script: &str) -> PathBuf {
+    let worker = dir.join("fixture_worker.py");
+    fs::write(&worker, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        dir.join("refresh-settings.json"),
+        serde_json::to_vec(&json!({
+            "enabled":true,"source_access_qualified":true,
+            "python":fs::canonicalize("/usr/bin/python3").unwrap(),
+            "worker":worker,"previous":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    worker
+}
+async fn wait_for_refresh_result(dir: &Path, result: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = fs::read(dir.join("refresh-schedule.json"))
+                && let Ok(state) = serde_json::from_slice::<Value>(&bytes)
+                && state["last_result"] == result
+            {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "refresh attempt did not reach {result}: {:?}",
+            fs::read_to_string(dir.join("refresh-schedule.json"))
+        )
+    })
+}
+#[tokio::test]
+async fn scheduled_access_denial_is_persisted_across_module_restart() {
+    let dir = Temp::new();
+    Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+        .unwrap();
+    let worker = configure_fixture_worker(
+        &dir.0,
+        "from pathlib import Path\nimport sys\np=Path(__file__).with_suffix('.count')\np.write_text(str(int(p.read_text())+1) if p.exists() else '1')\nsys.exit(3)\n",
+    );
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    let state = wait_for_refresh_result(&dir.0, "source_denied").await;
+    assert_eq!(state["stopped_denied"], true);
+    assert!(state["last_success_ms"].is_null());
+    assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
+    h.close().await;
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        fs::read_to_string(worker.with_extension("count")).unwrap(),
+        "1"
+    );
+    assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn stalled_refresh_keeps_queries_available_and_shutdown_reaps_worker() {
+    let dir = Temp::new();
+    let store = Store::new(&dir.0).unwrap();
+    let first = store
+        .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+        .unwrap();
+    let worker = configure_fixture_worker(
+        &dir.0,
+        "from pathlib import Path\nimport os,time\nPath(__file__).with_suffix('.pid').write_text(str(os.getpid()))\ntime.sleep(60)\n",
+    );
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !worker.with_extension("pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = fs::read_to_string(worker.with_extension("pid")).unwrap();
+    h.call("activate", json!({"guild":"123","epoch":2}))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(1), h.invoke("status", json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reply["reply"]["text"].as_str().unwrap().contains(&first.id));
+    h.close().await;
+    assert!(
+        !PathBuf::from(format!("/proc/{pid}")).exists(),
+        "worker is reaped before SDK shutdown completes"
+    );
+    assert_eq!(store.load().unwrap().id, first.id);
+    assert!(module.engine.read().unwrap().is_none());
+    let state: Value =
+        serde_json::from_slice(&fs::read(dir.0.join("refresh-schedule.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["running"], true,
+        "restart must treat cancelled work as interrupted"
+    );
+    assert!(state["last_success_ms"].is_null());
+}
+
+#[tokio::test]
+async fn scheduled_candidate_requires_review_before_serving_changed_facts() {
+    use dandys_world_core::{refresh_control::RefreshControl, refresh_review::ReviewApproval};
+    let dir = Temp::new();
+    let mut data = catalog();
+    data.sources[0].validated_at_ms = 1_789_171_200_000;
+    let first = Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    data.entities[0].facts[0].value = json!(9);
+    fs::write(
+        dir.0.join("fixture_candidate.json"),
+        serde_json::to_vec(&data).unwrap(),
+    )
+    .unwrap();
+    configure_fixture_worker(
+        &dir.0,
+        "from pathlib import Path\nimport sys\np=Path(sys.argv[sys.argv.index('--output')+1])\np.mkdir()\n(p/'candidate.json').write_bytes(Path(__file__).with_name('fixture_candidate.json').read_bytes())\n",
+    );
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    let state = wait_for_refresh_result(&dir.0, "review_required").await;
+    assert!(state["last_success_ms"].is_null());
+    assert_eq!(module.engine.read().unwrap().as_ref().unwrap().id, first.id);
+    let control = RefreshControl::new(&dir.0).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let review = control.inspect_pending(now).unwrap().unwrap();
+    let published = control
+        .approve(
+            &ReviewApproval {
+                active_digest: review.active_digest,
+                candidate_digest: review.candidate_digest,
+            },
+            now,
+        )
+        .unwrap();
+    wait_for_snapshot(&module, &published.id).await;
+    assert!(
+        module
+            .query("lookup", json!({"name":"Rock"}), 1_789_171_260_000)
+            .unwrap()["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Value: 9")
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn server_retry_floor_survives_worker_and_scheduler_boundaries() {
+    let dir = Temp::new();
+    Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+        .unwrap();
+    let floor = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 86_400_000;
+    configure_fixture_worker(
+        &dir.0,
+        &format!(
+            "from pathlib import Path\nimport sys,json\np=Path(sys.argv[sys.argv.index('--output')+1])\np.mkdir()\n(p/'result.json').write_text(json.dumps({{'status':'retry','retry_not_before_ms':{floor}}}))\nsys.exit(2)\n"
+        ),
+    );
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    let state = wait_for_refresh_result(&dir.0, "rate_limited").await;
+    assert!(state["next_due_ms"].as_u64().unwrap() >= floor);
+    assert!(state["last_success_ms"].is_null());
+    assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
     h.close().await;
 }

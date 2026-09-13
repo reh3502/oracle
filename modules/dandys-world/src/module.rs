@@ -1,5 +1,6 @@
 //! Separate Oracle SDK executable; its only data input is the operator's snapshot directory.
 mod presentation;
+mod refresh_runtime;
 use async_trait::async_trait;
 use dandys_world_core::{
     query::{QueryEngine, QueryRequest},
@@ -11,8 +12,11 @@ use oracle_module_sdk::{
 };
 use serde_json::{Value, json};
 use std::{
-    sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct LoadedCatalog {
@@ -20,12 +24,35 @@ struct LoadedCatalog {
     engine: QueryEngine,
     entity_count: usize,
     source_count: usize,
+    quality: String,
     oldest_validation_ms: u64,
     latest_validation_ms: u64,
 }
 impl LoadedCatalog {
     fn new(snapshot: Snapshot) -> Self {
         Self {
+            quality: {
+                use dandys_world_core::model::EvidenceState;
+                let facts = snapshot.data.entities.iter().flat_map(|e| &e.facts);
+                let unknown = facts
+                    .clone()
+                    .filter(|f| {
+                        matches!(f.state, EvidenceState::Unknown | EvidenceState::Unverified)
+                    })
+                    .count();
+                let conflicting = facts
+                    .filter(|f| f.state == EvidenceState::Conflicting)
+                    .count();
+                format!(
+                    "Schema: {}. Entities by kind: {}. Unknown/unverified facts: {}; conflicting facts: {}; coverage warnings: {}; unresolved redirects: {}.",
+                    snapshot.data.schema_version,
+                    serde_json::to_string(&snapshot.data.coverage.entities_by_kind).unwrap(),
+                    unknown,
+                    conflicting,
+                    snapshot.data.coverage.warnings.len(),
+                    snapshot.data.coverage.unresolved_redirects.len()
+                )
+            },
             id: snapshot.id.clone(),
             entity_count: snapshot.data.entities.len(),
             source_count: snapshot.data.sources.len(),
@@ -52,6 +79,11 @@ struct DwModule {
     // Metadata and query index are published and retained together.
     engine: Arc<RwLock<Option<Arc<LoadedCatalog>>>>,
     recovery: Arc<RwLock<&'static str>>,
+    refresh: refresh_runtime::Diagnostics,
+    disk_bytes: Arc<AtomicU64>,
+    queries: AtomicU64,
+    rejected: AtomicU64,
+    query_micros: AtomicU64,
 }
 fn request(operation: &str, input: Value) -> Result<QueryRequest> {
     if ![
@@ -81,6 +113,19 @@ fn request(operation: &str, input: Value) -> Result<QueryRequest> {
 }
 impl DwModule {
     fn query(&self, operation: &str, input: Value, now: u64) -> Result<Value> {
+        let started = Instant::now();
+        let result = self.query_inner(operation, input, now);
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        self.query_micros.fetch_add(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        if result.is_err() {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+    fn query_inner(&self, operation: &str, input: Value, now: u64) -> Result<Value> {
         let request = request(operation, input)?;
         let engine = self
             .engine
@@ -109,9 +154,35 @@ impl DwModule {
                     (now - engine.latest_validation_ms) / 60_000
                 )
             };
+            let refresh = self.refresh.read().unwrap();
+            let refresh = if refresh.is_empty() {
+                "Disabled"
+            } else if operation == "health" {
+                refresh.as_str()
+            } else {
+                refresh.split(':').next().unwrap_or("Unavailable")
+            };
+            let diagnostics = if operation == "health" {
+                format!(
+                    "\n{} Last observed disk bytes: {}. Module queries: {}; rejected: {}; mean query time: {} microseconds.",
+                    engine.quality,
+                    self.disk_bytes.load(Ordering::Relaxed),
+                    self.queries.load(Ordering::Relaxed),
+                    self.rejected.load(Ordering::Relaxed),
+                    self.query_micros.load(Ordering::Relaxed)
+                        / self.queries.load(Ordering::Relaxed).max(1)
+                )
+            } else {
+                String::new()
+            };
             response.message = format!(
-                "Loaded wiki snapshot: {}\nEntities: {}; source pages: {}.\n{}\nNetwork refresh: disabled.",
-                response.snapshot_id, engine.entity_count, engine.source_count, checks,
+                "Loaded wiki snapshot: {}\nEntities: {}; source pages: {}.\n{}\nNetwork refresh: {}.{}",
+                response.snapshot_id,
+                engine.entity_count,
+                engine.source_count,
+                checks,
+                refresh,
+                diagnostics,
             );
         }
         Ok(json!({"reply":presentation::render(&request, &response)}))
@@ -141,11 +212,20 @@ impl Module for DwModule {
         } else {
             "Ready"
         };
+        self.disk_bytes.store(
+            Store::new(&directory)
+                .and_then(|s| s.disk_usage())
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        refresh_runtime::start(directory.clone(), &global, self.refresh.clone())?;
         let engine = self.engine.clone();
         let recovery = self.recovery.clone();
+        let disk_bytes = self.disk_bytes.clone();
         let cancel = global.cancellation();
         global
             .spawn("dw-snapshot-monitor", async move {
+                let mut ticks = 0u64;
                 loop {
                     tokio::select! {
                         biased;
@@ -159,10 +239,18 @@ impl Module for DwModule {
                         .map(|e| e.id.clone())
                         .unwrap_or_default();
                     let root = directory.clone();
+                    ticks = ticks.wrapping_add(1);
+                    let disk_bytes = disk_bytes.clone();
                     // Always join blocking work, even during cancellation. No parsing
                     // or index construction runs on the query executor.
                     let loaded = tokio::task::spawn_blocking(move || {
-                        Store::new(root)?
+                        let store = Store::new(root)?;
+                        if ticks.is_multiple_of(60)
+                            && let Ok(bytes) = store.disk_usage()
+                        {
+                            disk_bytes.store(bytes, Ordering::Relaxed);
+                        }
+                        store
                             .load_if_changed(&current)
                             .map(|s| s.map(LoadedCatalog::new))
                     })
