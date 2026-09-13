@@ -1,0 +1,101 @@
+{
+  "manifest_version": 2,
+  "id": "fixture.member-callbacks",
+  "version": "1.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "protocol_major": 1,
+  "protocol_minor_min": 1,
+  "host_api": "^1.1",
+  "data_version": 1,
+  "readable_data_versions": [
+    1
+  ],
+  "capabilities": [
+    "storage.own",
+    "host.echo"
+  ],
+  "operations": [
+    {
+      "name": "member_probe",
+      "description": "Test-only raw callback probe",
+      "audience": "member_read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "params": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "method",
+          "params"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 5000,
+      "capabilities": []
+    },
+    {
+      "name": "operator_probe",
+      "description": "Test-only raw callback probe",
+      "audience": "operator",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "params": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "method",
+          "params"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 5000,
+      "capabilities": [
+        "storage.own",
+        "host.echo"
+      ]
+    }
+  ],
+  "collections": [
+    {
+      "name": "probes",
+      "schema": {
+        "type": "object"
+      }
+    }
+  ],
+  "commands": {
+    "namespace": "callbackprobe",
+    "description": "Test-only member callback probe",
+    "routes": [
+      {
+        "name": "probe",
+        "description": "Test-only adversarial callback invocation",
+        "operation": "member_probe",
+        "input": {
+          "kind": "json",
+          "required": true
+        }
+      }
+    ]
+  }
+}
