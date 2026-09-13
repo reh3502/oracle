@@ -11,6 +11,58 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait::async_trait]
 impl HumanOperations for Host {
+    async fn published_uses_member_identity(
+        &self,
+        context: &PolicyContext,
+        member: &oracle_core::member_read::MemberContext,
+        guild: &GuildId,
+        request: &oracle_operations::ingress::PublishedRequest,
+    ) -> Result<bool> {
+        let commands = self
+            .command_sync
+            .get()
+            .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+        command_runtime::published_uses_member_identity(
+            &self.modules,
+            commands,
+            context,
+            member,
+            guild,
+            request,
+        )
+        .await
+    }
+    async fn execute_published(
+        &self,
+        context: &PolicyContext,
+        member: &oracle_core::member_read::MemberContext,
+        guild: &GuildId,
+        request: oracle_operations::ingress::PublishedRequest,
+        cancel: &CancellationToken,
+    ) -> Result<oracle_operations::ingress::PublishedReply> {
+        let commands = self
+            .command_sync
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+        let modules = self.modules.clone();
+        let (context, member, guild) = (context.clone(), member.clone(), guild.clone());
+        let root = self.operation_tasks.token();
+        let cancel = cancel.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.operation_tasks.spawn("published_command", async move {
+            let result = tokio::select! {biased;
+                _ = root.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+                _ = cancel.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+                result = command_runtime::invoke_published_options(&modules, &commands, &context, &member, &guild, request) => result,
+            };
+            let _ = send.send(result);
+            Ok(())
+        }).map_err(|_| Error::new(ErrorCode::Cancelled))?;
+        receive
+            .await
+            .map_err(|_| Error::new(ErrorCode::Cancelled))?
+    }
     fn ai_available(&self) -> bool {
         self.ai.get().is_some()
     }

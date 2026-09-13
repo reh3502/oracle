@@ -20,14 +20,12 @@ pub fn compile_catalog(entries: &[ModuleCatalogEntry]) -> Result<Vec<DesiredComm
         let options: Vec<_> = descriptor
             .routes
             .iter()
-            .map(|route| {
-                json!({
-                    "type":1, "name":route.name, "description":route.description,
-                    "options":[{"type":3,"name":"input","description":"Operation input as JSON",
-                        "required":route.input_required,"max_length":6000}]
-                })
-            })
-            .collect();
+            .map(oracle_operations::published::compile_route)
+            .collect::<Result<_>>()?;
+        let member_visible = entry
+            .operations
+            .iter()
+            .any(|op| op.audience == oracle_core::ModuleAudience::MemberRead);
         desired.push(DesiredCommand {
             owner: entry.module.clone(),
             route: Some(CommandRoute {
@@ -36,7 +34,7 @@ pub fn compile_catalog(entries: &[ModuleCatalogEntry]) -> Result<Vec<DesiredComm
                 epoch: entry.epoch,
             }),
             definition: json!({"type":1,"name":descriptor.namespace,
-                "description":descriptor.description,"default_member_permissions":"32",
+                "description":descriptor.description,"default_member_permissions":if member_visible {serde_json::Value::Null} else {json!("32")},
                 "options":options}),
         });
     }
@@ -109,6 +107,168 @@ struct RegistryFence(oracle_modules::RegistryDispatchPermit);
 impl oracle_operations::executor::DispatchFence for RegistryFence {
     fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         self.0.dispatch(send)?
+    }
+}
+
+struct MemberResponseFence {
+    policy: oracle_core::member_read::MemberReadPermit,
+    registry: oracle_modules::RegistryDispatchPermit,
+}
+impl oracle_operations::executor::DispatchFence for MemberResponseFence {
+    fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        // Registry-before-policy matches configuration publication's lock order.
+        self.registry.dispatch(|| self.policy.dispatch(send))??
+    }
+}
+
+async fn resolve_published_entry(
+    manager: &oracle_modules::ModuleManager,
+    reconciler: &oracle_operations::commands::CommandReconciler,
+    actor: &oracle_core::PolicyContext,
+    member: &oracle_core::member_read::MemberContext,
+    guild: &oracle_core::GuildId,
+    request: &oracle_operations::ingress::PublishedRequest,
+) -> Result<ModuleCatalogEntry> {
+    use oracle_core::PolicyContext;
+    if !matches!(actor, PolicyContext::Discord {guild: g, user, ..} if g == guild && g == &member.guild && user == &member.user)
+    {
+        return Err(Error::new(ErrorCode::ForbiddenScope));
+    }
+    let binding = reconciler
+        .bindings(guild)
+        .await?
+        .into_iter()
+        .find(|binding| binding.id.as_deref() == Some(&request.command_id))
+        .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+    if binding.definition["name"].as_str() != Some(&request.command_name) {
+        return Err(Error::new(ErrorCode::ForbiddenScope));
+    }
+    let identity = binding
+        .route
+        .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+    let entries = match manager.catalog(actor, guild).await {
+        Ok(entries) => entries,
+        Err(error) if error.code == ErrorCode::ForbiddenPermission => {
+            manager.member_catalog(member, guild).await?.entries
+        }
+        Err(error) => return Err(error),
+    };
+    let entry = entries
+        .into_iter()
+        .find(|entry| {
+            entry.module == binding.owner
+                && entry.session == identity.session
+                && entry.generation == identity.generation
+                && entry.epoch == identity.epoch
+                && entry.commands.namespace == request.command_name
+        })
+        .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+    Ok(entry)
+}
+
+pub async fn published_uses_member_identity(
+    manager: &oracle_modules::ModuleManager,
+    reconciler: &oracle_operations::commands::CommandReconciler,
+    actor: &oracle_core::PolicyContext,
+    member: &oracle_core::member_read::MemberContext,
+    guild: &oracle_core::GuildId,
+    request: &oracle_operations::ingress::PublishedRequest,
+) -> Result<bool> {
+    let entry = resolve_published_entry(manager, reconciler, actor, member, guild, request).await?;
+    let route = entry
+        .commands
+        .routes
+        .iter()
+        .find(|r| r.name == request.route)
+        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    let operation = entry
+        .operations
+        .iter()
+        .find(|op| op.name == route.operation)
+        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    Ok(operation.audience == oracle_core::ModuleAudience::MemberRead)
+}
+
+pub async fn invoke_published_options(
+    manager: &oracle_modules::ModuleManager,
+    reconciler: &oracle_operations::commands::CommandReconciler,
+    actor: &oracle_core::PolicyContext,
+    member: &oracle_core::member_read::MemberContext,
+    guild: &oracle_core::GuildId,
+    request: oracle_operations::ingress::PublishedRequest,
+) -> Result<oracle_operations::ingress::PublishedReply> {
+    use oracle_core::ModuleAudience;
+    use oracle_operations::{
+        ingress::PublishedReply,
+        published::{decode_input, render_presentation},
+    };
+    let entry =
+        resolve_published_entry(manager, reconciler, actor, member, guild, &request).await?;
+    let route = entry
+        .commands
+        .routes
+        .iter()
+        .find(|route| route.name == request.route)
+        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    let operation = entry
+        .operations
+        .iter()
+        .find(|op| op.name == route.operation)
+        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    let input = decode_input(route, &request.options)?;
+    let settings = manager.runtime_settings(&entry.module);
+    let prefix = settings
+        .as_ref()
+        .and_then(|settings| settings.citation_prefix.as_deref());
+    if operation.audience == ModuleAudience::MemberRead {
+        let invocation = manager
+            .invoke_member_bound(
+                member,
+                guild,
+                &entry.module,
+                &operation.name,
+                input,
+                &entry.session,
+                entry.generation,
+                entry.epoch,
+            )
+            .await?;
+        let text = render_presentation(route, &invocation.value, prefix)?;
+        if text.is_none() {
+            return Err(Error::new(ErrorCode::Compatibility));
+        }
+        Ok(PublishedReply {
+            value: invocation.value,
+            text,
+            policy: Some(invocation.policy.clone()),
+            fence: Some(std::sync::Arc::new(MemberResponseFence {
+                policy: invocation.policy,
+                registry: invocation.registry,
+            })),
+        })
+    } else {
+        let revision = manager.registry_revision();
+        let value = manager
+            .invoke_bound(
+                actor,
+                guild,
+                &entry.module,
+                &operation.name,
+                input,
+                &entry.session,
+                entry.generation,
+                entry.epoch,
+            )
+            .await?;
+        let text = render_presentation(route, &value, prefix)?;
+        Ok(PublishedReply {
+            value,
+            text,
+            policy: None,
+            fence: Some(std::sync::Arc::new(RegistryFence(
+                manager.registry_permit(revision),
+            ))),
+        })
     }
 }
 

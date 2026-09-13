@@ -44,7 +44,7 @@ fn normalized(path: &Path) -> bool {
 /// A fixed HTTPS prefix accepts only a host and an unescaped, ordinary path,
 /// followed by one numeric revision parameter. No module-supplied URL is used.
 pub fn validate_citation_prefix(prefix: &str) -> Result<()> {
-    if prefix.len() > 2048 || !prefix.is_ascii() {
+    if prefix.len() > 1024 || !prefix.is_ascii() {
         return Err(invalid());
     }
     let authority_path = prefix
@@ -391,6 +391,13 @@ mod tests {
     #[test]
     fn citation_prefix_is_a_single_operator_owned_https_revision_link() {
         validate_citation_prefix("https://wiki.example.test/w/index.php?oldid=").unwrap();
+        assert!(
+            validate_citation_prefix(&format!(
+                "https://wiki.example.test/{}?oldid=",
+                "x".repeat(1024)
+            ))
+            .is_err()
+        );
         for prefix in [
             "http://wiki.example.test/index.php?oldid=",
             "https://u:p@wiki.example.test/index.php?oldid=",

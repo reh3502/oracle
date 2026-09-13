@@ -102,6 +102,56 @@ impl Host {
                 return Err(error);
             }
         };
+        let module_configuration = async {
+            if !config.module_runtime.is_empty() {
+                use std::os::unix::fs::MetadataExt;
+                let state = std::fs::canonicalize(&config.state_dir)
+                    .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+                let owner = std::fs::metadata(&state)
+                    .map_err(|e| Error::with_source(ErrorCode::Io, e))?
+                    .uid();
+                let mut protected = vec![
+                    state.join("host.lock"),
+                    state.join("control.sock"),
+                    state.join("migration-backups"),
+                ];
+                if let Some(path) = &config.source_path {
+                    protected.push(path.clone());
+                }
+                if let crate::config::Database::Sqlite { path } = &config.database {
+                    let path = std::fs::canonicalize(path)
+                        .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+                    protected.push(path.clone());
+                    protected.push(std::path::PathBuf::from(format!("{}-wal", path.display())));
+                    protected.push(std::path::PathBuf::from(format!("{}-shm", path.display())));
+                }
+                modules
+                    .configure_runtime_settings(
+                        &PolicyContext::LocalOperator,
+                        config.module_runtime.clone(),
+                        &protected,
+                        owner,
+                    )
+                    .await?;
+            }
+            for reads in &config.member_reads {
+                modules
+                    .configure_member_reads(
+                        &PolicyContext::LocalOperator,
+                        &reads.guild,
+                        &reads.module,
+                        Some(reads.policy.clone()),
+                    )
+                    .await?;
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+        if let Err(error) = module_configuration {
+            let _ = modules.shutdown().await;
+            let _ = storage.close().await;
+            return Err(error);
+        }
         Ok(Self {
             ai: std::sync::OnceLock::new(),
             operations: std::sync::OnceLock::new(),

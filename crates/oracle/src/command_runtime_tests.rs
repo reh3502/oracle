@@ -137,7 +137,7 @@ async fn published_command_identity_and_explicit_grants_survive_lifecycle_change
         storage.clone(),
         vec![GuildPolicy {
             guild: guild.clone(),
-            operators: vec![],
+            operators: vec!["42".parse().unwrap()],
         }],
     ));
     let manager =
@@ -236,6 +236,45 @@ async fn published_command_identity_and_explicit_grants_survive_lifecycle_change
         let name = bindings[0].definition["name"].as_str().unwrap().to_owned();
         let original = bindings[0].route.clone().unwrap();
         assert_eq!(original.session, catalog[0].session);
+        let (operator, mut metadata) = member_tests::identity(&guild, "42", true);
+        metadata.observed_at = std::time::Instant::now() - Duration::from_secs(100);
+        let typed_request = oracle_operations::ingress::PublishedRequest {
+            command_id: id.clone(),
+            command_name: name.clone(),
+            route: "status".into(),
+            options: Default::default(),
+        };
+        assert!(
+            !super::published_uses_member_identity(
+                &worker,
+                &reconciler,
+                &operator,
+                &metadata,
+                &guild,
+                &typed_request
+            )
+            .await
+            .unwrap()
+        );
+        let operator_reply = super::invoke_published_options(
+            &worker,
+            &reconciler,
+            &operator,
+            &metadata,
+            &guild,
+            typed_request,
+        )
+        .await
+        .unwrap();
+        assert!(
+            operator_reply.text.is_none(),
+            "legacy admin output remains exact JSON"
+        );
+        assert!(
+            operator_reply.policy.is_none(),
+            "legacy admin route must not require member policy/freshness"
+        );
+        assert_eq!(operator_reply.value["epoch"], original.epoch);
         assert_eq!(
             invoke_published(
                 &worker,
@@ -440,3 +479,6 @@ async fn published_command_identity_and_explicit_grants_survive_lifecycle_change
     stopped.unwrap();
     closed.unwrap();
 }
+
+#[path = "command_runtime_member_tests.rs"]
+mod member_tests;

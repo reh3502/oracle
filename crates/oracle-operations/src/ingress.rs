@@ -6,6 +6,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+/// Authenticated Discord option values. Duplicate option names are rejected at ingress.
+#[derive(Clone, Debug)]
+pub struct PublishedRequest {
+    pub command_id: String,
+    pub command_name: String,
+    pub route: String,
+    pub options: serde_json::Map<String, Value>,
+}
+pub struct PublishedReply {
+    pub value: Value,
+    pub text: Option<String>,
+    pub policy: Option<oracle_core::member_read::MemberReadPermit>,
+    pub fence: Option<std::sync::Arc<dyn crate::executor::DispatchFence>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationRequest {
@@ -51,8 +66,64 @@ pub enum OperationRequest {
 
 #[async_trait]
 pub trait HumanOperations: Send + Sync {
+    /// Resolve the currently bound route before selecting member-specific HTTP
+    /// checks. Invocation resolves it again to fence intervening registry changes.
+    async fn published_uses_member_identity(
+        &self,
+        _context: &PolicyContext,
+        _member: &oracle_core::member_read::MemberContext,
+        _guild: &GuildId,
+        _request: &PublishedRequest,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     fn ai_available(&self) -> bool {
         false
+    }
+    async fn execute_published(
+        &self,
+        context: &PolicyContext,
+        _member: &oracle_core::member_read::MemberContext,
+        guild: &GuildId,
+        request: PublishedRequest,
+        cancel: &CancellationToken,
+    ) -> Result<PublishedReply> {
+        // Legacy adapters can retain their existing JSON-only behavior.
+        let input = match request.options.len() {
+            0 => serde_json::json!({}),
+            1 => serde_json::from_str(
+                request
+                    .options
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| oracle_core::Error::new(oracle_core::ErrorCode::InvalidInput))?,
+            )
+            .map_err(|_| oracle_core::Error::new(oracle_core::ErrorCode::InvalidInput))?,
+            _ => {
+                return Err(oracle_core::Error::new(
+                    oracle_core::ErrorCode::InvalidInput,
+                ));
+            }
+        };
+        let value = self
+            .execute(
+                context,
+                guild,
+                OperationRequest::InvokePublished {
+                    command_id: request.command_id,
+                    command_name: request.command_name,
+                    route: request.route,
+                    input,
+                },
+                cancel,
+            )
+            .await?;
+        Ok(PublishedReply {
+            value,
+            text: None,
+            policy: None,
+            fence: None,
+        })
     }
     async fn execute(
         &self,

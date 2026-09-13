@@ -650,6 +650,28 @@ async fn gateway_coverage_is_unavailable_until_ready_and_clears_on_disconnect_an
     bootstrap.observe_connection(&ready);
     assert_eq!(modules.event_intents().len(), 3);
     assert_eq!(bootstrap.event_coverage()["connected"], true);
+    let gate = bootstrap.core.member_read_gate();
+    let guild = core::GuildId::new("101").unwrap();
+    let module = core::ModuleId::new("test.member-reader").unwrap();
+    gate.configure(
+        guild.clone(),
+        module.clone(),
+        Some(core::member_read::MemberReadPolicy {
+            channels: Default::default(),
+            roles: Default::default(),
+            per_user_per_minute: 4,
+            per_guild_per_minute: 8,
+        }),
+    )
+    .unwrap();
+    let mut member = core::member_read::MemberContext {
+        guild: guild.clone(),
+        user: core::UserId::new("303").unwrap(),
+        channel: "404".into(),
+        roles: Default::default(),
+        observed_at: std::time::Instant::now(),
+    };
+    let before_disconnect = gate.admit(&member, &guild, &module).unwrap();
     let stage: discord::ShardStageUpdateEvent =
         serde_json::from_str(r#"{"new":"Disconnected","old":"Connected","shard_id":0}"#).unwrap();
     // The public FullEvent is non-exhaustive; use the typed Event conversion.
@@ -660,8 +682,12 @@ async fn gateway_coverage_is_unavailable_until_ready_and_clears_on_disconnect_an
     );
     bootstrap.observe_connection(&disconnected);
     assert!(modules.event_intents().is_empty());
+    assert!(before_disconnect.check().is_err());
+    assert!(gate.admit(&member, &guild, &module).is_err());
     bootstrap.observe_connection(&ready);
     assert_eq!(modules.event_intents().len(), 3);
+    member.observed_at = std::time::Instant::now();
+    let before_shutdown = gate.admit(&member, &guild, &module).unwrap();
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     bootstrap
@@ -671,6 +697,7 @@ async fn gateway_coverage_is_unavailable_until_ready_and_clears_on_disconnect_an
         .unwrap();
     assert!(modules.event_intents().is_empty());
     assert_eq!(bootstrap.event_coverage()["connected"], false);
+    assert!(before_shutdown.check().is_err());
     modules.shutdown().await.unwrap();
     storage.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -733,7 +760,16 @@ async fn malformed_published_commands_never_reach_operations() {
                 .unwrap()
         );
         assert!(operations.requests.lock().unwrap().is_empty());
-        assert!(responder.events.lock().unwrap()[0].starts_with("reject:"));
+        // Typed routes can legitimately use these primitive values. Legacy JSON
+        // rejection happens after binding/adapter selection, possibly after defer.
+        assert!(
+            responder
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("reject:") || event.contains("refused"))
+        );
     }
     let (bootstrap, operations, responder) = operations_setup(json!({}), false);
     let mut command = published_interaction("404", json!([]));
@@ -744,6 +780,30 @@ async fn malformed_published_commands_never_reach_operations() {
         .unwrap();
     assert!(operations.requests.lock().unwrap().is_empty());
     assert!(responder.events.lock().unwrap()[0].starts_with("reject:"));
+}
+#[test]
+fn published_typed_options_preserve_primitives_and_reject_duplicates() {
+    let command = published_interaction(
+        "404",
+        json!([
+            {"name":"name","type":3,"value":"Pebble"},
+            {"name":"offset","type":4,"value":2},
+            {"name":"brief","type":5,"value":true}
+        ]),
+    );
+    let (_, member, request) = super::published_interaction::parse(&command).unwrap();
+    assert_eq!(request.options["name"], "Pebble");
+    assert_eq!(request.options["offset"], 2);
+    assert_eq!(request.options["brief"], true);
+    assert_eq!(member.user.to_string(), command.user.id.to_string());
+    let duplicate = published_interaction(
+        "404",
+        json!([
+            {"name":"name","type":3,"value":"Pebble"},
+            {"name":"name","type":3,"value":"Astro"}
+        ]),
+    );
+    assert!(super::published_interaction::parse(&duplicate).is_err());
 }
 #[tokio::test]
 async fn unrelated_published_commands_without_operations_are_not_claimed() {

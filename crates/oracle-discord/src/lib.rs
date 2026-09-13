@@ -48,6 +48,20 @@ async fn api<T>(future: impl Future<Output = serenity::Result<T>>) -> Result<T> 
 /// A narrow response seam. The concrete implementation always uses ephemeral replies.
 #[async_trait]
 pub trait InteractionResponder: Send + Sync {
+    async fn complete_published(
+        &self,
+        reply: &oracle_operations::ingress::PublishedReply,
+        _member: &oracle_core::member_read::MemberContext,
+        _cancel: CancellationToken,
+    ) -> Result<()> {
+        if let Some(fence) = &reply.fence {
+            fence.dispatch(&mut || Ok(()))?;
+        }
+        match &reply.text {
+            Some(text) => self.complete(text).await,
+            None => self.complete_result(&reply.value).await,
+        }
+    }
     async fn defer_ephemeral(&self) -> Result<()>;
     async fn complete(&self, message: &str) -> Result<()>;
     async fn reject_ephemeral(&self, message: &str) -> Result<()>;
@@ -58,11 +72,46 @@ pub trait InteractionResponder: Send + Sync {
     }
 }
 struct DiscordResponder<'a> {
+    reader: Option<&'a operations::DiscordOperations>,
     interaction: &'a discord::CommandInteraction,
     http: &'a discord::Http,
 }
 #[async_trait]
 impl InteractionResponder for DiscordResponder<'_> {
+    async fn complete_published(
+        &self,
+        reply: &oracle_operations::ingress::PublishedReply,
+        member: &oracle_core::member_read::MemberContext,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        if let Some(policy) = &reply.policy {
+            let reader = self
+                .reader
+                .ok_or(Error::Core(ErrorCode::ModuleUnavailable))?;
+            let text = reply.text.as_deref().ok_or(Error::InvalidInteraction)?;
+            let fence = reply.fence.clone().ok_or(Error::InvalidInteraction)?;
+            reader
+                .send_member_reply(
+                    self.interaction.application_id.get(),
+                    self.interaction.token.as_str(),
+                    text,
+                    member,
+                    policy,
+                    fence,
+                    cancel,
+                )
+                .await?;
+            Ok(())
+        } else {
+            if let Some(fence) = &reply.fence {
+                fence.dispatch(&mut || Ok(()))?;
+            }
+            match &reply.text {
+                Some(text) => self.complete(text).await,
+                None => self.complete_result(&reply.value).await,
+            }
+        }
+    }
     async fn defer_ephemeral(&self) -> Result<()> {
         api(self.interaction.defer_ephemeral(self.http)).await
     }
@@ -173,6 +222,7 @@ struct GatewayRuntime {
     unknown_origins: AtomicU64,
 }
 pub struct DiscordBootstrap {
+    published_reader: Option<Arc<operations::DiscordOperations>>,
     core: Arc<CoreService>,
     ready: watch::Sender<bool>,
     failures: AtomicU64,
@@ -183,6 +233,7 @@ impl DiscordBootstrap {
     pub fn new(core: Arc<CoreService>) -> Self {
         let (ready, _) = watch::channel(false);
         Self {
+            published_reader: None,
             core,
             ready,
             failures: AtomicU64::new(0),
@@ -197,6 +248,10 @@ impl DiscordBootstrap {
         let mut bootstrap = Self::new(core);
         bootstrap.operations = Some(operations);
         bootstrap
+    }
+    pub fn with_published_transport(mut self, reader: Arc<operations::DiscordOperations>) -> Self {
+        self.published_reader = Some(reader);
+        self
     }
     pub fn with_runtime(
         core: Arc<CoreService>,
@@ -218,6 +273,9 @@ impl DiscordBootstrap {
         Ok(bootstrap)
     }
     fn set_gateway_coverage(&self, connected: bool) {
+        if !connected {
+            self.core.member_read_gate().invalidate_all();
+        }
         if let Some(runtime) = &self.runtime {
             let intents = if connected {
                 runtime.intents.clone()
@@ -271,7 +329,7 @@ impl DiscordBootstrap {
                 return Ok(false);
             }
             return self
-                .handle_operation(interaction, responder, Duration::from_secs(30))
+                .handle_published(interaction, responder, Duration::from_secs(30))
                 .await;
         }
         if interaction_ops::is_operation(interaction) {
@@ -473,6 +531,7 @@ impl discord::EventHandler for DiscordBootstrap {
         } = event
         {
             let responder = DiscordResponder {
+                reader: self.published_reader.as_deref(),
                 interaction,
                 http: &context.http,
             };
@@ -491,6 +550,7 @@ impl discord::EventHandler for DiscordBootstrap {
                 .unwrap_or(u64::MAX);
             match gateway_events::normalize(event, runtime.bot.load(Ordering::SeqCst), now) {
                 gateway_events::Normalized::Audit(guild, events) => {
+                    self.core.member_read_gate().invalidate_guild(&guild);
                     if events
                         .first()
                         .is_some_and(|event| event.origin == oracle_core::GuildEventOrigin::Unknown)
@@ -504,6 +564,7 @@ impl discord::EventHandler for DiscordBootstrap {
                     }
                 }
                 gateway_events::Normalized::Event(guild, event) => {
+                    self.core.member_read_gate().invalidate_guild(&guild);
                     if event.origin == oracle_core::GuildEventOrigin::Unknown {
                         runtime.unknown_origins.fetch_add(1, Ordering::Relaxed);
                     }
@@ -512,6 +573,7 @@ impl discord::EventHandler for DiscordBootstrap {
                     }
                 }
                 gateway_events::Normalized::MemberRolesGap(guild) => {
+                    self.core.member_read_gate().invalidate_guild(&guild);
                     if self
                         .core
                         .status(&PolicyContext::LocalOperator, Some(&guild))
@@ -531,8 +593,10 @@ impl discord::EventHandler for DiscordBootstrap {
 mod tests;
 
 mod interaction_ops;
+mod member_transport;
 pub mod notification;
 pub mod operations;
+mod published_interaction;
 pub mod transport;
 
 mod gateway_events;

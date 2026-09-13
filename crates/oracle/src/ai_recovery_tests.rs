@@ -42,6 +42,9 @@ async fn host_startup_pauses_interrupted_discord_runs_and_settles_cancelled_spen
         manage_guild: true,
     };
     let config = crate::config::Config {
+        source_path: None,
+        module_runtime: Default::default(),
+        member_reads: vec![],
         version: 1,
         state_dir: root.path().join("state"),
         database: if std::env::var_os("ORACLE_TEST_AI_POSTGRES_URL").is_some() {

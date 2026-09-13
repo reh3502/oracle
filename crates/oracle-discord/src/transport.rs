@@ -40,6 +40,32 @@ fn error(code: ErrorCode) -> Error {
     Error::new(code)
 }
 
+fn valid_write_path(method: &Method, path: &str) -> bool {
+    if path.len() > 512 {
+        return false;
+    }
+    if path.starts_with("/api/v10/webhooks/") {
+        let parts: Vec<_> = path.split('/').collect();
+        return method == Method::PATCH
+            && parts.len() == 8
+            && parts[6] == "messages"
+            && parts[7] == "@original"
+            && parts[4]
+                .parse::<u64>()
+                .ok()
+                .and_then(|id| crate::member_transport::reply_path(id, parts[5]).ok())
+                .as_deref()
+                == Some(path);
+    }
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) && path.starts_with("/api/v10/")
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b))
+}
+
 #[async_trait]
 pub trait FreshCheck: Send + Sync {
     /// Re-fetch current authority and preconditions after rate waits, before connecting.
@@ -97,15 +123,7 @@ impl DiscordWriteClient {
         guard: &SendGuard,
         fresh: &dyn FreshCheck,
     ) -> Result<WriteResponse> {
-        if !matches!(
-            method,
-            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-        ) || !path.starts_with("/api/v10/")
-            || path.len() > 512
-            || !path
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"/_-".contains(&b))
-        {
+        if !valid_write_path(&method, path) {
             return Err(error(ErrorCode::InvalidInput));
         }
         let payload = serde_json::to_vec(body).map_err(|_| error(ErrorCode::InvalidInput))?;
@@ -475,6 +493,108 @@ mod tests {
     }
     async fn reply(stream: &mut TcpStream, status: u16, body: &str) {
         stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    }
+    #[test]
+    fn interaction_reply_endpoint_is_exact_and_patch_only() {
+        let path = "/api/v10/webhooks/123/abc.DEF_-123/messages/@original";
+        assert!(valid_write_path(&Method::PATCH, path));
+        assert!(!valid_write_path(&Method::POST, path));
+        for path in [
+            "/api/v10/webhooks/123/token/messages/456",
+            "/api/v10/webhooks/123/token/messages/@original?wait=true",
+            "/api/v10/webhooks/123/../messages/@original",
+            "/api/v10/webhooks/0123/token/messages/@original",
+            "/api/v10/channels/123/messages/@original",
+        ] {
+            assert!(!valid_write_path(&Method::PATCH, path));
+        }
+    }
+    struct ReplyRegistry(std::sync::atomic::AtomicBool);
+    impl oracle_operations::executor::DispatchFence for ReplyRegistry {
+        fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(error(ErrorCode::Cancelled));
+            }
+            send()
+        }
+    }
+    struct CountFresh(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl FreshCheck for CountFresh {
+        async fn check(&self) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn interaction_reply_retry_refreshes_and_preserves_safe_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = String::from_utf8(read_request(&mut stream).await).unwrap();
+                assert!(request.starts_with(
+                    "PATCH /api/v10/webhooks/123/abc.def/messages/@original HTTP/1.1"
+                ));
+                let body: Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(
+                    body,
+                    json!({"content":"reply","allowed_mentions":{"parse":[]},"flags":68})
+                );
+                if attempt == 0 {
+                    reply(&mut stream, 429, r#"{"retry_after":0.01}"#).await;
+                } else {
+                    reply(&mut stream, 200, "{}").await;
+                }
+            }
+        });
+        let fresh = CountFresh(std::sync::atomic::AtomicUsize::new(0));
+        let result = client
+            .execute(
+                Method::PATCH,
+                "/api/v10/webhooks/123/abc.def/messages/@original",
+                &json!({"content":"reply","allowed_mentions":{"parse":[]},"flags":68}),
+                &guard(),
+                &fresh,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(fresh.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn interaction_reply_retry_checks_registry_revocation_before_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let registry = Arc::new(ReplyRegistry(std::sync::atomic::AtomicBool::new(false)));
+        let guard = SendGuard::with_fence(CancellationToken::new(), now() + 10, registry.clone());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(!read_request(&mut stream).await.is_empty());
+            reply(&mut stream, 429, r#"{"retry_after":0.05}"#).await;
+            registry.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let result = client
+            .execute(
+                Method::PATCH,
+                "/api/v10/webhooks/123/abc.def/messages/@original",
+                &json!({"content":"reply"}),
+                &guard,
+                &Fresh(true),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(result.code, ErrorCode::Cancelled);
+        server.await.unwrap();
     }
     struct SlowFresh;
     #[async_trait]

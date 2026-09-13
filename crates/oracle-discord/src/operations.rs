@@ -319,7 +319,7 @@ fn require_private_roles(snapshot: &Snapshot, channel: &Channel) -> Result<()> {
     }
     Ok(())
 }
-fn member(value: &discord::Member) -> Member {
+pub(crate) fn member(value: &discord::Member) -> Member {
     Member {
         id: value.user.id.to_string(),
         roles: value.roles.iter().map(ToString::to_string).collect(),

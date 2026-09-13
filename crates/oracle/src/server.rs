@@ -35,11 +35,13 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
     let host = Arc::new(Host::open(&config, tools).await?);
+    let mut published_adapter = None;
     if let Some(token) = &token {
         let adapter = Arc::new(oracle_discord::operations::DiscordOperations::new(
             token.clone(),
             host.core.clone(),
         )?);
+        published_adapter = Some(adapter.clone());
         host.operations
             .set(Arc::new(
                 oracle_operations::executor::StructureExecutor::new(
@@ -85,7 +87,7 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
         let result = run(
             &host,
             &config,
-            token,
+            token.zip(published_adapter),
             &mut term,
             &mut interrupt,
             &listener,
@@ -109,7 +111,10 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
 async fn run(
     host: &Arc<Host>,
     config: &Config,
-    token: Option<oracle_discord::Token>,
+    discord: Option<(
+        oracle_discord::Token,
+        Arc<oracle_discord::operations::DiscordOperations>,
+    )>,
     term: &mut tokio::signal::unix::Signal,
     interrupt: &mut tokio::signal::unix::Signal,
     listener: &UnixListener,
@@ -154,20 +159,23 @@ async fn run(
             }
         })
         .map_err(|_| Error::new(ErrorCode::Cancelled))?;
-    let gateway = if let Some(token) = token {
-        let gateway = Arc::new(oracle_discord::DiscordBootstrap::with_runtime(
-            host.core.clone(),
-            host.clone(),
-            host.modules.clone(),
-            config
-                .discord
-                .as_ref()
-                .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?
-                .intents
-                .iter()
-                .cloned()
-                .collect(),
-        )?);
+    let gateway = if let Some((token, published_adapter)) = discord {
+        let gateway = Arc::new(
+            oracle_discord::DiscordBootstrap::with_runtime(
+                host.core.clone(),
+                host.clone(),
+                host.modules.clone(),
+                config
+                    .discord
+                    .as_ref()
+                    .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?
+                    .intents
+                    .iter()
+                    .cloned()
+                    .collect(),
+            )?
+            .with_published_transport(published_adapter),
+        );
         let running = gateway.clone();
         let cancel = stop.clone();
         tasks

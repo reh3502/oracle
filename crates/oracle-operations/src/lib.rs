@@ -3,6 +3,7 @@
 pub mod commands;
 pub mod executor;
 pub mod permissions;
+pub mod published;
 pub mod structure;
 
 pub mod ingress;

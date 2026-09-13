@@ -2,6 +2,7 @@ use oracle_core::{Error, ErrorCode, GuildPolicy, Result};
 use oracle_storage::DatabaseConfig;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -10,6 +11,8 @@ use std::{
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
     pub version: u32,
     pub state_dir: PathBuf,
     pub database: Database,
@@ -17,6 +20,18 @@ pub struct Config {
     pub discord: Option<Discord>,
     #[serde(default)]
     pub ai: Option<crate::ai::AiConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub module_runtime:
+        BTreeMap<oracle_core::ModuleId, oracle_modules::runtime_settings::ModuleRuntimeSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_reads: Vec<MemberReads>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberReads {
+    pub guild: oracle_core::GuildId,
+    pub module: oracle_core::ModuleId,
+    pub policy: oracle_core::member_read::MemberReadPolicy,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
@@ -39,6 +54,8 @@ impl Config {
         let bytes = std::fs::read(path).map_err(|e| Error::with_source(ErrorCode::Io, e))?;
         let mut config: Self = serde_json::from_slice(&bytes)
             .map_err(|e| Error::with_source(ErrorCode::InvalidInput, e))?;
+        config.source_path =
+            Some(std::fs::canonicalize(path).map_err(|e| Error::with_source(ErrorCode::Io, e))?);
         if config.version != 1 || config.guilds.len() > 100 {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
@@ -49,6 +66,15 @@ impl Config {
             }
         }
         let parent = path.parent().unwrap_or(Path::new("."));
+        let mut member_scopes = std::collections::BTreeSet::new();
+        if config.member_reads.len() > 1024 || config.module_runtime.len() > 128 {
+            return Err(Error::new(ErrorCode::InvalidInput));
+        }
+        for reads in &config.member_reads {
+            if !ids.contains(&reads.guild) || !member_scopes.insert((&reads.guild, &reads.module)) {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+        }
         if config.state_dir.is_relative() {
             config.state_dir = parent.join(&config.state_dir);
         }
@@ -121,6 +147,9 @@ pub fn secret_env(name: &str) -> Result<String> {
 }
 pub fn initialize(path: &Path, postgres_env: Option<String>) -> Result<()> {
     let config = Config {
+        source_path: None,
+        module_runtime: BTreeMap::new(),
+        member_reads: vec![],
         version: 1,
         state_dir: PathBuf::from("state"),
         database: match postgres_env {
@@ -149,3 +178,7 @@ pub fn initialize(path: &Path, postgres_env: Option<String>) -> Result<()> {
     .and_then(|_| file.sync_all())
     .map_err(|e| Error::with_source(ErrorCode::Io, e))
 }
+
+#[cfg(test)]
+#[path = "member_config_tests.rs"]
+mod member_config_tests;
