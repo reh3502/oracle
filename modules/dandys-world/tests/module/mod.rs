@@ -48,7 +48,7 @@ fn lookup(offset: usize) -> QueryRequest {
     QueryRequest::Lookup {
         name: "Fixture Rock".into(),
         kind: Some(dandys_world_core::model::Kind::Toon),
-        field: None,
+        field: Some("all details".into()),
         offset,
     }
 }
@@ -1099,4 +1099,76 @@ fn citation_field_reserves_one_of_the_twenty_host_field_slots() {
             .any(|b| b.label == "Next" && b.options["offset"] == 19)
     );
     assert_bounded(&reply);
+}
+
+#[test]
+fn overview_is_short_and_keeps_unverified_details_accessible() {
+    let mut data = catalog();
+    let template = data.entities[0].facts[0].clone();
+    for (key, state, text) in [
+        (
+            "ability",
+            dandys_world_core::model::EvidenceState::Unverified,
+            "unknown",
+        ),
+        (
+            "ability_1",
+            dandys_world_core::model::EvidenceState::Supported,
+            "Speak!\nBark to attract nearby Twisteds.",
+        ),
+        (
+            "ability_2",
+            dandys_world_core::model::EvidenceState::Supported,
+            "Fetch!\nHighlight nearby items.",
+        ),
+        (
+            "designation",
+            dandys_world_core::model::EvidenceState::Supported,
+            "M-001",
+        ),
+        (
+            "long_detail",
+            dandys_world_core::model::EvidenceState::Supported,
+            "Long details",
+        ),
+    ] {
+        let mut fact = template.clone();
+        fact.id = key.into();
+        fact.key = key.into();
+        fact.text = text.into();
+        fact.state = state;
+        fact.value = json!(null);
+        fact.conditions.clear();
+        data.entities[0].facts.push(fact);
+    }
+    let req = QueryRequest::Lookup {
+        name: "Fixture Rock".into(),
+        kind: None,
+        field: None,
+        offset: 0,
+    };
+    let reply = presentation::render(&req, &response(data.clone(), req.clone(), NOW));
+    assert_eq!(reply.card.fields.len(), 3);
+    assert_eq!(reply.card.fields[0].name, "Health");
+    assert!(
+        reply
+            .card
+            .fields
+            .iter()
+            .all(|f| f.value.encode_utf16().count() <= 350)
+    );
+    assert!(!reply.text.contains("next_offset"));
+    assert!(!reply.text.contains("can’t confirm"));
+    assert!(!reply.text.contains("M-001"));
+    let more = reply
+        .buttons
+        .iter()
+        .find(|b| b.label == "More details")
+        .unwrap();
+    let req = request(&more.route, more.options.clone()).unwrap();
+    let full = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(full.text.contains("can’t confirm"));
+    assert!(full.text.contains("M-001"));
+    assert_bounded(&reply);
+    assert_bounded(&full);
 }

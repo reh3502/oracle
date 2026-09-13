@@ -170,7 +170,7 @@ impl Cards {
                         option
                     })
                     .collect();
-                rows.push(json!({"type":1,"components":[{"type":3,"custom_id":format!("oc:{id}:select"),"placeholder":"Choose an option…","min_values":1,"max_values":1,"options":options}]}));
+                rows.push(json!({"type":1,"components":[{"type":3,"custom_id":format!("oc:{id}:select"),"placeholder": if card.choices.iter().all(|c| c.options.contains_key("field")) { "Choose a detail…" } else { "Choose a match…" },"min_values":1,"max_values":1,"options":options}]}));
             }
             for (chunk, buttons) in card.buttons.chunks(5).enumerate() {
                 let buttons:Vec<_> = buttons.iter().enumerate().map(|(i,b)|json!({"type":2,"style":2,"label":b.label,"custom_id":format!("oc:{id}:b{}",chunk*5+i)})).collect();

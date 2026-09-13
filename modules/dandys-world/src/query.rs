@@ -274,6 +274,9 @@ impl QueryEngine {
         Err(Box::new(r))
     }
     fn field_matches(f: &Fact, field: &str) -> bool {
+        if field == "all details" {
+            return true;
+        }
         let k = normalize(&f.key);
         let p = normalize(field);
         if k == p {
@@ -436,7 +439,31 @@ impl QueryEngine {
             .iter()
             .filter(|f| field.is_none_or(|x| Self::field_matches(f, x)))
             .collect();
-        facts.sort_by(|a, b| a.key.cmp(&b.key).then(a.id.cmp(&b.id)));
+        // Overview pages lead with useful gameplay facts; direct field requests
+        // keep their existing ordering and complete evidence.
+        let priority = |f: &Fact| {
+            if field.is_some() {
+                return 0;
+            }
+            if f.state != EvidenceState::Supported {
+                return 20;
+            }
+            match f.key.as_str() {
+                "health" => 0,
+                "ability_1" | "ability_2" | "effect_or_ability" => 1,
+                "description" | "effect" | "overview" => 2,
+                "requirements" | "unlock_requirements" => 3,
+                "speed" | "movement_speed" | "stamina" => 4,
+                "gender" | "designation" => 15,
+                _ => 10,
+            }
+        };
+        facts.sort_by(|a, b| {
+            priority(a)
+                .cmp(&priority(b))
+                .then(a.key.cmp(&b.key))
+                .then(a.id.cmp(&b.id))
+        });
         if facts.is_empty() {
             return self.response(
                 "not_found",

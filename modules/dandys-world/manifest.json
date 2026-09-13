@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "community.dandys-world",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "target": "x86_64-unknown-linux-gnu",
   "protocol_major": 1,
   "protocol_minor_min": 1,

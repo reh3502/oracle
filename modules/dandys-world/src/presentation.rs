@@ -166,6 +166,16 @@ fn base(title: &str, description: &str) -> Reply {
     }
 }
 fn finish(mut r: Reply) -> Reply {
+    r.citations
+        .sort_by_key(|s| s.label.starts_with("Template:"));
+    for (index, source) in r
+        .citations
+        .iter_mut()
+        .filter(|s| s.label.starts_with("Template:"))
+        .enumerate()
+    {
+        source.label = format!("Reference {}", index + 1);
+    }
     r.buttons.truncate(4);
     r.buttons.push(ask());
     r.text = format!(
@@ -236,6 +246,8 @@ fn refs(r: &mut Reply, sources: &[Source]) {
 fn plain_warning(s: &str) -> String {
     if s.starts_with("Cached source ") || s.contains("milliseconds since Unix epoch") {
         "This uses saved wiki information that has not been checked in over a day.".into()
+    } else if s.starts_with("More fields are available") {
+        String::new()
     } else if s.starts_with("More matches exist") {
         "More matches are available. Use Search by name to be more specific.".into()
     } else if s.starts_with("Entity availability is Historical") {
@@ -336,6 +348,27 @@ fn block_text(b: &AnswerBlock) -> String {
     }
     s
 }
+fn readable_block(b: &AnswerBlock) -> (String, String) {
+    let mut name = friendly_field(&b.key);
+    let mut text = block_text(b);
+    if b.key.starts_with("ability_") && b.state == EvidenceState::Supported {
+        if let Some((first, rest)) = text.split_once('\n')
+            && first.len() <= 60
+            && (rest.starts_with("(Active)") || rest.starts_with("(Passive)"))
+        {
+            name = first.to_owned();
+            text = rest.trim().to_owned();
+        }
+        text = text.replace("drastically decreasing Stealth to a value of", "setting Stealth to")
+            .replace("alerting any Twisteds nearby to his location", "letting nearby Twisteds know where he is")
+            .replace("This Toon can sniff out items, causing them to be highlighted when in the Toon's vicinity.", "Highlights items near this Toon.")
+            .replace("Has a cooldown of", "Cooldown:");
+    }
+    while text.contains("\n\n") {
+        text = text.replace("\n\n", "\n");
+    }
+    (name, text)
+}
 fn field_parts(name: String, value: String, inline: bool) -> Vec<Field> {
     // Every chunk of a fact is accepted or rejected together by the card budget.
     let name = display_text(&name);
@@ -406,6 +439,22 @@ fn pages(
             let mut o = opts;
             o["offset"] = json!(next);
             r.buttons.push(action("Next", &route, o));
+        }
+    }
+}
+fn friendly_field(key: &str) -> String {
+    match key {
+        "ability_1" => "First ability".into(),
+        "ability_2" => "Second ability".into(),
+        "effect_or_ability" => "What it does".into(),
+        "unlock_requirements" | "requirements" => "How to unlock".into(),
+        _ => {
+            let text = key.replace('_', " ");
+            let mut chars = text.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
         }
     }
 }
@@ -567,7 +616,22 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
             .map(|c| c.name.clone())
             .unwrap_or_else(|| "Here’s what the wiki says".into())
     };
+    let overview = matches!(req, QueryRequest::Lookup { field: None, .. });
     let mut r = base(&title, &warnings(&response.warnings));
+    if overview {
+        r.card.description = "Pick a detail below to learn more.".into();
+        let mut notes = response.warnings.clone();
+        notes.extend(
+            response
+                .answer_blocks
+                .iter()
+                .flat_map(|b| b.warnings.clone()),
+        );
+        let note = warnings(&notes);
+        if !note.is_empty() {
+            r.card.description.push_str(&format!("\n{note}"));
+        }
+    }
     let group_size = if matches!(req, QueryRequest::Compare { .. }) {
         2
     } else {
@@ -575,6 +639,20 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
     };
     let mut consumed = 0;
     for group in response.answer_blocks.chunks(group_size) {
+        if overview && r.card.fields.len() >= 3 {
+            break;
+        }
+        if overview
+            && group.iter().any(|b| {
+                b.state != EvidenceState::Supported
+                    || b.text == "The requested fact is not verified for a current answer."
+                    || rendered_len(&block_text(b), true) > 350
+                    || matches!(b.key.as_str(), "designation" | "gender")
+            })
+        {
+            consumed += group.len();
+            continue;
+        }
         let mut candidate = r.clone();
         let ids: BTreeSet<_> = group.iter().flat_map(|b| b.source_ids.iter()).collect();
         let sources: Vec<_> = response
@@ -584,7 +662,7 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
             .cloned()
             .collect();
         for b in group {
-            let label = b.key.replace('_', " ");
+            let (label, text) = readable_block(b);
             let name = if group_size == 2 {
                 format!(
                     "{} · {label}",
@@ -601,7 +679,7 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
             candidate
                 .card
                 .fields
-                .extend(field_parts(name, block_text(b), group_size == 2));
+                .extend(field_parts(name, text, group_size == 2));
         }
         refs(&mut candidate, &sources);
         if ids.len() != sources.len() || !fits(&candidate) {
@@ -633,6 +711,25 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
         response.answer_blocks.len(),
     );
     detail_navigation(&mut r, response);
+    if overview {
+        r.buttons
+            .retain(|b| b.label != "Overview" && b.label != "Next");
+        if let Some(c) = response.candidates.first() {
+            r.buttons.insert(
+                0,
+                action(
+                    "More details",
+                    "lookup",
+                    json!({"name": c.id, "field": "all details"}),
+                ),
+            );
+        }
+        if r.card.fields.is_empty() {
+            r.card.description =
+                "Choose a detail below to read about this. Some details may still need checking."
+                    .into();
+        }
+    }
     let mut keys = BTreeSet::new();
     for block in &response.answer_blocks {
         if !keys.insert(block.key.clone()) || r.choices.len() == 25 {
@@ -646,7 +743,7 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
         opts["field"] = json!(block.key);
         opts.as_object_mut().unwrap().remove("offset");
         r.choices.push(Choice {
-            label: short(&block.key.replace('_', " "), 80),
+            label: short(&readable_block(block).0, 80),
             description: "Read this detail".into(),
             route,
             options: opts,
