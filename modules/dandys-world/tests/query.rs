@@ -417,6 +417,9 @@ fn effect_questions_select_only_effect_and_abilities() {
     let mut d = data();
     d.entities[2].facts.push(fact("effect", "effect", "a"));
     d.entities[2].facts.push(fact("ability", "ability_1", "a"));
+    d.entities[2]
+        .facts
+        .push(fact("strategy", "survivability", "a"));
     let e = engine(d);
     let r = e
         .execute(

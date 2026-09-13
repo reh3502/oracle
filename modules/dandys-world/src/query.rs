@@ -273,6 +273,9 @@ impl QueryEngine {
         if k == p {
             return true;
         }
+        let is_ability = f.key.split(|c: char| !c.is_alphanumeric()).any(|word| {
+            word.eq_ignore_ascii_case("ability") || word.eq_ignore_ascii_case("abilities")
+        });
         match p.as_str() {
             "stats" | "statistics" => [
                 "stat",
@@ -289,8 +292,8 @@ impl QueryEngine {
             .iter()
             .any(|p| k.starts_with(p)),
             "speed" => k == "movementspeed",
-            "ability" | "abilities" => k.contains("abilit"),
-            "effectorability" => k == "effect" || k.contains("abilit"),
+            "ability" | "abilities" => is_ability,
+            "effectorability" => k == "effect" || is_ability,
             "unlock" | "requirements" => {
                 k.contains("unlock") || k.contains("requirement") || k.contains("obtainment")
             }
