@@ -3,7 +3,7 @@ mod presentation;
 use async_trait::async_trait;
 use dandys_world_core::{
     query::{QueryEngine, QueryRequest},
-    snapshot::Store,
+    snapshot::{Snapshot, Store},
 };
 use oracle_contracts::ModuleManifest;
 use oracle_module_sdk::{
@@ -12,20 +12,46 @@ use oracle_module_sdk::{
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct LoadedCatalog {
+    id: String,
     engine: QueryEngine,
     entity_count: usize,
     source_count: usize,
     oldest_validation_ms: u64,
     latest_validation_ms: u64,
 }
+impl LoadedCatalog {
+    fn new(snapshot: Snapshot) -> Self {
+        Self {
+            id: snapshot.id.clone(),
+            entity_count: snapshot.data.entities.len(),
+            source_count: snapshot.data.sources.len(),
+            oldest_validation_ms: snapshot
+                .data
+                .sources
+                .iter()
+                .map(|s| s.validated_at_ms)
+                .min()
+                .expect("validated sources"),
+            latest_validation_ms: snapshot
+                .data
+                .sources
+                .iter()
+                .map(|s| s.validated_at_ms)
+                .max()
+                .expect("validated sources"),
+            engine: QueryEngine::new(snapshot.id, snapshot.data),
+        }
+    }
+}
 #[derive(Default)]
 struct DwModule {
     // Metadata and query index are published and retained together.
-    engine: RwLock<Option<Arc<LoadedCatalog>>>,
+    engine: Arc<RwLock<Option<Arc<LoadedCatalog>>>>,
+    recovery: Arc<RwLock<&'static str>>,
 }
 fn request(operation: &str, input: Value) -> Result<QueryRequest> {
     if ![
@@ -69,8 +95,10 @@ impl DwModule {
         if matches!(request, QueryRequest::Status {}) {
             let checks = if operation == "health" {
                 format!(
-                    "Source validation timestamps (Unix milliseconds): oldest {}; latest {}.",
-                    engine.oldest_validation_ms, engine.latest_validation_ms
+                    "Source validation timestamps (Unix milliseconds): oldest {}; latest {}. Snapshot monitor: {}.",
+                    engine.oldest_validation_ms,
+                    engine.latest_validation_ms,
+                    *self.recovery.read().unwrap()
                 )
             } else if engine.latest_validation_ms > now {
                 "Some source checks are dated in the future; check the host clock.".into()
@@ -97,7 +125,7 @@ impl Module for DwModule {
     async fn initialize_with_runtime(
         &self,
         mode: Mode,
-        _global: TaskScope,
+        global: TaskScope,
         runtime: RuntimeConfiguration,
     ) -> Result<()> {
         if mode != Mode::Normal {
@@ -106,28 +134,57 @@ impl Module for DwModule {
             ));
         }
         let directory = runtime.data_directory.filter(|p| p.is_absolute()).ok_or_else(|| RpcError::Remote("Configure an absolute Dandy's World runtime data_directory containing a published snapshot".into()))?;
-        let snapshot = Store::new(directory).and_then(|s| s.load()).map_err(|_| RpcError::Remote("Cannot load Dandy's World snapshot; publish a validated catalog into its configured data directory".into()))?;
-        let engine = Arc::new(LoadedCatalog {
-            entity_count: snapshot.data.entities.len(),
-            source_count: snapshot.data.sources.len(),
-            // Store validation requires at least one source with a positive timestamp.
-            oldest_validation_ms: snapshot
-                .data
-                .sources
-                .iter()
-                .map(|s| s.validated_at_ms)
-                .min()
-                .expect("validated sources"),
-            latest_validation_ms: snapshot
-                .data
-                .sources
-                .iter()
-                .map(|s| s.validated_at_ms)
-                .max()
-                .expect("validated sources"),
-            engine: QueryEngine::new(snapshot.id, snapshot.data),
-        });
-        *self.engine.write().unwrap() = Some(engine);
+        let outcome = Store::new(&directory).and_then(|s| s.load_recovering()).map_err(|_| RpcError::Remote("Cannot load Dandy's World snapshot; publish a validated catalog into its configured data directory".into()))?;
+        *self.engine.write().unwrap() = Some(Arc::new(LoadedCatalog::new(outcome.snapshot)));
+        *self.recovery.write().unwrap() = if outcome.recovered {
+            "Recovered previous snapshot"
+        } else {
+            "Ready"
+        };
+        let engine = self.engine.clone();
+        let recovery = self.recovery.clone();
+        let cancel = global.cancellation();
+        global
+            .spawn("dw-snapshot-monitor", async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                    let current = engine
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .map(|e| e.id.clone())
+                        .unwrap_or_default();
+                    let root = directory.clone();
+                    // Always join blocking work, even during cancellation. No parsing
+                    // or index construction runs on the query executor.
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        Store::new(root)?
+                            .load_if_changed(&current)
+                            .map(|s| s.map(LoadedCatalog::new))
+                    })
+                    .await;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    match loaded {
+                        Ok(Ok(Some(next))) => {
+                            *engine.write().unwrap() = Some(Arc::new(next));
+                            *recovery.write().unwrap() = "Ready";
+                        }
+                        Ok(Ok(None)) => {}
+                        _ => {
+                            *recovery.write().unwrap() =
+                                "Snapshot reload failed; retaining loaded snapshot";
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|_| RpcError::Remote("Cannot start Dandy's World snapshot monitor".into()))?;
         Ok(())
     }
     async fn invoke(&self, _context: CallContext, operation: &str, input: Value) -> Result<Value> {

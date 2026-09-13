@@ -191,22 +191,57 @@ async fn sdk_lifecycle_requires_snapshot_and_fences_queries_without_callbacks() 
     h.close().await;
     assert!(module.query("status", json!({}), NOW).is_err());
 }
+async fn wait_for_snapshot(module: &DwModule, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if module
+                .engine
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|e| e.id == expected)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("snapshot monitor adopted publication");
+}
 #[tokio::test]
-async fn loaded_catalog_remains_immutable_until_next_initialization() {
+async fn snapshot_monitor_adopts_publication_and_rollback_with_pinned_readers() {
     let dir = Temp::new();
     let store = Store::new(&dir.0).unwrap();
     let mut data = catalog();
-    store
+    let first = store
         .publish_bytes(&serde_json::to_vec(&data).unwrap())
         .unwrap();
     let module = Arc::new(DwModule::default());
     let h = Harness::new(module.clone());
     h.hello().await;
     h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    let pinned = module.engine.read().unwrap().clone().unwrap();
     data.entities[0].facts[0].value = json!(9);
-    store
+    let second = store
         .publish_bytes(&serde_json::to_vec(&data).unwrap())
         .unwrap();
+    wait_for_snapshot(&module, &second.id).await;
+    assert!(
+        module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Value: 9")
+    );
+    let old_reply = pinned.engine.execute(lookup(0), NOW).unwrap();
+    assert_eq!(old_reply.snapshot_id, first.id);
+    assert!(
+        presentation::render(&lookup(0), &old_reply)
+            .text
+            .contains("Value: 2")
+    );
+    store.rollback().unwrap();
+    wait_for_snapshot(&module, &first.id).await;
     assert!(
         module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
             .as_str()
@@ -214,15 +249,55 @@ async fn loaded_catalog_remains_immutable_until_next_initialization() {
             .contains("Value: 2")
     );
     h.close().await;
+    store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        module.engine.read().unwrap().is_none(),
+        "joined monitor cannot repopulate after shutdown"
+    );
+}
+#[tokio::test]
+async fn startup_recovers_previous_and_bad_reload_preserves_loaded_snapshot() {
+    let dir = Temp::new();
+    let store = Store::new(&dir.0).unwrap();
+    let mut data = catalog();
+    let first = store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    data.entities[0].facts[0].value = json!(9);
+    let second = store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    fs::write(dir.0.join(format!("{}.json", second.id)), b"corrupt").unwrap();
     let module = Arc::new(DwModule::default());
     let h = Harness::new(module.clone());
     h.hello().await;
     h.initialize(json!({"data_directory":dir.0})).await.unwrap();
-    assert!(
-        module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
-            .as_str()
+    assert_eq!(module.engine.read().unwrap().as_ref().unwrap().id, first.id);
+    assert_eq!(
+        *module.recovery.read().unwrap(),
+        "Recovered previous snapshot"
+    );
+    fs::write(dir.0.join("active"), b"invalid pointer").unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !module.recovery.read().unwrap().contains("reload failed") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(module.engine.read().unwrap().as_ref().unwrap().id, first.id);
+    assert_eq!(
+        module
+            .engine
+            .read()
             .unwrap()
-            .contains("Value: 9")
+            .as_ref()
+            .unwrap()
+            .oldest_validation_ms,
+        NOW
     );
     h.close().await;
 }

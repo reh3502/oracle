@@ -450,6 +450,18 @@ impl Store {
         lock.lock_shared()?;
         self.catalog_bytes(&self.heads()?.current).map(|(s, _)| s)
     }
+    /// Avoid rebuilding an unchanged query index. The pointer and any new catalog
+    /// are read under one shared lock so pruning cannot race the read.
+    pub fn load_if_changed(&self, current: &str) -> Result<Option<Snapshot>> {
+        let lock = self.lock_file("readers.lock")?;
+        lock.lock_shared()?;
+        let head = self.heads()?.current;
+        if head == current {
+            return Ok(None);
+        }
+        self.catalog_bytes(&head)
+            .map(|(snapshot, _)| Some(snapshot))
+    }
     fn mirror(&self) -> Result<String> {
         let bytes = read_regular(&self.root.join("previous"), 64)?;
         let id = std::str::from_utf8(&bytes)
