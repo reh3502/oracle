@@ -333,6 +333,7 @@ pub enum ModuleCommandOptionType {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModulePresentation {
     PlainTextV1 { pointer: String },
+    CardV1 { pointer: String },
 }
 
 mod legacy;

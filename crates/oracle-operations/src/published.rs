@@ -1,4 +1,7 @@
-//! Host-owned compilation, typed input decoding, and opt-in plain text replies.
+//! Host-owned compilation, typed input decoding, and opt-in replies.
+pub use crate::published_cards::{
+    CardButton, CardChoice, CardPresentation, CardPrompt, render_card,
+};
 use oracle_core::{
     Error, ErrorCode, ModuleCommandInput, ModuleCommandOptionType, ModuleCommandRoute,
     ModulePresentation, Result,

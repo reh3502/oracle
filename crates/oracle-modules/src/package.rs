@@ -379,6 +379,34 @@ fn validate_presentation(pointer: &str, schema: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn validate_card_presentation(pointer: &str, schema: &Value) -> Result<()> {
+    // Runtime rendering applies the exact bounded host shape independently of
+    // the module's output schema. Require an explicit, closed reply descriptor.
+    let reply = &schema["properties"]["reply"];
+    let names = ["text", "card", "citations", "buttons", "choices"];
+    if pointer != "/reply"
+        || schema["type"] != "object"
+        || !schema["required"]
+            .as_array()
+            .is_some_and(|r| r.contains(&serde_json::json!("reply")))
+        || reply["type"] != "object"
+        || reply["additionalProperties"] != false
+        || !reply["properties"]
+            .as_object()
+            .is_some_and(|p| p.len() == names.len() && names.iter().all(|n| p.contains_key(*n)))
+        || !reply["required"].as_array().is_some_and(|r| {
+            r.len() == names.len() && names.iter().all(|n| r.contains(&serde_json::json!(n)))
+        })
+        || reply["properties"]["text"]["type"] != "string"
+        || reply["properties"]["card"]["type"] != "object"
+        || ["citations", "buttons", "choices"]
+            .iter()
+            .any(|n| reply["properties"][n]["type"] != "array")
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
+    Ok(())
+}
 pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     if !matches!(
         (manifest.manifest_version, manifest.protocol_minor_min),
@@ -393,11 +421,23 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         semver::VersionReq::parse(&manifest.host_api).map_err(|_| err(ErrorCode::Compatibility))?;
     if !host.matches(&semver::Version::new(
         1,
-        u64::from(manifest.manifest_version - 1),
+        if manifest.manifest_version == 2 { 2 } else { 0 },
         0,
     )) || (manifest.manifest_version == 2
         && (host.matches(&semver::Version::new(1, 0, 0))
             || host.matches(&semver::Version::new(1, 0, u64::MAX))))
+    {
+        return Err(err(ErrorCode::Compatibility));
+    }
+    let uses_cards = manifest.commands.as_ref().is_some_and(|commands| {
+        commands
+            .routes
+            .iter()
+            .any(|route| matches!(route.presentation, Some(ModulePresentation::CardV1 { .. })))
+    });
+    if uses_cards
+        && (host.matches(&semver::Version::new(1, 1, 0))
+            || host.matches(&semver::Version::new(1, 1, u64::MAX)))
     {
         return Err(err(ErrorCode::Compatibility));
     }
@@ -566,8 +606,14 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                         validate_typed_options(options, &operation.input_schema)?
                     }
                 }
-                if let Some(ModulePresentation::PlainTextV1 { pointer }) = &route.presentation {
-                    validate_presentation(pointer, &operation.output_schema)?;
+                match &route.presentation {
+                    Some(ModulePresentation::PlainTextV1 { pointer }) => {
+                        validate_presentation(pointer, &operation.output_schema)?
+                    }
+                    Some(ModulePresentation::CardV1 { pointer }) => {
+                        validate_card_presentation(pointer, &operation.output_schema)?
+                    }
+                    None => {}
                 }
             }
         }
@@ -1303,6 +1349,30 @@ mod tests {
                     {"name":"details","description":"Include details","required":false,"type":"boolean"}]},
                 "presentation":{"kind":"plain_text_v1","pointer":"/reply"}}]}
         })).unwrap()
+    }
+    #[test]
+    fn cards_require_host_api_1_2_and_declared_reply_shape() {
+        let mut manifest = member_manifest();
+        // Existing 1.1 plain text modules remain accepted on the 1.2 host.
+        validate_manifest(&manifest).unwrap();
+        manifest.commands.as_mut().unwrap().routes[0].presentation =
+            Some(ModulePresentation::CardV1 {
+                pointer: "/reply".into(),
+            });
+        let reply = &mut manifest.operations[0].output_schema["properties"]["reply"];
+        reply["required"] = json!(["text", "card", "citations", "buttons", "choices"]);
+        reply["properties"]["card"] = json!({"type":"object"});
+        reply["properties"]["buttons"] = json!({"type":"array"});
+        reply["properties"]["choices"] = json!({"type":"array"});
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.host_api = "^1.2".into();
+        validate_manifest(&manifest).unwrap();
+        manifest.host_api = "^1.1.4".into();
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.host_api = "^1.2".into();
+        manifest.operations[0].output_schema["properties"]["reply"]["additionalProperties"] =
+            json!(true);
+        assert!(validate_manifest(&manifest).is_err());
     }
     #[test]
     fn v2_requires_new_protocol_host_api_and_typed_schema_equivalence() {

@@ -4,6 +4,7 @@ pub mod commands;
 pub mod executor;
 pub mod permissions;
 pub mod published;
+mod published_cards;
 pub mod structure;
 
 pub mod ingress;
