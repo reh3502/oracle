@@ -29,6 +29,8 @@ pub(super) fn identity(
 }
 fn options(id: &str, route: &str, value: Value) -> PublishedRequest {
     PublishedRequest {
+        expected_binding: None,
+        member_only: false,
         command_id: id.into(),
         command_name: "dw".into(),
         route: route.into(),
@@ -254,12 +256,57 @@ async fn typed_members_keep_operator_policy_citations_and_lifecycle_response_fen
         )
         .await
         .unwrap();
-        let text = reply.text.as_ref().unwrap();
+        let text = &reply
+            .card
+            .as_ref()
+            .expect("member reply uses a card")
+            .embed
+            .to_string();
         assert!(text.contains("Two fixture hearts"), "{text}");
         assert!(text.contains("https://dandys-world-robloxhorror.fandom.com/index.php?oldid=2"));
         assert!(!text.contains("\"reply\""));
         assert!(reply.policy.is_some());
         dispatch(&reply).unwrap();
+        let mut followup = options(&id, "lookup", query.clone());
+        followup.member_only = true;
+        followup.expected_binding = reply.binding.clone();
+        let followed = invoke_published_options(
+            &worker,
+            &reconciler,
+            &member_actor,
+            &member,
+            &guild,
+            followup.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(followed.card.is_some());
+        // A forged or stale card identity is rejected before module execution.
+        followup.expected_binding = Some("other-module/old-session/0/0".into());
+        assert_eq!(
+            invoke_published_options(
+                &worker,
+                &reconciler,
+                &member_actor,
+                &member,
+                &guild,
+                followup.clone()
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+            ErrorCode::ModuleUnavailable
+        );
+        followup.expected_binding = None;
+        assert_eq!(
+            invoke_published_options(&worker, &reconciler, &admin_actor, &admin, &guild, followup)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::InvalidInput
+        );
         for (route, input) in [
             ("lookup", json!({})),
             ("lookup", json!({"name":2})),

@@ -140,7 +140,7 @@ impl DiscordOperations {
         fence: Arc<dyn DispatchFence>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let path = reply_path(application_id, interaction_token)?;
+        reply_path(application_id, interaction_token)?;
         if text.trim().is_empty()
             || text.encode_utf16().count() > 2000
             || text
@@ -149,8 +149,33 @@ impl DiscordOperations {
         {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
-        // The caller supplies the host response fence (registry, then policy).
-        // Re-wrapping the same permit would recursively acquire its policy lock.
+        self.send_member_payload(
+            application_id,
+            interaction_token,
+            &json!({"content":text,"allowed_mentions":{"parse":[]},"flags":68}),
+            context,
+            policy,
+            fence,
+            cancel,
+        )
+        .await
+    }
+
+    /// Host-built rich responses use the same current-identity and socket fences.
+    /// This is crate-private: module JSON never reaches it without card validation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_member_payload(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        payload: &serde_json::Value,
+        context: &MemberContext,
+        policy: &MemberReadPermit,
+        fence: Arc<dyn DispatchFence>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let path = reply_path(application_id, interaction_token)?;
+        let body = member_payload(payload)?;
         let guard = SendGuard::with_fence(cancel, now() + 30, fence);
         let fresh = ReplyFresh {
             operations: self,
@@ -159,17 +184,52 @@ impl DiscordOperations {
         };
         success(
             self.writer
-                .execute(
-                    Method::PATCH,
-                    &path,
-                    &json!({"content":text,"allowed_mentions":{"parse":[]},"flags":68}),
-                    &guard,
-                    &fresh,
-                )
+                .execute(Method::PATCH, &path, &body, &guard, &fresh)
                 .await?,
         )?;
         Ok(())
     }
+}
+fn member_payload(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "content" | "embeds" | "components" | "attachments" | "allowed_mentions" | "flags"
+        )
+    }) || serde_json::to_vec(payload)
+        .map_err(|_| Error::new(ErrorCode::InvalidInput))?
+        .len()
+        > 64 * 1024
+        || payload
+            .get("attachments")
+            .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+        || payload
+            .get("content")
+            .is_some_and(|v| v.as_str().is_none_or(|s| s.encode_utf16().count() > 2000))
+        || payload
+            .get("embeds")
+            .is_some_and(|v| v.as_array().is_none_or(|a| a.len() > 1))
+        || payload
+            .get("components")
+            .is_some_and(|v| v.as_array().is_none_or(|a| a.len() > 5))
+    {
+        return Err(Error::new(ErrorCode::InvalidInput));
+    }
+    let mut body = payload.clone();
+    body["allowed_mentions"] = json!({"parse":[]});
+    // Rich embeds must not inherit SUPPRESS_EMBEDS from a plain reply.
+    body["flags"] = if body
+        .get("embeds")
+        .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        json!(64)
+    } else {
+        json!(68)
+    };
+    Ok(body)
 }
 struct ReplyFresh<'a> {
     operations: &'a DiscordOperations,
@@ -199,6 +259,27 @@ impl FreshCheck for ReplyFresh<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rich_reply_keeps_embeds_visible_and_cannot_enable_mentions_or_attachments() {
+        let payload = json!({"content":"", "embeds":[{"title":"Pebble","description":"2 starting hearts"}],
+            "components":[],"flags":68,"allowed_mentions":{"parse":["everyone"]}});
+        let body = member_payload(&payload).unwrap();
+        assert_eq!(body["embeds"], payload["embeds"]);
+        assert_eq!(body["flags"], 64);
+        assert_eq!(body["allowed_mentions"], json!({"parse":[]}));
+        assert_eq!(
+            member_payload(&json!({"content":"plain"})).unwrap()["flags"],
+            68
+        );
+        for bad in [
+            json!({"content":"x","file":"/private"}),
+            json!({"attachments":[{"id":"1"}]}),
+            json!({"embeds":[{},{}]}),
+            json!({"content":"😀".repeat(1001)}),
+        ] {
+            assert!(member_payload(&bad).is_err());
+        }
+    }
     #[test]
     fn trusted_token_path_rejects_path_and_query_injection() {
         assert_eq!(

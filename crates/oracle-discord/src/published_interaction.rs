@@ -69,6 +69,8 @@ pub(super) fn parse(
             command_name: interaction.data.name.to_string(),
             route: command.name.to_string(),
             options: values,
+            expected_binding: None,
+            member_only: false,
         },
     ))
 }
@@ -90,9 +92,9 @@ impl DiscordBootstrap {
             }
         };
         responder.defer_ephemeral().await?;
-        if let Err(error) = self.core.status(&actor, Some(&member.guild)).await {
+        if let Err(_error) = self.core.status(&actor, Some(&member.guild)).await {
             responder
-                .complete(&format!("Oracle refused this request: {:?}.", error.code))
+                .complete("This command isn’t available to you here right now. Ask a server helper if you need a hand.")
                 .await?;
             return Ok(true);
         }
@@ -116,9 +118,9 @@ impl DiscordBootstrap {
         if member_route && let Some(reader) = &self.published_reader {
             member = match reader.refresh_member(&member).await {
                 Ok(member) => member,
-                Err(error) => {
+                Err(_error) => {
                     responder
-                        .complete(&format!("Oracle refused this request: {:?}.", error.code))
+                        .complete("This command isn’t available to you here right now. Ask a server helper if you need a hand.")
                         .await?;
                     return Ok(true);
                 }
@@ -139,16 +141,16 @@ impl DiscordBootstrap {
         .await;
         match result {
             Ok(Ok(reply)) => {
-                if let Err(error) = responder
+                if let Err(_error) = responder
                     .complete_published(&reply, &member, cancel.clone())
                     .await
                 {
-                    responder.complete(&format!("This reply could not be delivered: {error}. Run the command again if you still have access.")).await?;
+                    responder.complete("I couldn’t show that answer. Try the command again in a moment.").await?;
                 }
             }
-            Ok(Err(error)) => {
+            Ok(Err(_error)) => {
                 responder
-                    .complete(&format!("Oracle refused this request: {:?}.", error.code))
+                    .complete("This command isn’t available to you here right now. Ask a server helper if you need a hand.")
                     .await?
             }
             Err(_) => {

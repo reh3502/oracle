@@ -121,6 +121,74 @@ impl oracle_operations::executor::DispatchFence for MemberResponseFence {
     }
 }
 
+fn validate_card_actions(
+    card: &oracle_operations::published::CardPresentation,
+    entry: &ModuleCatalogEntry,
+) -> Result<()> {
+    use oracle_core::{ModuleAudience, ModuleCommandInput, ModuleCommandOptionType};
+    let actions = card
+        .buttons
+        .iter()
+        .map(|a| (&a.route, &a.options, a.prompt.as_ref()))
+        .chain(card.choices.iter().map(|a| (&a.route, &a.options, None)));
+    for (name, options, prompt) in actions {
+        let route = entry
+            .commands
+            .routes
+            .iter()
+            .find(|r| &r.name == name)
+            .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+        if !entry
+            .operations
+            .iter()
+            .any(|op| op.name == route.operation && op.audience == ModuleAudience::MemberRead)
+        {
+            return Err(Error::new(ErrorCode::ForbiddenPermission));
+        }
+        let mut supplied = options.clone();
+        if let Some(prompt) = prompt {
+            let Some(ModuleCommandInput::Typed {
+                options: descriptors,
+            }) = &route.input
+            else {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            };
+            let descriptor = descriptors
+                .iter()
+                .find(|d| d.name == prompt.option)
+                .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+            let ModuleCommandOptionType::String {
+                min_length,
+                max_length,
+                choices,
+            } = &descriptor.value_type
+            else {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            };
+            if !choices.is_empty()
+                || u32::from(prompt.max_length) > *max_length
+                || u32::from(prompt.max_length) < *min_length
+                || supplied.contains_key(&prompt.option)
+            {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+            supplied.insert(
+                prompt.option.clone(),
+                serde_json::Value::String("x".repeat((*min_length).max(1) as usize)),
+            );
+        }
+        oracle_operations::published::decode_input(route, &supplied)?;
+    }
+    Ok(())
+}
+
+fn interaction_binding(entry: &ModuleCatalogEntry) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        entry.module, entry.session, entry.generation, entry.epoch
+    )
+}
+
 async fn resolve_published_entry(
     manager: &oracle_modules::ModuleManager,
     reconciler: &oracle_operations::commands::CommandReconciler,
@@ -133,6 +201,9 @@ async fn resolve_published_entry(
     if !matches!(actor, PolicyContext::Discord {guild: g, user, ..} if g == guild && g == &member.guild && user == &member.user)
     {
         return Err(Error::new(ErrorCode::ForbiddenScope));
+    }
+    if request.member_only && request.expected_binding.is_none() {
+        return Err(Error::new(ErrorCode::InvalidInput));
     }
     let binding = reconciler
         .bindings(guild)
@@ -163,6 +234,13 @@ async fn resolve_published_entry(
                 && entry.commands.namespace == request.command_name
         })
         .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+    if request
+        .expected_binding
+        .as_ref()
+        .is_some_and(|expected| expected != &interaction_binding(&entry))
+    {
+        return Err(Error::new(ErrorCode::ModuleUnavailable));
+    }
     Ok(entry)
 }
 
@@ -200,7 +278,7 @@ pub async fn invoke_published_options(
     use oracle_core::ModuleAudience;
     use oracle_operations::{
         ingress::PublishedReply,
-        published::{decode_input, render_presentation},
+        published::{decode_input, render_card, render_presentation},
     };
     let entry =
         resolve_published_entry(manager, reconciler, actor, member, guild, &request).await?;
@@ -215,6 +293,9 @@ pub async fn invoke_published_options(
         .iter()
         .find(|op| op.name == route.operation)
         .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    if request.member_only && operation.audience != ModuleAudience::MemberRead {
+        return Err(Error::new(ErrorCode::ForbiddenPermission));
+    }
     let input = decode_input(route, &request.options)?;
     let settings = manager.runtime_settings(&entry.module);
     let prefix = settings
@@ -233,11 +314,24 @@ pub async fn invoke_published_options(
                 entry.epoch,
             )
             .await?;
-        let text = render_presentation(route, &invocation.value, prefix)?;
+        let card = render_card(route, &invocation.value, prefix)?;
+        if let Some(card) = &card {
+            validate_card_actions(card, &entry)?;
+        }
+        let text = if card.is_some() {
+            Some("Your answer is in the card below.".to_owned())
+        } else {
+            render_presentation(route, &invocation.value, prefix)?
+        };
         if text.is_none() {
             return Err(Error::new(ErrorCode::Compatibility));
         }
         Ok(PublishedReply {
+            card,
+            binding: Some(interaction_binding(&entry)),
+            control_fence: Some(std::sync::Arc::new(RegistryFence(
+                invocation.registry.clone(),
+            ))),
             value: invocation.value,
             text,
             policy: Some(invocation.policy.clone()),
@@ -260,8 +354,16 @@ pub async fn invoke_published_options(
                 entry.epoch,
             )
             .await?;
+        let card = render_card(route, &value, prefix)?;
+        // Interactive presentation is reserved for member-read routes.
+        if card.is_some() {
+            return Err(Error::new(ErrorCode::Compatibility));
+        }
         let text = render_presentation(route, &value, prefix)?;
         Ok(PublishedReply {
+            card: None,
+            binding: None,
+            control_fence: None,
             value,
             text,
             policy: None,

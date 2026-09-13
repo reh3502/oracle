@@ -768,7 +768,8 @@ async fn malformed_published_commands_never_reach_operations() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| event.starts_with("reject:") || event.contains("refused"))
+                .any(|event| event.starts_with("reject:")
+                    || event.contains("This command isn’t available to you here right now."))
         );
     }
     let (bootstrap, operations, responder) = operations_setup(json!({}), false);

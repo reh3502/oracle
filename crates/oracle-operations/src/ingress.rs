@@ -9,12 +9,19 @@ use tokio_util::sync::CancellationToken;
 /// Authenticated Discord option values. Duplicate option names are rejected at ingress.
 #[derive(Clone, Debug)]
 pub struct PublishedRequest {
+    /// Optional host-issued module/session/generation/epoch identity for a follow-up.
+    pub expected_binding: Option<String>,
+    /// Interactive follow-ups can invoke only member-read routes, even for operators.
+    pub member_only: bool,
     pub command_id: String,
     pub command_name: String,
     pub route: String,
     pub options: serde_json::Map<String, Value>,
 }
 pub struct PublishedReply {
+    pub card: Option<crate::published::CardPresentation>,
+    pub binding: Option<String>,
+    pub control_fence: Option<std::sync::Arc<dyn crate::executor::DispatchFence>>,
     pub value: Value,
     pub text: Option<String>,
     pub policy: Option<oracle_core::member_read::MemberReadPermit>,
@@ -88,6 +95,11 @@ pub trait HumanOperations: Send + Sync {
         request: PublishedRequest,
         cancel: &CancellationToken,
     ) -> Result<PublishedReply> {
+        if request.member_only || request.expected_binding.is_some() {
+            return Err(oracle_core::Error::new(
+                oracle_core::ErrorCode::Compatibility,
+            ));
+        }
         // Legacy adapters can retain their existing JSON-only behavior.
         let input = match request.options.len() {
             0 => serde_json::json!({}),
@@ -119,6 +131,9 @@ pub trait HumanOperations: Send + Sync {
             )
             .await?;
         Ok(PublishedReply {
+            card: None,
+            binding: None,
+            control_fence: None,
             value,
             text: None,
             policy: None,

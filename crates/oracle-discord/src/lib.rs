@@ -72,6 +72,7 @@ pub trait InteractionResponder: Send + Sync {
     }
 }
 struct DiscordResponder<'a> {
+    cards: &'a interactive_cards::Cards,
     reader: Option<&'a operations::DiscordOperations>,
     interaction: &'a discord::CommandInteraction,
     http: &'a discord::Http,
@@ -88,6 +89,22 @@ impl InteractionResponder for DiscordResponder<'_> {
             let reader = self
                 .reader
                 .ok_or(Error::Core(ErrorCode::ModuleUnavailable))?;
+            if let Some(card) = &reply.card {
+                let (_, _, request) = published_interaction::parse(self.interaction)?;
+                let payload = self.cards.payload(card, reply, member, &request)?;
+                return reader
+                    .send_member_payload(
+                        self.interaction.application_id.get(),
+                        self.interaction.token.as_str(),
+                        &payload,
+                        member,
+                        policy,
+                        reply.fence.clone().ok_or(Error::InvalidInteraction)?,
+                        cancel,
+                    )
+                    .await
+                    .map_err(Error::from);
+            }
             let text = reply.text.as_deref().ok_or(Error::InvalidInteraction)?;
             let fence = reply.fence.clone().ok_or(Error::InvalidInteraction)?;
             reader
@@ -222,6 +239,7 @@ struct GatewayRuntime {
     unknown_origins: AtomicU64,
 }
 pub struct DiscordBootstrap {
+    cards: interactive_cards::Cards,
     published_reader: Option<Arc<operations::DiscordOperations>>,
     core: Arc<CoreService>,
     ready: watch::Sender<bool>,
@@ -233,6 +251,7 @@ impl DiscordBootstrap {
     pub fn new(core: Arc<CoreService>) -> Self {
         let (ready, _) = watch::channel(false);
         Self {
+            cards: interactive_cards::Cards::default(),
             published_reader: None,
             core,
             ready,
@@ -525,12 +544,25 @@ impl DiscordBootstrap {
 impl discord::EventHandler for DiscordBootstrap {
     async fn dispatch(&self, context: &discord::Context, event: &discord::FullEvent) {
         self.observe_connection(event);
+        if let discord::FullEvent::InteractionCreate { interaction, .. } = event {
+            let result = match interaction {
+                discord::Interaction::Component(i) => {
+                    self.handle_card_component(i, &context.http).await
+                }
+                discord::Interaction::Modal(i) => self.handle_card_modal(i, &context.http).await,
+                _ => Ok(()),
+            };
+            if result.is_err() {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if let discord::FullEvent::InteractionCreate {
             interaction: discord::Interaction::Command(interaction),
             ..
         } = event
         {
             let responder = DiscordResponder {
+                cards: &self.cards,
                 reader: self.published_reader.as_deref(),
                 interaction,
                 http: &context.http,
@@ -593,6 +625,7 @@ impl discord::EventHandler for DiscordBootstrap {
 mod tests;
 
 mod interaction_ops;
+mod interactive_cards;
 mod member_transport;
 pub mod notification;
 pub mod operations;

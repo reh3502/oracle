@@ -239,6 +239,8 @@ async fn published_command_identity_and_explicit_grants_survive_lifecycle_change
         let (operator, mut metadata) = member_tests::identity(&guild, "42", true);
         metadata.observed_at = std::time::Instant::now() - Duration::from_secs(100);
         let typed_request = oracle_operations::ingress::PublishedRequest {
+            expected_binding: None,
+            member_only: false,
             command_id: id.clone(),
             command_name: name.clone(),
             route: "status".into(),

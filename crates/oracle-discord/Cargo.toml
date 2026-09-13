@@ -11,6 +11,7 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 reqwest = { version = "0.13", default-features = false }
 
 oracle-modules = { path = "../oracle-modules" }
