@@ -401,3 +401,56 @@ fn major_entity_discovery_loss_cannot_hide_behind_unchanged_source_coverage() {
         ReasonCode::CategoryLoss,
     );
 }
+
+fn with_image(mut value: Value, checked: u64) -> Value {
+    value["entities"][0]["id"] = json!("page:1");
+    value["images"] = json!({"page:1":{"url":"https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/8/8d/Pebble_Render.png/revision/latest","file_title":"File:Pebble Render.png","file_page_id":99,"revision":100,"sha1":"a".repeat(40),"mime":"image/png","width":256,"height":256,"validated_at_ms":checked,"article_revision":2}});
+    value
+}
+#[test]
+fn images_require_review_for_add_change_remove_but_not_verified_rechecks() {
+    let old = with_image(catalog(), BASE + 30_000);
+    let fresh = with_image(refreshed(), BASE + 3_630_000);
+    assert_eq!(
+        review_candidate(&snapshot(&old), &bytes(&fresh), NOW).status,
+        ReviewStatus::Eligible
+    );
+    let mut no_image = old.clone();
+    no_image.as_object_mut().unwrap().remove("images");
+    assert_reason(
+        &no_image,
+        &old,
+        ReviewStatus::ReviewRequired,
+        ReasonCode::CatalogChanged,
+    );
+    assert_reason(
+        &old,
+        &no_image,
+        ReviewStatus::ReviewRequired,
+        ReasonCode::CatalogChanged,
+    );
+    let mut changed = fresh.clone();
+    changed["images"]["page:1"]["sha1"] = json!("b".repeat(40));
+    assert_reason(
+        &old,
+        &changed,
+        ReviewStatus::ReviewRequired,
+        ReasonCode::CatalogChanged,
+    );
+    let mut future = fresh.clone();
+    future["images"]["page:1"]["validated_at_ms"] = json!(NOW + 1);
+    assert_reason(
+        &old,
+        &future,
+        ReviewStatus::Rejected,
+        ReasonCode::FutureTimestamp,
+    );
+    let mut older = fresh;
+    older["images"]["page:1"]["revision"] = json!(99);
+    assert_reason(
+        &old,
+        &older,
+        ReviewStatus::Rejected,
+        ReasonCode::RevisionRegressed,
+    );
+}

@@ -65,6 +65,32 @@ fn every_corpus_reply_renders_within_discord_limits() {
             }
         };
         let embed = &rendered.embed;
+        if let Some(image) = row.result["reply"].get("image") {
+            assert_eq!(
+                embed["thumbnail"]["url"], image["url"],
+                "{}: image lost",
+                row.case
+            );
+            let attribution = format!(
+                "[Image](https://dandys-world-robloxhorror.fandom.com/index.php?oldid={})",
+                image["revision"]
+            );
+            assert!(
+                embed["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field["value"].as_str().unwrap().contains(&attribution)),
+                "{}: image source lost",
+                row.case
+            );
+        } else {
+            assert!(
+                embed.get("thumbnail").is_none(),
+                "{}: invented image",
+                row.case
+            );
+        }
         let mut total = utf16(&embed["title"], 256, &row.case, "title");
         if let Some(description) = embed.get("description") {
             total += utf16(description, 4096, &row.case, "description");

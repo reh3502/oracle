@@ -1172,3 +1172,18 @@ fn overview_is_short_and_keeps_unverified_details_accessible() {
     assert_bounded(&reply);
     assert_bounded(&full);
 }
+
+#[test]
+fn image_card_keeps_file_source_separate_from_text_license() {
+    let req = lookup(0);
+    let mut response = response(catalog(), req.clone(), NOW);
+    response.image=Some(serde_json::from_value(json!({"url":"https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/8/8d/Pebble_Render.png/revision/latest","file_title":"File:Pebble Render.png","file_page_id":99,"revision":100,"sha1":"a".repeat(40),"mime":"image/png","width":256,"height":256,"validated_at_ms":NOW,"article_revision":2})).unwrap());
+    let reply = presentation::render(&req, &response);
+    assert_eq!(reply.image.as_ref().unwrap().revision, 100);
+    assert!(reply.card.footer.starts_with("Wiki text:"));
+    assert_eq!(reply.citations[0].revision, 2);
+    assert_bounded(&reply);
+    response.image = None;
+    let plain = presentation::render(&req, &response);
+    assert!(serde_json::to_value(plain).unwrap().get("image").is_none());
+}

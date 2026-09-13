@@ -506,8 +506,9 @@ pub fn validate_module_image_url(url: &str, prefix: &str) -> crate::Result<()> {
                     .and_then(|b| (b as char).to_digit(16))
                     .ok_or_else(invalid)?;
                 let value = (hi * 16 + lo) as u8;
-                // Never allow decoding to introduce separators or another escape.
-                if b"/\\%?#:@".contains(&value) {
+                // Keep path segments and escapes unambiguous. Encoded filename
+                // punctuation stays encoded in the forwarded URL.
+                if b"/\\%".contains(&value) {
                     return Err(invalid());
                 }
                 decoded.push(value);

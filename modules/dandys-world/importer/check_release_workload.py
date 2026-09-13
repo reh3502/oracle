@@ -180,7 +180,13 @@ def validate_reply(result):
     reply = result['reply']
     assert isinstance(reply, dict)
     legacy = set(reply) == {'text', 'citations'}
-    assert legacy or set(reply) == {'text', 'card', 'citations', 'buttons', 'choices'}
+    assert legacy or set(reply) in ({'text', 'card', 'citations', 'buttons', 'choices'}, {'text', 'card', 'citations', 'buttons', 'choices', 'image'})
+    if 'image' in reply:
+        from media_source import image_url
+        image = reply['image']
+        assert isinstance(image, dict) and set(image) == {'url', 'revision'}
+        assert image_url(image['url'])
+        assert type(image['revision']) is int and 0 < image['revision'] <= SAFE_INTEGER
     display_text(reply['text'], 1800 if legacy else 2000)
     assert isinstance(reply['citations'], list) and len(reply['citations']) <= 5
     for citation in reply['citations']:

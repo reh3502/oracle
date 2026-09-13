@@ -72,6 +72,8 @@ pub struct AnswerBlock {
 #[derive(Clone, Debug, Serialize)]
 pub struct QueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<EntityImage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub navigation_request: Option<QueryRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_option: Option<String>,
@@ -171,6 +173,7 @@ impl QueryEngine {
     }
     fn response(&self, status: &str, message: &str) -> QueryResponse {
         QueryResponse {
+            image: None,
             navigation_request: None,
             selection_option: None,
             snapshot_id: self.snapshot_id.clone(),
@@ -472,6 +475,14 @@ impl QueryEngine {
         }
         let mut r = self.response("answered", &e.name);
         r.candidates.push(candidate(e));
+        r.image = self
+            .data
+            .images
+            .get(&e.id)
+            .filter(|image| {
+                image.validated_at_ms <= now && now.saturating_sub(image.validated_at_ms) <= 7 * DAY
+            })
+            .cloned();
         r.warnings = e.warnings.clone();
         if offset >= facts.len() {
             r.status = "not_found".into();

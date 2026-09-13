@@ -50,6 +50,7 @@ fn data() -> CatalogData {
     let mut c = entity("toon:3", "Astro", Kind::Toon);
     c.aliases.push("Moon friend".into());
     CatalogData {
+        images: BTreeMap::new(),
         schema_version: 1,
         adapter_version: "fixture".into(),
         source_origin: SOURCE_ORIGIN.into(),
@@ -519,5 +520,53 @@ fn ambiguity_navigation_retains_question_field_and_comparison_side() {
     assert_eq!(r.selection_option.as_deref(), Some("right"));
     assert!(
         matches!(r.navigation_request, Some(QueryRequest::Compare {ref left, ref right, field:Some(ref f)}) if left == "toon:3" && right == "Pebble" && f == "speed")
+    );
+}
+
+#[test]
+fn images_follow_only_the_single_resolved_entity_and_expire_without_fetching() {
+    let mut d = data();
+    d.entities[0].id = "page:1".into();
+    d.images.insert("page:1".into(), EntityImage {url:"https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/8/8d/Pebble_Render.png/revision/latest".into(),file_title:"File:Pebble Render.png".into(),file_page_id:99,revision:100,sha1:"a".repeat(40),mime:"image/png".into(),width:256,height:256,validated_at_ms:NOW,article_revision:42});
+    let e = engine(d);
+    assert!(e.execute(lookup("page:1"), NOW).unwrap().image.is_some());
+    assert!(
+        e.execute(
+            QueryRequest::Ask {
+                question: "Who is toon Pebble?".into()
+            },
+            NOW
+        )
+        .unwrap()
+        .image
+        .is_some()
+    );
+    for req in [
+        lookup("Pebble"),
+        lookup("Twisted Pebble"),
+        QueryRequest::Search {
+            query: "Pebble".into(),
+            kind: None,
+            limit: 10,
+        },
+        QueryRequest::Compare {
+            left: "page:1".into(),
+            right: "Astro".into(),
+            field: None,
+        },
+    ] {
+        assert!(e.execute(req, NOW).unwrap().image.is_none());
+    }
+    assert!(
+        e.execute(lookup("page:1"), NOW - 1)
+            .unwrap()
+            .image
+            .is_none()
+    );
+    assert!(
+        e.execute(lookup("page:1"), NOW + 8 * 86_400_000)
+            .unwrap()
+            .image
+            .is_none()
     );
 }

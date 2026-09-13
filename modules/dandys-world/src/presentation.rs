@@ -9,11 +9,18 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Reply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<Image>,
     pub text: String,
     pub card: Card,
     pub citations: Vec<Reference>,
     pub buttons: Vec<Action>,
     pub choices: Vec<Choice>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct Image {
+    pub url: String,
+    pub revision: u64,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Card {
@@ -153,6 +160,7 @@ fn ask() -> Action {
 }
 fn base(title: &str, description: &str) -> Reply {
     Reply {
+        image: None,
         text: String::new(),
         card: Card {
             title: short(title, 256),
@@ -209,7 +217,10 @@ fn fits(r: &Reply) -> bool {
             .all(|s| (1..=9_007_199_254_740_991).contains(&s.revision))
         && rendered_len(&r.card.title, true) <= 256
         && rendered_len(&r.card.description, true) <= 4096
-        && r.card.fields.len() + usize::from(!r.citations.is_empty()) <= 20
+        && r.card.fields.len()
+            + usize::from(!r.citations.is_empty())
+            + usize::from(r.image.is_some())
+            <= 20
         && source_len <= 1024
         && r.card.fields.iter().all(|f| {
             !f.name.trim().is_empty()
@@ -226,6 +237,7 @@ fn fits(r: &Reply) -> bool {
                 .map(|f| rendered_len(&f.name, true) + rendered_len(&f.value, true))
                 .sum::<usize>()
             + source_len
+            + if r.image.is_some() { 140 } else { 0 }
             + if r.citations.is_empty() {
                 0
             } else {
@@ -618,6 +630,14 @@ pub fn render(request: &QueryRequest, response: &QueryResponse) -> Reply {
     };
     let overview = matches!(req, QueryRequest::Lookup { field: None, .. });
     let mut r = base(&title, &warnings(&response.warnings));
+    if let Some(image) = &response.image {
+        r.image = Some(Image {
+            url: image.url.clone(),
+            revision: image.revision,
+        });
+        r.card.footer = "Wiki text: Dandy’s World Wiki contributors • CC BY-SA 3.0".into();
+    }
+
     if overview {
         r.card.description = "Pick a detail below to learn more.".into();
         let mut notes = response.warnings.clone();

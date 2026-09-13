@@ -16,6 +16,8 @@ pub struct CatalogData {
     pub sources: Vec<Source>,
     pub entities: Vec<Entity>,
     pub coverage: Coverage,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub images: BTreeMap<String, EntityImage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,4 +124,20 @@ pub struct Coverage {
     pub excluded: Vec<CoverageEntry>,
     pub unresolved_redirects: Vec<CoverageEntry>,
     pub warnings: Vec<String>,
+}
+
+/// File provenance is distinct from the article's text license.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityImage {
+    pub url: String,
+    pub file_title: String,
+    pub file_page_id: u64,
+    pub revision: u64,
+    pub sha1: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub validated_at_ms: u64,
+    pub article_revision: u64,
 }

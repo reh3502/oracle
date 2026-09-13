@@ -53,6 +53,76 @@ fn citation_valid(citations: &[Citation], sources: &HashSet<&str>) -> Result<()>
     }
     Ok(())
 }
+/// Only canonical original raster URLs from this wiki's CDN are accepted.
+pub fn image_url_valid(url: &str) -> bool {
+    let Some(tail) =
+        url.strip_prefix("https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/")
+    else {
+        return false;
+    };
+    if url.len() > 2048
+        || !url.is_ascii()
+        || url
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || matches!(b, b'\\' | b'#'))
+    {
+        return false;
+    }
+    let (path, query) = tail.split_once('?').unwrap_or((tail, ""));
+    if !query.is_empty()
+        && !query.strip_prefix("cb=").is_some_and(|v| {
+            !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+    let parts: Vec<_> = path.split('/').collect();
+    if !matches!(parts.len(), 5 | 7)
+        || parts[0].len() != 1
+        || parts[1].len() != 2
+        || !parts[..2]
+            .iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+        || parts[3] != "revision"
+        || parts[4] != "latest"
+    {
+        return false;
+    }
+    if parts.len() == 7
+        && (parts[5] != "scale-to-width-down"
+            || !parts[6]
+                .parse::<u32>()
+                .is_ok_and(|n| (1..=2048).contains(&n)))
+    {
+        return false;
+    }
+    let filename = parts[2];
+    let lower = filename.to_ascii_lowercase();
+    if filename.is_empty()
+        || filename.contains("..")
+        || ["%2e", "%2f", "%5c", "%25", "%00", "%0a", "%0d"]
+            .iter()
+            .any(|v| lower.contains(v))
+        || ![".png", ".jpg", ".jpeg", ".webp", ".gif"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+    {
+        return false;
+    }
+    let bytes = filename.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() || !bytes[i + 1..i + 3].iter().all(|b| b.is_ascii_hexdigit()) {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
 /// Validate before constructing any serving snapshot. Unknown data remains explicit.
 pub fn validate(data: &CatalogData) -> Result<()> {
     require(
@@ -113,6 +183,45 @@ pub fn validate(data: &CatalogData) -> Result<()> {
         require(
             nonempty(&e.id) && ids.insert(e.id.as_str()) && nonempty(&e.name),
             "duplicate or empty entity identity",
+        )?;
+    }
+    require(
+        data.images.len() <= data.entities.len(),
+        "image count exceeds entities",
+    )?;
+    for (id, image) in &data.images {
+        let source = data
+            .sources
+            .iter()
+            .find(|s| s.id == *id && id == &format!("page:{}", s.page_id));
+        require(
+            ids.contains(id.as_str())
+                && source.is_some_and(|s| s.revision_id == image.article_revision),
+            "image lacks canonical entity article provenance",
+        )?;
+        require(
+            image_url_valid(&image.url)
+                && image.file_title.starts_with("File:")
+                && image.file_title.len() <= 300
+                && image.file_title.len() > 5
+                && !image.file_title.chars().any(char::is_control)
+                && (1..=9_007_199_254_740_991).contains(&image.file_page_id)
+                && (1..=9_007_199_254_740_991).contains(&image.revision)
+                && image.width > 0
+                && image.height > 0
+                && image.width <= 100_000
+                && image.height <= 100_000
+                && image.validated_at_ms > 0
+                && image.sha1.len() == 40
+                && image
+                    .sha1
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                && matches!(
+                    image.mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                ),
+            "invalid image metadata",
         )?;
     }
     let mut fact_ids = HashSet::new();

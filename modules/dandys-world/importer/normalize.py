@@ -363,9 +363,14 @@ class Normalizer:
                   'unresolved_redirects':self.unresolved,
                   'warnings':['Coverage is relative to the saved discovery indexes, not the live wiki.',
                               'Unresolved templates and known source conflicts remain explicit; historical facts are labelled.']}
-        return {'schema_version':1,'adapter_version':'dw-wiki/1.0','source_origin':ORIGIN,
+        result = {'schema_version':1,'adapter_version':'dw-wiki/1.0','source_origin':ORIGIN,
                 'crawl_started_at':self.corpus.manifest['started_at'],'crawl_completed_at':self.corpus.manifest['completed_at'],
                 'sources':[r['source'] for r in self.corpus.rows],'entities':sorted(self.entities.values(),key=lambda x:x['id']), 'coverage':coverage}
+        images = {key: value for key, value in self.corpus.images.items()
+                  if key in self.entities and any(row['source']['id'] == key and row['title'] == self.entities[key]['name'] for row in main)}
+        if images:
+            result['images'] = images
+        return result
 
     def apply_reviews(self):
         path=Path(__file__).with_name('source_reviews.json')

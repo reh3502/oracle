@@ -88,7 +88,7 @@ def run(output, previous=None, budget_bytes=MAX_OUTPUT, *, acquirer=None, normal
         previous = Path(previous)
         if not previous.is_absolute() or output.resolve().is_relative_to(previous.resolve()):
             raise SourceError('Worker output cannot modify the previous corpus')
-    acquirer = acquirer or acquire
+    acquirer = acquirer or (lambda *args, **kwargs: acquire(*args, **kwargs, include_images=True))
     normalizer = normalizer or normalize_source
     output.mkdir(mode=0o700, exist_ok=False)
     source = output / 'source'

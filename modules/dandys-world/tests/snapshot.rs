@@ -205,3 +205,60 @@ fn concurrent_readers_observe_only_complete_catalogs() {
         }
     });
 }
+
+fn image_fixture() -> Value {
+    json!({"url":"https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/8/8d/Pebble_Render.png/revision/latest/scale-to-width-down/256?cb=20240806022953","file_title":"File:Pebble Render.png","file_page_id":99,"revision":100,"sha1":"a".repeat(40),"mime":"image/png","width":256,"height":256,"validated_at_ms":1,"article_revision":2})
+}
+#[test]
+fn optional_images_require_canonical_entity_and_file_provenance() {
+    let legacy = snapshot_value_without_images();
+    assert!(legacy.images.is_empty());
+    assert!(
+        serde_json::to_value(legacy)
+            .unwrap()
+            .get("images")
+            .is_none()
+    );
+    let mut value = candidate();
+    value["entities"][0]["id"] = json!("page:1");
+    value["images"] = json!({"page:1":image_fixture()});
+    Snapshot::from_bytes(&bytes(&value)).unwrap();
+    for (key, bad) in [
+        ("article_revision", json!(999)),
+        ("sha1", json!("invalid")),
+        ("revision", json!(0)),
+        ("width", json!(0)),
+        ("mime", json!("image/svg+xml")),
+        ("url", json!("https://example.com/Pebble.png")),
+    ] {
+        let mut invalid = value.clone();
+        invalid["images"]["page:1"][key] = bad;
+        assert!(Snapshot::from_bytes(&bytes(&invalid)).is_err(), "{key}");
+    }
+    value["entities"][0]["id"] = json!("child:1");
+    assert!(
+        Snapshot::from_bytes(&bytes(&value)).is_err(),
+        "same citation is not the same canonical entity"
+    );
+}
+fn snapshot_value_without_images() -> CatalogData {
+    serde_json::from_value(candidate()).unwrap()
+}
+#[test]
+fn image_urls_reject_traversal_and_non_wiki_resources() {
+    use dandys_world_core::snapshot::image_url_valid;
+    let prefix = "https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/8/8d/";
+    for suffix in [
+        "../private.png/revision/latest",
+        "%2e%2e.png/revision/latest",
+        "x%2fy.png/revision/latest",
+        "x.svg/revision/latest",
+        "x.png/revision/latest?redirect=https://bad",
+        "x.png/revision/latest/scale-to-width-down/999999",
+    ] {
+        assert!(!image_url_valid(&format!("{prefix}{suffix}")), "{suffix}");
+    }
+    assert!(image_url_valid(&format!(
+        "{prefix}Pebble_Render.png/revision/latest?cb=20240806022953"
+    )));
+}

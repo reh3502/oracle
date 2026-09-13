@@ -45,6 +45,7 @@ class Corpus:
         self.rows = rows
         self.manifest = manifest
         self.namespace_counts = namespace_counts
+        self.images = {}
         self.by_title = {row['title']: row for row in rows}
         if len(self.by_title) != len(rows):
             raise ImportError('Duplicate source title')
@@ -100,7 +101,22 @@ class Corpus:
         rights = json.loads(read(root, 'siteinfo.json', MAX_PAGE))['query']['rightsinfo']
         if rights['text'] != 'CC-BY-SA':
             raise ImportError('Source license needs review')
-        return cls(rows, manifest, counts)
+        corpus = cls(rows, manifest, counts)
+        if 'media_sha256' in manifest:
+            from media_source import checksum
+            media = json.loads(read(root, 'media.json', 4 * MAX_PAGE))
+            if checksum(media) != manifest['media_sha256'] or media.get('version') != 1 or media.get('status') != 'complete':
+                raise ImportError('Corrupt image metadata')
+            images = media.get('images')
+            if not isinstance(images, dict) or len(images) > len(rows):
+                raise ImportError('Invalid image mapping')
+            sources = {row['source']['id']: row for row in rows}
+            for key, image in images.items():
+                row = sources.get(key)
+                if not row or row['namespace'] != 0 or not isinstance(image, dict) or image.get('article_revision') != row['source']['revision_id']:
+                    raise ImportError('Image article revision mismatch')
+            corpus.images = images
+        return corpus
 
     def citation(self, row, section, raw):
         if raw not in row['raw']:

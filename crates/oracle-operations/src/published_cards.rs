@@ -415,6 +415,7 @@ mod tests {
             "a/a1/Pebble.png",
             "a/a1/Pebble.PNG/revision/latest?cb=20240806022953",
             "a/a1/Pebble%20Render%C3%A9.png/revision/latest/scale-to-width-down/256?cb=20240806022953",
+            "5/56/Get_To_Where%3F.png/revision/latest/scale-to-width-down/256?cb=20260515191029",
         ] {
             let url = format!("{IMAGE_PREFIX}{path}");
             let mut value = with_image(&url);

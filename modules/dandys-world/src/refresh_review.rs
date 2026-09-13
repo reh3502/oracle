@@ -315,6 +315,28 @@ pub fn review_candidate(active: &Snapshot, candidate_bytes: &[u8], now_ms: u64) 
             findings.add(ReasonCode::EntityDeleted, false, id);
         }
     }
+    for (id, image) in &new.images {
+        if image.validated_at_ms > now_ms {
+            findings.add(ReasonCode::FutureTimestamp, true, id);
+        }
+        if let Some(previous) = old.images.get(id) {
+            if image.validated_at_ms < previous.validated_at_ms {
+                findings.add(ReasonCode::ValidationRegressed, true, id);
+            }
+            if image.file_page_id == previous.file_page_id && image.revision < previous.revision {
+                findings.add(ReasonCode::RevisionRegressed, true, id);
+            }
+        }
+        if old
+            .images
+            .get(id)
+            .is_none_or(|previous| image.validated_at_ms > previous.validated_at_ms)
+            && let Some((start, end)) = new_interval
+            && !(start..=end).contains(&image.validated_at_ms)
+        {
+            findings.add(ReasonCode::InvalidTimestamp, true, id);
+        }
+    }
     if semantic_value(old) != semantic_value(new) {
         findings.add(ReasonCode::CatalogChanged, false, "");
     }
@@ -359,6 +381,11 @@ fn semantic_value(data: &CatalogData) -> Value {
     let object = value.as_object_mut().unwrap();
     object.remove("crawl_started_at");
     object.remove("crawl_completed_at");
+    if let Some(images) = object.get_mut("images").and_then(Value::as_object_mut) {
+        for image in images.values_mut() {
+            image.as_object_mut().unwrap().remove("validated_at_ms");
+        }
+    }
     let sources = object["sources"].as_array_mut().unwrap();
     for source in sources.iter_mut() {
         source.as_object_mut().unwrap().remove("validated_at_ms");

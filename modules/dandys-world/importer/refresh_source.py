@@ -416,7 +416,7 @@ def write_json(path, value, budget):
     budget.write(path, (json.dumps(value, ensure_ascii=False) + '\n').encode())
 
 
-def acquire(output, previous=None, client=None, budget_bytes=None):
+def acquire(output, previous=None, client=None, budget_bytes=None, include_images=False):
     """Write an absent output directory, never mutate an active/previous corpus.
 
     Completion requires stable discovery and a second revision check of every
@@ -500,7 +500,18 @@ def acquire(output, previous=None, client=None, budget_bytes=None):
                     'acquisition': {'requests': client.requests, 'reused_pages': reused, 'downloaded_pages': len(pages) - reused}}
         client.remaining()
         write_json(output / 'manifest.json', manifest, budget)
-        Corpus.open(output)
+        corpus = Corpus.open(output)
+        if include_images:
+            from media_source import collect, checksum
+            media = collect(corpus, client)
+            write_json(output / 'media.json', media, budget)
+            manifest['media_sha256'] = checksum(media)
+            manifest['completed_at'] = client.wall()
+            manifest['scope'] = 'Current revisions in all five configured namespaces and main-image metadata; no image bytes or edit history.'
+            manifest['acquisition']['requests'] = client.requests
+            (output / 'manifest.json').unlink()
+            write_json(output / 'manifest.json', manifest, budget)
+            Corpus.open(output)
         client.remaining()
         return manifest
     except Exception:
@@ -518,7 +529,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     try:
-        print(json.dumps(acquire(args.output, args.previous)))
+        print(json.dumps(acquire(args.output, args.previous, include_images=True)))
     except SourceDenied:
         parser.exit(3, 'Source acquisition denied; scheduled acquisition must stop.\n')
     except (OSError, ValueError, KeyError, TypeError) as error:
