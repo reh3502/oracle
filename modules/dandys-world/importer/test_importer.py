@@ -191,6 +191,22 @@ class InfoboxTests(unittest.TestCase):
         self.assertEqual(entity['facts'][0]['state'], 'unverified')
         self.assertIsNone(entity['facts'][0]['value'])
 
+    def test_nested_strategy_sections_inherit_uncertainty_until_sibling(self):
+        raw = ('== Strategy ==\nAdvice.\n=== Survivability ===\nA ranking claim.\n'
+               '==== Details ====\nMore advice.\n== Mechanics ==\nA documented mechanic.\n'
+               '=== Timing ===\nA documented duration.')
+        c = corpus([('Syntax', raw)], False)
+        n = Normalizer(c)
+        row = c.by_title['Syntax']
+        entity = n.entity(row, 'mechanic')
+        n.sections(entity, row)
+        facts = {f['key']: f for f in entity['facts']}
+        for name in ('strategy', 'survivability', 'details'):
+            self.assertEqual(facts[name]['state'], 'unverified')
+            self.assertIsNone(facts[name]['value'])
+        for name in ('mechanics', 'timing'):
+            self.assertEqual(facts[name]['state'], 'supported')
+
     def test_stat_template_drift_does_not_reuse_formula(self):
         c = corpus()
         c.by_title['Template:StatComp']['raw'] += '\nchanged'

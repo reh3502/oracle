@@ -205,10 +205,16 @@ class Normalizer:
 
     def sections(self,entity,row,code=None):
         code=code or mw.parse(row['raw'])
+        ancestors=[]
         for section in code.get_sections(include_lead=True,flat=True):
             headings=section.filter_headings(recursive=False)
             heading=Renderer(self.corpus,row).text(str(headings[0].title)).strip() if headings else 'Overview'
             heading_key=key(heading)
+            if headings:
+                level=headings[0].level
+                while ancestors and ancestors[-1][0]>=level:ancestors.pop()
+                ancestors.append((level,heading_key))
+            uncertain=any(term in name for _,name in ancestors for term in ['strateg','lore','tips','recommend'])
             if heading_key in EXCLUDED_SECTIONS or any(word in heading_key for word in ['gallery','audio','dialogue','unused','old_','history','changelog']):continue
             raw=str(section)
             if headings:raw=raw[raw.find(str(headings[0]))+len(str(headings[0])):]
@@ -224,7 +230,7 @@ class Normalizer:
                 if not display.strip():continue
                 # Full tables have dedicated adapters below; avoid huge semantically flattened tables.
                 if any(str(t.tag)=='table' for t in mw.parse(chunk).filter_tags()):continue
-                state='unverified' if any(term in heading_key for term in ['strateg','lore','tips','recommend']) else 'supported'
+                state='unverified' if uncertain else 'supported'
                 self.fact(entity,row,heading_key,chunk,heading,state=state)
 
     def new_named(self,row,name,kind,section):
