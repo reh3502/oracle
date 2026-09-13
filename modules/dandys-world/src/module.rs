@@ -184,6 +184,39 @@ impl DwModule {
                 refresh,
                 diagnostics,
             );
+            if operation == "health" {
+                return Ok(json!({"reply":{"text":response.message,"citations":[]}}));
+            }
+            let freshness = if engine.oldest_validation_ms > now
+                || engine.latest_validation_ms > now
+            {
+                "Some wiki checks have an incorrect date. Those answers may be unavailable."
+                    .to_owned()
+            } else {
+                let minutes = (now - engine.oldest_validation_ms) / 60_000;
+                if minutes < 60 {
+                    "The wiki was checked within the last hour.".to_owned()
+                } else if minutes < 24 * 60 {
+                    format!(
+                        "The oldest wiki check was {} {} ago.",
+                        minutes / 60,
+                        if minutes / 60 == 1 { "hour" } else { "hours" }
+                    )
+                } else {
+                    format!(
+                        "Some wiki information was last checked {} {} ago. Older answers include a warning.",
+                        minutes / (24 * 60),
+                        if minutes / (24 * 60) == 1 {
+                            "day"
+                        } else {
+                            "days"
+                        }
+                    )
+                }
+            };
+            response.message = format!(
+                "Ask about Toons, Twisteds, floors, items and more.\n\n{freshness}\nAnswers link back to the wiki so you can read more."
+            );
         }
         Ok(json!({"reply":presentation::render(&request, &response)}))
     }

@@ -71,6 +71,10 @@ pub struct AnswerBlock {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct QueryResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation_request: Option<QueryRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_option: Option<String>,
     pub snapshot_id: String,
     pub status: String,
     pub message: String,
@@ -167,6 +171,8 @@ impl QueryEngine {
     }
     fn response(&self, status: &str, message: &str) -> QueryResponse {
         QueryResponse {
+            navigation_request: None,
+            selection_option: None,
             snapshot_id: self.snapshot_id.clone(),
             status: status.into(),
             message: message.into(),
@@ -414,7 +420,16 @@ impl QueryEngine {
     ) -> QueryResponse {
         let e = match self.resolve(name, kind) {
             Ok(e) => e,
-            Err(r) => return *r,
+            Err(mut r) => {
+                r.navigation_request = Some(QueryRequest::Lookup {
+                    name: name.into(),
+                    kind,
+                    field: field.map(str::to_owned),
+                    offset,
+                });
+                r.selection_option = Some("name".into());
+                return *r;
+            }
         };
         let mut facts: Vec<_> = e
             .facts
@@ -487,11 +502,27 @@ impl QueryEngine {
                 }
                 let a = match self.resolve(&left, None) {
                     Ok(e) => e,
-                    Err(r) => return Ok(*r),
+                    Err(mut r) => {
+                        r.navigation_request = Some(QueryRequest::Compare {
+                            left: left.clone(),
+                            right: right.clone(),
+                            field: field.clone(),
+                        });
+                        r.selection_option = Some("left".into());
+                        return Ok(*r);
+                    }
                 };
                 let b = match self.resolve(&right, None) {
                     Ok(e) => e,
-                    Err(r) => return Ok(*r),
+                    Err(mut r) => {
+                        r.navigation_request = Some(QueryRequest::Compare {
+                            left: a.id.clone(),
+                            right: right.clone(),
+                            field: field.clone(),
+                        });
+                        r.selection_option = Some("right".into());
+                        return Ok(*r);
+                    }
                 };
                 let mut r = self.response(
                     "answered",
@@ -503,6 +534,7 @@ impl QueryEngine {
                         "Comparison requires entities of the same kind.",
                     ));
                 }
+                r.candidates = vec![candidate(a), candidate(b)];
                 let mut count = 0;
                 for f in &a.facts {
                     if field.as_deref().is_some_and(|k| !Self::field_matches(f, k)) {
@@ -744,6 +776,15 @@ impl QueryEngine {
             return unsupported();
         }
         // Only resolve the entire remaining entity span, never an embedded name.
-        self.lookup(name, kind, field, 0, now)
+        {
+            let mut r = self.lookup(name, kind, field, 0, now);
+            r.navigation_request = Some(QueryRequest::Lookup {
+                name: name.into(),
+                kind,
+                field: field.map(str::to_owned),
+                offset: 0,
+            });
+            r
+        }
     }
 }

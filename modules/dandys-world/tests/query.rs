@@ -490,3 +490,34 @@ fn sourced_conjunction_names_and_unicode_possessives_work() {
         assert!(r.answer_blocks.is_empty());
     }
 }
+
+#[test]
+fn ambiguity_navigation_retains_question_field_and_comparison_side() {
+    let e = engine(data());
+    let r = e
+        .execute(
+            QueryRequest::Ask {
+                question: "What is Pebble's speed?".into(),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        matches!(r.navigation_request, Some(QueryRequest::Lookup {field:Some(ref f), ..}) if f == "speed")
+    );
+    assert_eq!(r.selection_option.as_deref(), Some("name"));
+    let r = e
+        .execute(
+            QueryRequest::Compare {
+                left: "Astro".into(),
+                right: "Pebble".into(),
+                field: Some("speed".into()),
+            },
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(r.selection_option.as_deref(), Some("right"));
+    assert!(
+        matches!(r.navigation_request, Some(QueryRequest::Compare {ref left, ref right, field:Some(ref f)}) if left == "toon:3" && right == "Pebble" && f == "speed")
+    );
+}

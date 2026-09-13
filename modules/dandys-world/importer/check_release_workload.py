@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -122,13 +123,88 @@ async def launch(binary, store, stderr):
         raise
 
 
+SAFE_INTEGER = 9_007_199_254_740_991
+NAME = re.compile(r'[a-z0-9_-]{1,32}\Z')
+
+
+def display_text(value, maximum, empty=False):
+    assert isinstance(value, str)
+    units = len(value.encode('utf-16-le')) // 2
+    assert units <= maximum and (empty or value.strip())
+    assert not any((ord(c) < 32 and c != '\n') or 0x7f <= ord(c) <= 0x9f
+                   or ord(c) in (0x61c, 0x200e, 0x200f, 0xfeff)
+                   or 0x200b <= ord(c) <= 0x200d
+                   or 0x202a <= ord(c) <= 0x202e
+                   or 0x2066 <= ord(c) <= 0x2069 for c in value)
+    return units
+
+
+def validate_action(action, prompt=False):
+    expected = {'label', 'route', 'options'} if prompt else {'label', 'description', 'route', 'options'}
+    assert isinstance(action, dict)
+    if prompt:
+        assert set(action) in (expected, expected | {'prompt'})
+    else:
+        assert set(action) == expected
+    display_text(action['label'], 80)
+    assert isinstance(action['route'], str) and NAME.fullmatch(action['route'])
+    options = action['options']
+    assert isinstance(options, dict) and len(options) <= 25
+    assert len(json.dumps(options, ensure_ascii=False, separators=(',', ':')).encode()) <= 8192
+    for name, value in options.items():
+        assert NAME.fullmatch(name)
+        if isinstance(value, str):
+            display_text(value, 6000, empty=True)
+        elif type(value) is int:
+            assert -SAFE_INTEGER <= value <= SAFE_INTEGER
+        else:
+            assert type(value) is bool
+    if not prompt:
+        display_text(action['description'], 100, empty=True)
+    modal = action.get('prompt')
+    if modal is not None:
+        assert isinstance(modal, dict) and set(modal) == {'label', 'option', 'placeholder', 'max_length'}
+        display_text(modal['label'], 45)
+        display_text(modal['placeholder'], 100, empty=True)
+        assert isinstance(modal['option'], str) and NAME.fullmatch(modal['option'])
+        assert modal['option'] not in options
+        assert type(modal['max_length']) is int and 1 <= modal['max_length'] <= 200
+
+
 def validate_reply(result):
+    """Validate both shipped reply formats without relaxing citation/action bounds.
+
+    These are wire-shape checks. The Rust card_corpus integration test additionally
+    exercises host sanitization and measures expanded Discord UTF-16 lengths.
+    """
     reply = result['reply']
-    assert set(reply) == {'text', 'citations'}
-    assert 0 < len(reply['text'].encode('utf-16-le')) // 2 <= 1800
-    assert len(reply['citations']) <= 5
+    assert isinstance(reply, dict)
+    legacy = set(reply) == {'text', 'citations'}
+    assert legacy or set(reply) == {'text', 'card', 'citations', 'buttons', 'choices'}
+    display_text(reply['text'], 1800 if legacy else 2000)
+    assert isinstance(reply['citations'], list) and len(reply['citations']) <= 5
     for citation in reply['citations']:
-        assert 0 < citation['revision'] <= 9007199254740991
+        assert isinstance(citation, dict) and set(citation) == {'label', 'revision'}
+        display_text(citation['label'], 120)
+        assert type(citation['revision']) is int and 0 < citation['revision'] <= SAFE_INTEGER
+    if legacy:
+        return
+    card = reply['card']
+    assert isinstance(card, dict) and set(card) == {'title', 'description', 'fields', 'footer'}
+    total = display_text(card['title'], 256)
+    total += display_text(card['description'], 4096, empty=True)
+    total += display_text(card['footer'], 512, empty=True)
+    assert isinstance(card['fields'], list) and len(card['fields']) + bool(reply['citations']) <= 20
+    for field in card['fields']:
+        assert isinstance(field, dict) and set(field) == {'name', 'value', 'inline'}
+        total += display_text(field['name'], 256)
+        total += display_text(field['value'], 1024)
+        assert type(field['inline']) is bool
+    assert total <= 6000
+    for name, maximum, prompt in [('buttons', 5, True), ('choices', 25, False)]:
+        assert isinstance(reply[name], list) and len(reply[name]) <= maximum
+        for action in reply[name]:
+            validate_action(action, prompt=prompt)
 
 
 async def workload(peer, cases, rounds, worker_pid=None, worker_finished=None):

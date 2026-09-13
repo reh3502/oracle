@@ -8,7 +8,7 @@ Build the SDK executable with:
 cargo build --locked --release --manifest-path modules/dandys-world/Cargo.toml --bin dw-module
 ```
 
-Package `target/release/dw-module` from this directory with `manifest.json` using Oracle's operator package workflow. The module ID is `community.dandys-world`. Its manifest requires host API 1.1, protocol 1.1 and an operator-configured runtime data directory containing a published catalog. Missing or invalid snapshots fail initialization with an actionable error. Never put credentials or unrelated files in that directory.
+Package `target/release/dw-module` from this directory with `manifest.json` using Oracle's operator package workflow. The module ID is `community.dandys-world`. Its manifest requires host API 1.2, protocol 1.1 and an operator-configured runtime data directory containing a published catalog. Missing or invalid snapshots fail initialization with an actionable error. Never put credentials or unrelated files in that directory.
 
 The offline importer and `dw-query publish --catalog FILE --store DIRECTORY` create the validated store separately. Loading pins a complete snapshot for each query. A lifecycle-tracked monitor adopts published updates and rollbacks within about one second; in-flight queries retain their original catalog. Startup can recover the recorded previous snapshot if the current one is corrupt. Local operator commands `stage`, `review`, `approve`, `discard`, `rollback`, `backup`, `restore` and `recover` manage candidate review and recovery. Approvals require the exact active and candidate SHA-256 pair. Backup output must be an absent directory; restore preserves original source validation timestamps.
 
@@ -16,14 +16,14 @@ Version 0.3.0 writes a versioned active/previous pointer. Older 0.2.x executable
 
 The host must enable member-read access and configure the wiki citation prefix `https://dandys-world-robloxhorror.fandom.com/index.php?oldid=`. The host owns guild/channel/role policy, quotas, interaction destinations and mention suppression. The module's six public typed routes are:
 
-- `/dw search query:Pebble` — find entities and exact IDs.
+- `/dw search query:Pebble` — find entities and choose a result.
 - `/dw lookup name:Pebble kind:toon field:health` — show sourced facts.
 - `/dw compare left:EXACT_ID right:EXACT_ID field:health` — compare compatible fields.
 - `/dw ask question:How does research work?` — supported deterministic game questions.
-- `/dw sources name:Pebble kind:toon` — wiki revisions and validation timestamps.
+- `/dw sources name:Pebble kind:toon` — wiki sources and when they were checked.
 - `/dw status` — cached catalog availability.
 
-`lookup` and `sources` accept an `offset` copied from the previous reply; retain the other options. Entity kind distinguishes Toons, Twisteds, NPCs, floors, machines, mechanics, trinkets, items, events and other topics. Exact IDs also resolve ambiguity. The private `health` operation is operator-only and has no public route. No operation exposes AI tools, grants, storage callbacks or arbitrary JSON options to members.
+Replies use Discord cards with an answer first and wiki links below it. Dropdowns resolve ambiguous names and select details; Next and Back navigate without typing IDs or offsets. Ask a question opens a text form. Controls belong to the person who opened the card and expire after ten minutes or a module reload. `lookup` and `sources` also accept an `offset` for direct command use. Entity kind distinguishes Toons, Twisteds, NPCs, floors, machines, mechanics, trinkets, items, events and other topics. Exact IDs also resolve ambiguity. The private `health` operation is operator-only and has no public route. No operation exposes AI tools, grants, storage callbacks or arbitrary JSON options to members.
 
 Replies preserve complete facts, their conditions, uncertainty warnings and all cited source revisions. Oversized facts or facts needing more than five citations produce an explicit wiki navigation link without a partial game claim. Comparisons keep both sides together. Cached data older than the core's refusal window is not presented as a verified current fact. Wiki-derived text is attributed to wiki contributors under CC BY-SA 3.0; imported corpus files remain separate from this source package.
 

@@ -53,26 +53,75 @@ fn lookup(offset: usize) -> QueryRequest {
     }
 }
 fn assert_bounded(reply: &presentation::Reply) {
-    assert!(reply.text.encode_utf16().count() <= 1800);
+    fn size(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+    assert!(size(&reply.text) <= 1800);
     assert!(reply.citations.len() <= 5);
-    let rendered = format!(
-        "{}{}",
-        reply.text,
+    assert!(size(&reply.card.title) <= 256);
+    assert!(size(&reply.card.description) <= 4096);
+    assert!(reply.card.fields.len() <= 20);
+    assert!(
         reply
+            .card
+            .fields
+            .iter()
+            .all(|f| size(&f.value) <= 1024 && size(&f.name) <= 256)
+    );
+    let total = size(&reply.card.title)
+        + size(&reply.card.description)
+        + size(&reply.card.footer)
+        + reply
+            .card
+            .fields
+            .iter()
+            .map(|f| size(&f.name) + size(&f.value))
+            .sum::<usize>()
+        + reply
             .citations
             .iter()
-            .map(|c| format!(
-                "\n[{}]({SOURCE_ORIGIN}/index.php?oldid={})",
-                c.label, c.revision
-            ))
-            .collect::<String>()
-    );
-    assert!(
-        rendered.encode_utf16().count() <= 1900,
-        "{}",
-        rendered.len()
-    );
+            .map(|r| size(&r.label) + 120)
+            .sum::<usize>();
+    assert!(total < 6000, "card uses {total} UTF-16 units");
+    assert!(reply.buttons.len() <= 5);
+    assert!(reply.choices.len() <= 25);
+    for choice in &reply.choices {
+        assert!(size(&choice.label) <= 80 && size(&choice.description) <= 100);
+        assert!(
+            request(&choice.route, choice.options.clone()).is_ok(),
+            "invalid choice: {:?}",
+            choice
+        );
+    }
+    for button in &reply.buttons {
+        let mut options = button.options.clone();
+        if let Some(prompt) = &button.prompt {
+            assert!(prompt.max_length <= 200);
+            options[&prompt.option] = json!(prompt.placeholder);
+        }
+        assert!(
+            request(&button.route, options).is_ok(),
+            "invalid button: {:?}",
+            button
+        );
+    }
 }
+
+fn display(reply: &presentation::Reply) -> String {
+    format!(
+        "{} {} {}",
+        reply.card.title,
+        reply.card.description,
+        reply
+            .card
+            .fields
+            .iter()
+            .map(|f| f.value.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 struct Host(AtomicUsize);
 #[async_trait]
 impl RpcHandler for Host {
@@ -178,7 +227,7 @@ async fn sdk_lifecycle_requires_snapshot_and_fences_queries_without_callbacks() 
         reply["reply"]["text"]
             .as_str()
             .unwrap()
-            .contains("Value: 2")
+            .contains("2 hearts")
     );
     assert_eq!(reply["reply"]["citations"][0]["revision"], 2);
     assert!(
@@ -231,14 +280,14 @@ async fn snapshot_monitor_adopts_publication_and_rollback_with_pinned_readers() 
         module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
             .as_str()
             .unwrap()
-            .contains("Value: 9")
+            .contains("9 hearts")
     );
     let old_reply = pinned.engine.execute(lookup(0), NOW).unwrap();
     assert_eq!(old_reply.snapshot_id, first.id);
     assert!(
         presentation::render(&lookup(0), &old_reply)
             .text
-            .contains("Value: 2")
+            .contains("2 hearts")
     );
     store.rollback().unwrap();
     wait_for_snapshot(&module, &first.id).await;
@@ -246,7 +295,7 @@ async fn snapshot_monitor_adopts_publication_and_rollback_with_pinned_readers() 
         module.query("lookup", json!({"name":"Rock"}), NOW).unwrap()["reply"]["text"]
             .as_str()
             .unwrap()
-            .contains("Value: 2")
+            .contains("2 hearts")
     );
     h.close().await;
     store
@@ -355,8 +404,8 @@ fn renderer_keeps_complete_fact_conditions_and_evidence() {
     let req = lookup(0);
     let reply = presentation::render(&req, &response(catalog(), req.clone(), NOW));
     assert!(reply.text.contains("Fixture hearts"));
-    assert!(reply.text.contains("Conditions: base"));
-    assert!(reply.text.contains("Value: 2"));
+    assert!(reply.text.contains("Applies when: base"));
+    assert!(reply.text.contains("2 hearts"));
     assert_eq!(reply.citations[0].revision, 2);
     assert_bounded(&reply);
 }
@@ -366,8 +415,8 @@ fn renderer_does_not_claim_conflicting_or_stale_values() {
     data.entities[0].facts[0].state = dandys_world_core::model::EvidenceState::Conflicting;
     let req = lookup(0);
     let reply = presentation::render(&req, &response(data, req.clone(), NOW));
-    assert!(reply.text.contains("Conflicting"));
-    assert!(!reply.text.contains("Value: 2"));
+    assert!(reply.text.contains("sources disagree"));
+    assert!(!reply.text.contains("2 hearts"));
     assert!(!reply.text.contains("Fixture hearts"));
     assert_eq!(reply.citations.len(), 1);
     assert_bounded(&reply);
@@ -375,14 +424,14 @@ fn renderer_does_not_claim_conflicting_or_stale_values() {
         &req,
         &response(catalog(), req.clone(), NOW + 8 * 86_400_000),
     );
-    assert!(!reply.text.contains("Value: 2"));
+    assert!(!reply.text.contains("2 hearts"));
     assert!(reply.text.contains("seven days"));
     assert_bounded(&reply);
 }
 #[test]
 fn oversized_fact_falls_back_without_truncating_claim_and_offers_next_offset() {
     let mut data = catalog();
-    data.entities[0].facts[0].text = "oversized claim ".repeat(200);
+    data.entities[0].facts[0].text = "oversized claim ".repeat(1000);
     let mut second = data.entities[0].facts[0].clone();
     second.id = "second".into();
     second.key = "z_field".into();
@@ -391,13 +440,19 @@ fn oversized_fact_falls_back_without_truncating_claim_and_offers_next_offset() {
     let req = lookup(0);
     let reply = presentation::render(&req, &response(data.clone(), req.clone(), NOW));
     assert!(!reply.text.contains("oversized claim"));
-    assert!(reply.text.contains("consult the linked wiki"));
-    assert!(reply.text.contains("offset:1"));
+    assert!(reply.text.contains("Open the wiki source"));
+    assert!(
+        reply
+            .buttons
+            .iter()
+            .any(|b| b.label == "Next" && b.options["offset"] == 1)
+    );
     assert_eq!(reply.citations.len(), 1);
     assert_bounded(&reply);
     let req = lookup(1);
     let reply = presentation::render(&req, &response(data, req.clone(), NOW));
     assert!(reply.text.contains("Second complete fact"));
+    assert!(!reply.buttons.iter().any(|b| b.label == "Previous"));
     assert!(!reply.text.contains("offset:"));
     assert_bounded(&reply);
 }
@@ -410,16 +465,21 @@ fn lookup_and_sources_pagination_use_number_actually_shown() {
         let mut fact = base.clone();
         fact.id = format!("f{i}");
         fact.key = format!("field{i}");
-        fact.text = format!("Full fact {i}: {}", "detail ".repeat(50));
+        fact.text = format!("Full fact {i}: {}", "detail ".repeat(110));
         data.entities[0].facts.push(fact);
     }
     let req = lookup(0);
     let reply = presentation::render(&req, &response(data, req.clone(), NOW));
     let count = (0..8)
-        .filter(|i| reply.text.contains(&format!("Full fact {i}:")))
+        .filter(|i| display(&reply).contains(&format!("Full fact {i}:")))
         .count();
     assert!(count > 0 && count < 8);
-    assert!(reply.text.contains(&format!("offset:{count}")));
+    assert!(
+        reply
+            .buttons
+            .iter()
+            .any(|b| b.label == "Next" && b.options["offset"] == count)
+    );
     assert_bounded(&reply);
     let mut data = catalog();
     let base = data.sources[0].clone();
@@ -438,7 +498,12 @@ fn lookup_and_sources_pagination_use_number_actually_shown() {
     };
     let reply = presentation::render(&req, &response(data, req.clone(), NOW));
     assert_eq!(reply.citations.len(), 5);
-    assert!(reply.text.contains("offset:5"));
+    assert!(
+        reply
+            .buttons
+            .iter()
+            .any(|b| b.label == "Next" && b.options["offset"] == 5)
+    );
     assert_bounded(&reply);
 }
 #[test]
@@ -458,7 +523,7 @@ fn excessive_evidence_uses_navigation_fallback_without_partial_fact() {
     let req = lookup(0);
     let reply = presentation::render(&req, &response(data, req.clone(), NOW));
     assert!(!reply.text.contains("Fixture hearts"));
-    assert!(reply.text.contains("No game fact"));
+    assert!(reply.text.contains("too long to show completely"));
     assert_eq!(reply.citations.len(), 1);
     assert_bounded(&reply);
 }
@@ -478,11 +543,11 @@ fn comparisons_keep_both_complete_sides_or_show_no_claim() {
         field: Some("health".into()),
     };
     let reply = presentation::render(&req, &response(data.clone(), req.clone(), NOW));
-    assert!(reply.text.contains("Value: 2") && reply.text.contains("Value: 3"));
+    assert!(reply.text.contains("2 hearts") && reply.text.contains("3 hearts"));
     assert_bounded(&reply);
-    data.entities[1].facts[0].text = "huge ".repeat(400);
+    data.entities[1].facts[0].text = "huge ".repeat(2000);
     let reply = presentation::render(&req, &response(data, req.clone(), NOW));
-    assert!(!reply.text.contains("Value: 2") && !reply.text.contains("Value: 3"));
+    assert!(!reply.text.contains("2 hearts") && !reply.text.contains("3 hearts"));
     assert_bounded(&reply);
 }
 #[test]
@@ -578,18 +643,18 @@ async fn status_and_health_report_pinned_snapshot_metadata_without_paths() {
     for operation in ["status", "health"] {
         let result = h.invoke(operation, json!({})).await.unwrap();
         let text = result["reply"]["text"].as_str().unwrap();
-        assert!(text.contains(&first.id));
-        assert!(text.contains("Entities: 1; source pages: 2."));
         if operation == "health" {
+            assert!(text.contains(&first.id));
+            assert!(text.contains("Entities: 1; source pages: 2."));
             assert!(text.contains(&format!("oldest {}; latest {}", NOW - 1000, NOW)));
             assert!(text.contains("Schema: 1"));
             assert!(text.contains("Unknown/unverified facts:"));
             assert!(text.contains("Last observed disk bytes:"));
             assert!(text.contains("Module queries:"));
         } else {
-            assert!(text.contains("minutes ago") || text.contains("dated in the future"));
+            assert_eq!(result["reply"]["card"]["title"], "Dandy’s World guide");
+            assert!(!text.contains(&first.id));
         }
-        assert!(text.contains("Network refresh: Disabled"));
         assert!(!text.contains(dir.0.to_str().unwrap()));
         assert!(!text.contains("data_directory"));
         assert!(text.encode_utf16().count() <= 1800);
@@ -608,9 +673,9 @@ async fn status_and_health_report_pinned_snapshot_metadata_without_paths() {
     assert_ne!(first.id, second.id);
     let old_status = module.query("status", json!({}), NOW).unwrap();
     let text = old_status["reply"]["text"].as_str().unwrap();
-    assert!(text.contains(&first.id));
+    assert!(!text.contains(&first.id));
     assert!(!text.contains(&second.id));
-    assert!(text.contains("oldest 0 minutes ago; newest 0 minutes ago"));
+    assert_eq!(old_status["reply"]["card"]["title"], "Dandy’s World guide");
     let cached = module
         .query("status", json!({}), NOW + 2 * 86_400_000)
         .unwrap();
@@ -618,7 +683,7 @@ async fn status_and_health_report_pinned_snapshot_metadata_without_paths() {
         cached["reply"]["text"]
             .as_str()
             .unwrap()
-            .contains("cached sources")
+            .contains("2 days ago")
     );
     h.close().await;
     let module = Arc::new(DwModule::default());
@@ -758,7 +823,7 @@ async fn stalled_refresh_keeps_queries_available_and_shutdown_reaps_worker() {
         .await
         .unwrap()
         .unwrap();
-    assert!(reply["reply"]["text"].as_str().unwrap().contains(&first.id));
+    assert_eq!(reply["reply"]["card"]["title"], "Dandy’s World guide");
     h.close().await;
     assert!(
         !PathBuf::from(format!("/proc/{pid}")).exists(),
@@ -824,7 +889,7 @@ async fn scheduled_candidate_requires_review_before_serving_changed_facts() {
             .unwrap()["reply"]["text"]
             .as_str()
             .unwrap()
-            .contains("Value: 9")
+            .contains("9 hearts")
     );
     h.close().await;
 }
@@ -856,4 +921,182 @@ async fn server_retry_floor_survives_worker_and_scheduler_boundaries() {
     assert!(state["last_success_ms"].is_null());
     assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
     h.close().await;
+}
+
+#[test]
+fn ambiguous_choices_keep_requested_field_and_compare_side() {
+    let mut data = catalog();
+    let mut other = data.entities[0].clone();
+    other.id = "twisted:fixture".into();
+    other.kind = dandys_world_core::model::Kind::Twisted;
+    other.name = "Twisted Rock".into();
+    other.aliases = vec!["Rock".into()];
+    data.entities.push(other);
+    let req = QueryRequest::Ask {
+        question: "What is Rock's health?".into(),
+    };
+    let r = response(data.clone(), req.clone(), NOW);
+    let reply = presentation::render(&req, &r);
+    assert_eq!(reply.card.title, "Which one did you mean?");
+    assert_eq!(reply.choices.len(), 2);
+    assert!(
+        reply
+            .choices
+            .iter()
+            .all(|c| c.route == "lookup" && c.options["field"] == "health")
+    );
+    assert!(
+        reply
+            .choices
+            .iter()
+            .any(|c| c.options["name"] == "twisted:fixture")
+    );
+    assert!(!reply.text.contains("exact ID"));
+    for (left, right, selection, retained) in [
+        ("Rock", "toon:fixture", "left", "right"),
+        ("toon:fixture", "Rock", "right", "left"),
+    ] {
+        let req = QueryRequest::Compare {
+            left: left.into(),
+            right: right.into(),
+            field: Some("health".into()),
+        };
+        let reply = presentation::render(&req, &response(data.clone(), req.clone(), NOW));
+        assert!(reply.choices.iter().all(|c| c.route == "compare"
+            && c.options["field"] == "health"
+            && c.options[retained] == "toon:fixture"));
+        assert!(
+            reply
+                .choices
+                .iter()
+                .any(|c| c.options[selection] == "twisted:fixture")
+        );
+        assert!(
+            reply
+                .choices
+                .iter()
+                .all(|c| c.options.get("kind").is_none())
+        );
+    }
+}
+
+#[test]
+fn canonical_health_is_readable_without_losing_heart_exception() {
+    let mut data = catalog();
+    let f = &mut data.entities[0].facts[0];
+    f.text = "Maximum starting health: 2 hearts. Main Heart decoration is not counted.".into();
+    f.conditions = vec!["maximum starting health as shown by normal Heart slots".into()];
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(display(&reply).contains("❤️❤️ 2 starting hearts"));
+    assert!(display(&reply).contains("decorative Main Heart does not add health"));
+    assert!(!display(&reply).contains("Applies when"));
+    assert_eq!(reply.citations[0].revision, 2);
+    let ask = reply
+        .buttons
+        .iter()
+        .find(|b| b.label == "Ask a question")
+        .unwrap();
+    assert_eq!(ask.route, "ask");
+    assert_eq!(ask.prompt.as_ref().unwrap().option, "question");
+}
+
+#[test]
+fn large_fact_is_complete_across_card_fields_or_not_shown_at_all() {
+    let mut data = catalog();
+    let text = "A complete long fixture sentence. ".repeat(70);
+    data.entities[0].facts[0].text = text.clone();
+    let req = lookup(0);
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    let joined = reply
+        .card
+        .fields
+        .iter()
+        .map(|f| f.value.as_str())
+        .collect::<String>();
+    assert!(joined.contains(&text));
+    assert!(reply.card.fields.len() > 1);
+    assert_eq!(reply.citations.len(), 1);
+    assert_bounded(&reply);
+}
+
+#[test]
+fn incompatible_comparison_offers_working_adjustments_not_entity_choices() {
+    let mut data = catalog();
+    let mut other = data.entities[0].clone();
+    other.id = "toon:other".into();
+    other.name = "Other".into();
+    other.aliases.clear();
+    other.facts[0].conditions = vec!["different situation".into()];
+    data.entities.push(other);
+    let req = QueryRequest::Compare {
+        left: "toon:fixture".into(),
+        right: "toon:other".into(),
+        field: Some("health".into()),
+    };
+    let reply = presentation::render(&req, &response(data, req.clone(), NOW));
+    assert!(reply.choices.is_empty());
+    assert!(reply.buttons.iter().any(|b| b.label == "Choose a detail"));
+    assert_bounded(&reply);
+}
+
+#[test]
+fn markdown_expansion_and_display_controls_keep_complete_facts_host_safe() {
+    let mut data = catalog();
+    let raw = format!("\u{200e}{}\u{202a}", "*_[x](y)#|~` ".repeat(180));
+    data.entities[0].facts[0].text = raw.clone();
+    data.entities[0].facts[0].value = json!(null);
+    data.entities[0].facts[0].conditions.clear();
+    let req = lookup(0);
+    let response = response(data, req.clone(), NOW);
+    let reply = presentation::render(&req, &response);
+    let joined = reply
+        .card
+        .fields
+        .iter()
+        .map(|f| f.value.as_str())
+        .collect::<String>();
+    assert_eq!(joined, raw.replace(['\u{200e}', '\u{202a}'], ""));
+    assert_eq!(
+        response.answer_blocks[0].text, raw,
+        "raw evidence is unchanged"
+    );
+    assert!(!reply.text.contains(['\u{200e}', '\u{202a}']));
+    for field in &reply.card.fields {
+        let rendered = field
+            .value
+            .chars()
+            .map(|c| c.len_utf16() + usize::from("\\*_~`[]()#|".contains(c)))
+            .sum::<usize>();
+        assert!(rendered <= 1024, "escaped field length {rendered}");
+    }
+    assert!(reply.card.fields.len() >= 4);
+    assert_bounded(&reply);
+}
+
+#[test]
+fn citation_field_reserves_one_of_the_twenty_host_field_slots() {
+    let req = lookup(0);
+    let mut response = response(catalog(), req.clone(), NOW);
+    let mut block = response.answer_blocks[0].clone();
+    block.text = "Short detail".into();
+    block.value = json!(null);
+    block.conditions.clear();
+    response.answer_blocks = (0..25)
+        .map(|i| {
+            let mut b = block.clone();
+            b.key = format!("detail{i}");
+            b
+        })
+        .collect();
+    let reply = presentation::render(&req, &response);
+    assert_eq!(reply.card.fields.len(), 19);
+    assert_eq!(reply.citations.len(), 1);
+    assert!(
+        reply
+            .buttons
+            .iter()
+            .any(|b| b.label == "Next" && b.options["offset"] == 19)
+    );
+    assert_bounded(&reply);
 }
