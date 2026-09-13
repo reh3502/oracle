@@ -415,6 +415,147 @@ impl<'de> Deserialize<'de> for ModuleManifest {
     }
 }
 
+/// Shared literal HTTPS image policy for operator settings and response rendering.
+/// Prefixes accept no escaped paths, credentials, ports, queries or
+/// fragments. Validating a URL does not fetch it.
+pub fn validate_module_image_prefix(prefix: &str) -> crate::Result<()> {
+    let invalid = || crate::Error::new(crate::ErrorCode::InvalidInput);
+    if prefix.len() > 1024 || !prefix.ends_with('/') {
+        return Err(invalid());
+    }
+    let path = module_image_path(prefix)?;
+    let path = path.strip_suffix('/').ok_or_else(invalid)?;
+    if path.is_empty() || !ordinary_image_path(path) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn ordinary_image_path(path: &str) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/._~-".contains(&b))
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+fn module_image_path(url: &str) -> crate::Result<&str> {
+    let invalid = || crate::Error::new(crate::ErrorCode::InvalidInput);
+    let (host, path) = url
+        .strip_prefix("https://")
+        .and_then(|s| s.split_once('/'))
+        .ok_or_else(invalid)?;
+    if host.len() > 253
+        || host.is_empty()
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(path)
+}
+/// An image must remain under the exact configured prefix. The only optional
+/// query is a numeric cache revision; no arbitrary fetch destination is accepted.
+/// Errors contain no module-controlled URL text.
+pub fn validate_module_image_url(url: &str, prefix: &str) -> crate::Result<()> {
+    validate_module_image_prefix(prefix)?;
+    let invalid = || crate::Error::new(crate::ErrorCode::InvalidInput);
+    if url.len() > 2048 || !url.starts_with(prefix) {
+        return Err(invalid());
+    }
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(base, query)| (base, Some(query)));
+    if let Some(query) = query {
+        let revision = query.strip_prefix("cb=").ok_or_else(invalid)?;
+        if revision.is_empty()
+            || revision.len() > 20
+            || !revision.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+    }
+    let raw_path = module_image_path(base)?;
+    let mut segments = Vec::new();
+    for segment in raw_path.split('/') {
+        if segment.is_empty() {
+            return Err(invalid());
+        }
+        let mut decoded = Vec::new();
+        let mut bytes = segment.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let hi = bytes
+                    .next()
+                    .and_then(|b| (b as char).to_digit(16))
+                    .ok_or_else(invalid)?;
+                let lo = bytes
+                    .next()
+                    .and_then(|b| (b as char).to_digit(16))
+                    .ok_or_else(invalid)?;
+                let value = (hi * 16 + lo) as u8;
+                // Never allow decoding to introduce separators or another escape.
+                if b"/\\%?#:@".contains(&value) {
+                    return Err(invalid());
+                }
+                decoded.push(value);
+            } else if byte.is_ascii_alphanumeric() || b"._~-".contains(&byte) {
+                decoded.push(byte);
+            } else {
+                return Err(invalid());
+            }
+        }
+        let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
+        if decoded.trim().is_empty() || matches!(decoded.as_str(), "." | "..")
+            || decoded.chars().any(|c| c.is_control() || matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')) {
+            return Err(invalid());
+        }
+        segments.push(decoded);
+    }
+    let raster = |segment: &str| {
+        segment.rsplit_once('.').is_some_and(|(name, ext)| {
+            !name.is_empty()
+                && matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif"
+                )
+        })
+    };
+    let valid = segments.iter().enumerate().any(|(index, segment)| {
+        if !raster(segment) {
+            return false;
+        }
+        match &segments[index + 1..] {
+            [] => true,
+            [revision, latest] => revision == "revision" && latest == "latest",
+            [revision, latest, scale, size] => {
+                revision == "revision"
+                    && latest == "latest"
+                    && scale == "scale-to-width-down"
+                    && size.bytes().all(|b| b.is_ascii_digit())
+                    && size.parse::<u16>().is_ok_and(|n| (1..=4096).contains(&n))
+            }
+            _ => false,
+        }
+    });
+    if !valid {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::*;

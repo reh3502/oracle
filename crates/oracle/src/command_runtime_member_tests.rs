@@ -124,6 +124,7 @@ async fn typed_members_keep_operator_policy_citations_and_lifecycle_response_fen
             BTreeMap::from([(
                 module.clone(),
                 ModuleRuntimeSettings {
+                    image_prefix: None,
                     data_directory: Some(directory.clone()),
                     citation_prefix: Some(
                         "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=".into(),

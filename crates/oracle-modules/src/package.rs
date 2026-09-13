@@ -391,9 +391,10 @@ fn validate_card_presentation(pointer: &str, schema: &Value) -> Result<()> {
             .is_some_and(|r| r.contains(&serde_json::json!("reply")))
         || reply["type"] != "object"
         || reply["additionalProperties"] != false
-        || !reply["properties"]
-            .as_object()
-            .is_some_and(|p| p.len() == names.len() && names.iter().all(|n| p.contains_key(*n)))
+        || !reply["properties"].as_object().is_some_and(|p| {
+            (p.len() == names.len() || (p.len() == names.len() + 1 && p.contains_key("image")))
+                && names.iter().all(|n| p.contains_key(*n))
+        })
         || !reply["required"].as_array().is_some_and(|r| {
             r.len() == names.len() && names.iter().all(|n| r.contains(&serde_json::json!(n)))
         })
@@ -402,6 +403,22 @@ fn validate_card_presentation(pointer: &str, schema: &Value) -> Result<()> {
         || ["citations", "buttons", "choices"]
             .iter()
             .any(|n| reply["properties"][n]["type"] != "array")
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
+    if let Some(image) = reply["properties"].get("image")
+        && (image["type"] != "object"
+            || image["additionalProperties"] != false
+            || !image["properties"].as_object().is_some_and(|p| {
+                p.len() == 2 && p.contains_key("url") && p.contains_key("revision")
+            })
+            || !image["required"].as_array().is_some_and(|r| {
+                r.len() == 2
+                    && r.contains(&serde_json::json!("url"))
+                    && r.contains(&serde_json::json!("revision"))
+            })
+            || image["properties"]["url"]["type"] != "string"
+            || image["properties"]["revision"]["type"] != "integer")
     {
         return Err(err(ErrorCode::InvalidInput));
     }
@@ -421,7 +438,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         semver::VersionReq::parse(&manifest.host_api).map_err(|_| err(ErrorCode::Compatibility))?;
     if !host.matches(&semver::Version::new(
         1,
-        if manifest.manifest_version == 2 { 2 } else { 0 },
+        if manifest.manifest_version == 2 { 3 } else { 0 },
         0,
     )) || (manifest.manifest_version == 2
         && (host.matches(&semver::Version::new(1, 0, 0))
@@ -438,6 +455,23 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     if uses_cards
         && (host.matches(&semver::Version::new(1, 1, 0))
             || host.matches(&semver::Version::new(1, 1, u64::MAX)))
+    {
+        return Err(err(ErrorCode::Compatibility));
+    }
+    let uses_images = manifest.commands.as_ref().is_some_and(|commands| {
+        commands.routes.iter().any(|route| {
+            matches!(route.presentation, Some(ModulePresentation::CardV1 { .. }))
+                && manifest.operations.iter().any(|op| {
+                    op.name == route.operation
+                        && op.output_schema["properties"]["reply"]["properties"]
+                            .get("image")
+                            .is_some()
+                })
+        })
+    });
+    if uses_images
+        && (host.matches(&semver::Version::new(1, 2, 0))
+            || host.matches(&semver::Version::new(1, 2, u64::MAX)))
     {
         return Err(err(ErrorCode::Compatibility));
     }
@@ -1372,6 +1406,28 @@ mod tests {
         manifest.host_api = "^1.2".into();
         manifest.operations[0].output_schema["properties"]["reply"]["additionalProperties"] =
             json!(true);
+        assert!(validate_manifest(&manifest).is_err());
+    }
+    #[test]
+    fn optional_image_schema_requires_host_1_3_and_exact_metadata_shape() {
+        let mut manifest = member_manifest();
+        manifest.host_api = "^1.3".into();
+        manifest.commands.as_mut().unwrap().routes[0].presentation =
+            Some(ModulePresentation::CardV1 {
+                pointer: "/reply".into(),
+            });
+        let reply = &mut manifest.operations[0].output_schema["properties"]["reply"];
+        reply["required"] = json!(["text", "card", "citations", "buttons", "choices"]);
+        reply["properties"]["card"] = json!({"type":"object"});
+        reply["properties"]["buttons"] = json!({"type":"array"});
+        reply["properties"]["choices"] = json!({"type":"array"});
+        reply["properties"]["image"] = json!({"type":"object","additionalProperties":false,"required":["url","revision"],"properties":{"url":{"type":"string"},"revision":{"type":"integer"}}});
+        validate_manifest(&manifest).unwrap();
+        manifest.host_api = "^1.2".into();
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.host_api = "^1.3".into();
+        manifest.operations[0].output_schema["properties"]["reply"]["properties"]["image"]["properties"]
+            ["source_url"] = json!({"type":"string"});
         assert!(validate_manifest(&manifest).is_err());
     }
     #[test]

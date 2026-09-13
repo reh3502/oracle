@@ -212,6 +212,7 @@ async fn run(postgres: bool) {
             BTreeMap::from([(
                 module.clone(),
                 ModuleRuntimeSettings {
+                    image_prefix: None,
                     data_directory: Some(directory.clone()),
                     citation_prefix: Some(PREFIX.into()),
                 },

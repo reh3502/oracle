@@ -2,7 +2,7 @@
 //! Run with ORACLE_CARD_REPLIES=/absolute/replies.jsonl cargo test -p
 //! oracle-operations --test card_corpus -- --ignored --nocapture.
 use oracle_core::ModuleCommandRoute;
-use oracle_operations::published::render_card;
+use oracle_operations::published::render_card_with_images;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -52,10 +52,11 @@ fn every_corpus_reply_renders_within_discord_limits() {
             index + 1
         );
         case_count += 1;
-        let rendered = match render_card(
+        let rendered = match render_card_with_images(
             &route,
             &row.result,
             Some("https://dandys-world-robloxhorror.fandom.com/index.php?oldid="),
+            Some("https://static.wikia.nocookie.net/dandys-world-robloxhorror/images/"),
         ) {
             Ok(Some(card)) => card,
             other => {

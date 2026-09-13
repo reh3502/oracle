@@ -278,7 +278,7 @@ pub async fn invoke_published_options(
     use oracle_core::ModuleAudience;
     use oracle_operations::{
         ingress::PublishedReply,
-        published::{decode_input, render_card, render_presentation},
+        published::{decode_input, render_card_with_images, render_presentation},
     };
     let entry =
         resolve_published_entry(manager, reconciler, actor, member, guild, &request).await?;
@@ -301,6 +301,9 @@ pub async fn invoke_published_options(
     let prefix = settings
         .as_ref()
         .and_then(|settings| settings.citation_prefix.as_deref());
+    let image_prefix = settings
+        .as_ref()
+        .and_then(|settings| settings.image_prefix.as_deref());
     if operation.audience == ModuleAudience::MemberRead {
         let invocation = manager
             .invoke_member_bound(
@@ -314,7 +317,7 @@ pub async fn invoke_published_options(
                 entry.epoch,
             )
             .await?;
-        let card = render_card(route, &invocation.value, prefix)?;
+        let card = render_card_with_images(route, &invocation.value, prefix, image_prefix)?;
         if let Some(card) = &card {
             validate_card_actions(card, &entry)?;
         }
@@ -354,7 +357,7 @@ pub async fn invoke_published_options(
                 entry.epoch,
             )
             .await?;
-        let card = render_card(route, &value, prefix)?;
+        let card = render_card_with_images(route, &value, prefix, image_prefix)?;
         // Interactive presentation is reserved for member-read routes.
         if card.is_some() {
             return Err(Error::new(ErrorCode::Compatibility));

@@ -17,6 +17,8 @@ pub struct ModuleRuntimeSettings {
     pub data_directory: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citation_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_prefix: Option<String>,
 }
 
 fn invalid() -> Error {
@@ -104,6 +106,9 @@ pub fn prepare_runtime_settings(
         .any(|setting| setting.data_directory.is_some())
     {
         for setting in settings.values() {
+            if let Some(prefix) = &setting.image_prefix {
+                oracle_core::validate_module_image_prefix(prefix)?;
+            }
             if let Some(prefix) = &setting.citation_prefix {
                 validate_citation_prefix(prefix)?;
             }
@@ -123,6 +128,9 @@ pub fn prepare_runtime_settings(
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut directories = Vec::new();
     for setting in settings.values() {
+        if let Some(prefix) = &setting.image_prefix {
+            oracle_core::validate_module_image_prefix(prefix)?;
+        }
         if let Some(prefix) = &setting.citation_prefix {
             validate_citation_prefix(prefix)?;
         }
@@ -250,6 +258,7 @@ mod tests {
             BTreeMap::from([(
                 serde_json::from_str("\"game.test\"").unwrap(),
                 ModuleRuntimeSettings {
+                    image_prefix: None,
                     data_directory: Some(path),
                     citation_prefix: Some("https://wiki.example.test/w/index.php?oldid=".into()),
                 },
@@ -297,6 +306,7 @@ mod tests {
         settings.insert(
             serde_json::from_str("\"other.game\"").unwrap(),
             ModuleRuntimeSettings {
+                image_prefix: None,
                 data_directory: Some(temp.0.join("packages/game")),
                 citation_prefix: None,
             },
@@ -332,6 +342,7 @@ mod tests {
         settings.insert(
             serde_json::from_str("\"other.game\"").unwrap(),
             ModuleRuntimeSettings {
+                image_prefix: None,
                 data_directory: Some(temp.0.join("data")),
                 citation_prefix: None,
             },
@@ -419,5 +430,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn optional_image_policy_is_validated_even_without_a_data_directory() {
+        let module: ModuleId = serde_json::from_str("\"game.test\"").unwrap();
+        let old: ModuleRuntimeSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.image_prefix.is_none());
+        let mut settings = BTreeMap::from([(
+            module.clone(),
+            ModuleRuntimeSettings {
+                image_prefix: Some("https://cdn.example.test/wiki/images/".into()),
+                ..ModuleRuntimeSettings::default()
+            },
+        )]);
+        prepare_runtime_settings(&settings, Path::new("/unused"), &[], 0).unwrap();
+        settings.get_mut(&module).unwrap().image_prefix = Some("https://cdn.example.test/".into());
+        assert!(prepare_runtime_settings(&settings, Path::new("/unused"), &[], 0).is_err());
     }
 }

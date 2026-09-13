@@ -1,4 +1,4 @@
-//! Bounded, host-owned rich replies. Modules never supply Discord payloads or URLs.
+//! Bounded, host-owned rich replies. Modules never supply raw Discord payloads.
 use oracle_core::{Error, ErrorCode, ModuleCommandRoute, ModulePresentation, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -47,6 +47,14 @@ struct Reply {
     citations: Vec<Citation>,
     buttons: Vec<CardButton>,
     choices: Vec<CardChoice>,
+    #[serde(default)]
+    image: Option<CardImage>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CardImage {
+    url: String,
+    revision: u64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +164,16 @@ pub fn render_card(
     result: &Value,
     citation_prefix: Option<&str>,
 ) -> Result<Option<CardPresentation>> {
+    render_card_with_images(route, result, citation_prefix, None)
+}
+/// Rich replies may include a thumbnail only under an explicit operator policy.
+/// The host forwards the validated URL to Discord; it never fetches the image.
+pub fn render_card_with_images(
+    route: &ModuleCommandRoute,
+    result: &Value,
+    citation_prefix: Option<&str>,
+    image_prefix: Option<&str>,
+) -> Result<Option<CardPresentation>> {
     let Some(ModulePresentation::CardV1 { pointer }) = &route.presentation else {
         return Ok(None);
     };
@@ -176,6 +194,12 @@ pub fn render_card(
     if let Some(prefix) = citation_prefix {
         super::published::validate_citation_prefix(prefix)?;
     }
+    if let Some(image) = &reply.image {
+        oracle_core::validate_module_image_url(&image.url, image_prefix.ok_or_else(invalid)?)?;
+        if image.revision == 0 || image.revision > SAFE_INTEGER as u64 {
+            return Err(invalid());
+        }
+    }
     let title = rich(&reply.card.title, 256, false)?;
     let description = rich(&reply.card.description, 4096, true)?;
     let footer = label(&reply.card.footer, 512, true)?;
@@ -187,7 +211,7 @@ pub fn render_card(
         total += len(&name) + len(&value);
         fields.push(json!({"name":name,"value":value,"inline":field.inline}));
     }
-    if !reply.citations.is_empty() {
+    if !reply.citations.is_empty() || reply.image.is_some() {
         let prefix = citation_prefix.ok_or_else(invalid)?;
         let mut links = Vec::new();
         for citation in reply.citations {
@@ -196,6 +220,9 @@ pub fn render_card(
             }
             let label = rich(&citation.label, 120, false)?;
             links.push(format!("[{label}]({prefix}{})", citation.revision));
+        }
+        if let Some(image) = &reply.image {
+            links.push(format!("[Image]({prefix}{})", image.revision));
         }
         let value = links.join(" · ");
         if len(&value) > 1024 || fields.len() >= 20 {
@@ -227,6 +254,9 @@ pub fn render_card(
         action(&choice.route, &choice.options)?;
     }
     let mut embed = json!({"title":title,"color":0x9678D3,"fields":fields});
+    if let Some(image) = reply.image {
+        embed["thumbnail"] = json!({"url":image.url});
+    }
     if !description.is_empty() {
         embed["description"] = json!(description);
     }
@@ -364,5 +394,110 @@ mod tests {
         let p = render(&r).unwrap().unwrap();
         assert_eq!(p.choices[0].label, "Dandy (Toon)");
         assert_eq!(p.choices[0].description, "Pick Dandy's toon.");
+    }
+    const IMAGE_PREFIX: &str = "https://cdn.example.test/wiki/images/";
+    fn with_image(url: &str) -> Value {
+        let mut value = reply();
+        value["reply"]["image"] = json!({"url":url,"revision":456});
+        value
+    }
+    fn image_render(value: &Value) -> Result<Option<CardPresentation>> {
+        render_card_with_images(
+            &route(),
+            value,
+            Some("https://example.org/index.php?oldid="),
+            Some(IMAGE_PREFIX),
+        )
+    }
+    #[test]
+    fn approved_images_are_preserved_and_credited_in_the_same_source_field() {
+        for path in [
+            "a/a1/Pebble.png",
+            "a/a1/Pebble.PNG/revision/latest?cb=20240806022953",
+            "a/a1/Pebble%20Render%C3%A9.png/revision/latest/scale-to-width-down/256?cb=20240806022953",
+        ] {
+            let url = format!("{IMAGE_PREFIX}{path}");
+            let mut value = with_image(&url);
+            value["reply"]["citations"] = json!([{"label":"Pebble","revision":123}]);
+            let rendered = image_render(&value).unwrap().unwrap();
+            assert_eq!(rendered.embed["thumbnail"]["url"], url);
+            let fields = rendered.embed["fields"].as_array().unwrap();
+            assert_eq!(fields.len(), 1);
+            let text = fields[0]["value"].as_str().unwrap();
+            assert!(text.contains("[Pebble](https://example.org/index.php?oldid=123)"));
+            assert!(text.contains("[Image](https://example.org/index.php?oldid=456)"));
+            assert!(!text.contains(&url));
+        }
+        let old = render(&reply()).unwrap().unwrap();
+        let current = image_render(&reply()).unwrap().unwrap();
+        assert_eq!(old.embed, current.embed);
+        assert!(old.embed.get("thumbnail").is_none());
+    }
+    #[test]
+    fn images_require_operator_permission_and_safe_numeric_attribution() {
+        let mut value = with_image(&format!("{IMAGE_PREFIX}a.png"));
+        assert!(render(&value).is_err());
+        assert!(render_card_with_images(&route(), &value, None, Some(IMAGE_PREFIX)).is_err());
+        for revision in [json!(0), json!(-1), json!(9007199254740992u64), json!(true)] {
+            value["reply"]["image"]["revision"] = revision;
+            assert!(image_render(&value).is_err());
+        }
+        value["reply"]["image"]["revision"] = json!(456);
+        value["reply"]["image"]["source_url"] = json!("https://evil.test");
+        assert!(image_render(&value).is_err());
+    }
+    #[test]
+    fn hostile_image_paths_and_prefixes_fail_without_url_disclosure() {
+        for prefix in [
+            "http://cdn.example.test/wiki/",
+            "https://cdn.example.test/",
+            "https://cdn.example.test/wiki",
+            "https://user@cdn.example.test/wiki/",
+            "https://cdn.example.test:443/wiki/",
+            "https://cdn.example.test/wiki/../",
+            "https://cdn.example.test/wiki/%2e/",
+            "https://cdn.example.test/wiki/?x=/",
+            "https://cdn.example.test/wiki/#/",
+        ] {
+            assert!(
+                oracle_core::validate_module_image_prefix(prefix).is_err(),
+                "{prefix}"
+            );
+        }
+        for path in [
+            "../a.png",
+            "%2e%2e/a.png",
+            "%252e%252e/a.png",
+            "x%2fa.png",
+            "x%5ca.png",
+            "a.png%00",
+            "a.png%0a",
+            "a%E2%80%AE.png",
+            "a.png?url=https://evil.test",
+            "a.png?cb=1&cb=2",
+            "a.png?cb=",
+            "a.png?cb=abc",
+            "a.png#fragment",
+            "a.svg",
+            "a.html",
+            "a.png/redirect/evil",
+            "a.png/revision/latest/scale-to-width-down/99999",
+            "a.png//revision/latest",
+            "a.png/revision/latest?cb=123#evil",
+            "a%GG.png",
+            "a%FF.png",
+        ] {
+            let url = format!("{IMAGE_PREFIX}{path}");
+            let error = image_render(&with_image(&url)).unwrap_err();
+            assert!(!format!("{error:?}").contains(&url));
+        }
+        for url in [
+            "https://evil.test/a.png",
+            "https://cdn.example.test.evil.test/wiki/images/a.png",
+            "https://cdn.example.test/wiki/images-other/a.png",
+            "https://cdn.example.test/wiki/images@evil.test/a.png",
+        ] {
+            assert!(image_render(&with_image(url)).is_err());
+        }
     }
 }
