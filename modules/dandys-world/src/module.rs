@@ -15,9 +15,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+struct LoadedCatalog {
+    engine: QueryEngine,
+    entity_count: usize,
+    source_count: usize,
+    oldest_validation_ms: u64,
+    latest_validation_ms: u64,
+}
 #[derive(Default)]
 struct DwModule {
-    engine: RwLock<Option<Arc<QueryEngine>>>,
+    // Metadata and query index are published and retained together.
+    engine: RwLock<Option<Arc<LoadedCatalog>>>,
 }
 fn request(operation: &str, input: Value) -> Result<QueryRequest> {
     if ![
@@ -54,9 +62,30 @@ impl DwModule {
             .unwrap()
             .clone()
             .ok_or_else(|| RpcError::Remote("Dandy's World snapshot is not loaded".into()))?;
-        let response = engine
+        let mut response = engine
+            .engine
             .execute(request.clone(), now)
             .map_err(|e| RpcError::Remote(e.to_string()))?;
+        if matches!(request, QueryRequest::Status {}) {
+            let checks = if operation == "health" {
+                format!(
+                    "Source validation timestamps (Unix milliseconds): oldest {}; latest {}.",
+                    engine.oldest_validation_ms, engine.latest_validation_ms
+                )
+            } else if engine.latest_validation_ms > now {
+                "Some source checks are dated in the future; check the host clock.".into()
+            } else {
+                format!(
+                    "Wiki checks: oldest {} minutes ago; newest {} minutes ago.",
+                    (now - engine.oldest_validation_ms) / 60_000,
+                    (now - engine.latest_validation_ms) / 60_000
+                )
+            };
+            response.message = format!(
+                "Loaded wiki snapshot: {}\nEntities: {}; source pages: {}.\n{}\nNetwork refresh: disabled.",
+                response.snapshot_id, engine.entity_count, engine.source_count, checks,
+            );
+        }
         Ok(json!({"reply":presentation::render(&request, &response)}))
     }
 }
@@ -78,7 +107,26 @@ impl Module for DwModule {
         }
         let directory = runtime.data_directory.filter(|p| p.is_absolute()).ok_or_else(|| RpcError::Remote("Configure an absolute Dandy's World runtime data_directory containing a published snapshot".into()))?;
         let snapshot = Store::new(directory).and_then(|s| s.load()).map_err(|_| RpcError::Remote("Cannot load Dandy's World snapshot; publish a validated catalog into its configured data directory".into()))?;
-        let engine = Arc::new(QueryEngine::new(snapshot.id, snapshot.data));
+        let engine = Arc::new(LoadedCatalog {
+            entity_count: snapshot.data.entities.len(),
+            source_count: snapshot.data.sources.len(),
+            // Store validation requires at least one source with a positive timestamp.
+            oldest_validation_ms: snapshot
+                .data
+                .sources
+                .iter()
+                .map(|s| s.validated_at_ms)
+                .min()
+                .expect("validated sources"),
+            latest_validation_ms: snapshot
+                .data
+                .sources
+                .iter()
+                .map(|s| s.validated_at_ms)
+                .max()
+                .expect("validated sources"),
+            engine: QueryEngine::new(snapshot.id, snapshot.data),
+        });
         *self.engine.write().unwrap() = Some(engine);
         Ok(())
     }

@@ -473,3 +473,82 @@ fn out_of_range_revision_fails_closed_without_uncited_claim() {
     assert!(reply.citations.is_empty());
     assert_bounded(&reply);
 }
+#[tokio::test]
+async fn status_and_health_report_pinned_snapshot_metadata_without_paths() {
+    let dir = Temp::new();
+    let store = Store::new(&dir.0).unwrap();
+    let mut data = catalog();
+    let mut source = data.sources[0].clone();
+    source.id = "page:2".into();
+    source.page_id = 2;
+    source.title = "Fixture second source".into();
+    source.url = format!("{SOURCE_ORIGIN}/wiki/Fixture_second_source");
+    source.revision_id = 3;
+    source.validated_at_ms = NOW - 1000;
+    data.sources.push(source);
+    data.coverage.discovered_pages = 2;
+    data.coverage.imported_pages = 2;
+    data.coverage.nonredirect_articles = 2;
+    data.coverage.namespace_counts.insert("articles".into(), 2);
+    let first = store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    h.call("activate", json!({"guild":"123","epoch":2}))
+        .await
+        .unwrap();
+    for operation in ["status", "health"] {
+        let result = h.invoke(operation, json!({})).await.unwrap();
+        let text = result["reply"]["text"].as_str().unwrap();
+        assert!(text.contains(&first.id));
+        assert!(text.contains("Entities: 1; source pages: 2."));
+        if operation == "health" {
+            assert!(text.contains(&format!("oldest {}; latest {}", NOW - 1000, NOW)));
+        } else {
+            assert!(text.contains("minutes ago") || text.contains("dated in the future"));
+        }
+        assert!(text.contains("Network refresh: disabled."));
+        assert!(!text.contains(dir.0.to_str().unwrap()));
+        assert!(!text.contains("data_directory"));
+        assert!(text.encode_utf16().count() <= 1800);
+        assert_eq!(result["reply"]["citations"], json!([]));
+        assert!(
+            h.invoke(operation, json!({"directory":"forged"}))
+                .await
+                .is_err()
+        );
+    }
+    // Metadata must describe the same retained snapshot as answers, not a newer disk pointer.
+    data.sources[0].validated_at_ms = NOW + 1000;
+    let second = store
+        .publish_bytes(&serde_json::to_vec(&data).unwrap())
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    let old_status = module.query("status", json!({}), NOW).unwrap();
+    let text = old_status["reply"]["text"].as_str().unwrap();
+    assert!(text.contains(&first.id));
+    assert!(!text.contains(&second.id));
+    assert!(text.contains("oldest 0 minutes ago; newest 0 minutes ago"));
+    let cached = module
+        .query("status", json!({}), NOW + 2 * 86_400_000)
+        .unwrap();
+    assert!(
+        cached["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cached sources")
+    );
+    h.close().await;
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    let new_status = module.query("health", json!({}), NOW + 1001).unwrap();
+    let text = new_status["reply"]["text"].as_str().unwrap();
+    assert!(text.contains(&second.id));
+    assert!(text.contains(&format!("latest {}.", NOW + 1000)));
+    h.close().await;
+}
