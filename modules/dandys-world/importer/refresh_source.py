@@ -1,7 +1,6 @@
-"""Bounded canonical MediaWiki acquisition; not enabled by the deployed module.
+"""Bounded canonical MediaWiki acquisition for operator-enabled refresh.
 
-This adapter's availability is not evidence of source-access permission. It is
-kept separate from the offline runtime while acquisition qualification is open.
+Deployment must separately qualify source access before enabling the scheduler.
 No arbitrary URL, credentials, browser impersonation, or challenge workaround.
 """
 import argparse
@@ -376,7 +375,7 @@ def metadata(client, expected, content=False):
         size = revision.get('size')
         timestamp = revision.get('timestamp')
         model = slot.get('contentmodel', revision.get('contentmodel'))
-        if not positive(revision.get('revid')) or type(revision.get('parentid')) is not int or revision['parentid'] < 0 or not isinstance(digest, str) or len(digest) != 40 or any(c not in '0123456789abcdef' for c in digest) or type(size) is not int or not 0 <= size <= MAX_PAGE or model not in ('wikitext', 'Scribunto', 'interactivemap', 'json'):
+        if not positive(revision.get('revid')) or type(revision.get('parentid')) is not int or revision['parentid'] < 0 or not isinstance(digest, str) or len(digest) != 40 or any(c not in '0123456789abcdef' for c in digest) or type(size) is not int or not 0 <= size <= MAX_PAGE or model not in ('wikitext', 'Scribunto', 'interactivemap', 'json', 'sanitized-css'):
             raise SourceError('Invalid revision metadata')
         try:
             if millis(timestamp) > millis(validated):

@@ -57,7 +57,7 @@ class Wiki:
                 p = next((p for p in self.pages if p['pageid'] == pid), None)
                 if p is None:
                     pages.append({'pageid': pid, 'missing': True}); continue
-                slot = {'contentmodel': 'wikitext'}
+                slot = {'contentmodel': p.get('model', 'wikitext')}
                 if '|content' in q['rvprop']:
                     # contentmodel also begins with content; distinguish full field.
                     if 'content' in q['rvprop'].split('|'):
@@ -79,6 +79,24 @@ class SourceTests(unittest.TestCase):
         self.root = tempfile.TemporaryDirectory()
         self.addCleanup(self.root.cleanup)
         self.base = Path(self.root.name)
+    def test_template_styles_are_preserved_without_execution(self):
+        wiki = Wiki()
+        page = next(p for p in wiki.pages if p['ns'] == 10)
+        page.update(title='Template:Example/styles.css', model='sanitized-css', raw='.example { color: red; }')
+        acquire(self.base / 'styles', client=wiki.client())
+        saved = Corpus.open(self.base / 'styles').by_title[page['title']]
+        self.assertEqual(saved['raw'], page['raw'])
+        wiki.calls.clear()
+        result = acquire(self.base / 'cached-styles', previous=self.base / 'styles', client=wiki.client())
+        self.assertEqual(wiki.body_calls(), 0)
+
+    def test_unknown_content_model_still_rejects_acquisition(self):
+        wiki = Wiki()
+        wiki.pages[0]['model'] = 'unsupported-model'
+        with self.assertRaises(SourceError):
+            acquire(self.base / 'unknown-model', client=wiki.client())
+        self.assertFalse((self.base / 'unknown-model/manifest.json').exists())
+
     def test_complete_corpus_and_exact_revision_cache_reuse(self):
         wiki = Wiki()
         first = acquire(self.base / 'first', client=wiki.client())
