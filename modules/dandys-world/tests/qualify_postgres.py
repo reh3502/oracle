@@ -56,7 +56,7 @@ def main():
         run("pg-init", command)
         run("pg-start", [binary / "pg_ctl", "-D", data, "-l", folder / "server.log",
                          "-o", f"-k {socket} -p 55466 -c listen_addresses=''", "-w", "start"])
-        for database in ("runs", "restored", "races", "native", "wiki"):
+        for database in ("runs", "restored", "races", "interruption", "native", "wiki"):
             run("pg-create-" + database,
                 [binary / "createdb", "-h", socket, "-p", "55466", database])
         cargo = ["cargo", "test", "--locked", "--manifest-path",
@@ -66,6 +66,10 @@ def main():
              "DW_TEST_POSTGRES_RESTORE_URL": url("restored")})
         run("pg-races", cargo + ["--test", "run_storage_races", "--", "--ignored"],
             {"DW_TEST_POSTGRES_URL": url("races")})
+        run("pg-interruption", cargo + ["--test", "run_interruption",
+                                       "postgres_process_killed_at_write_boundaries_replays_one_signup",
+                                       "--", "--ignored", "--exact"],
+            {"DW_TEST_POSTGRES_URL": url("interruption")})
         if args.module_binary:
             native_env = {"DW_MODULE_BINARY": str(args.module_binary.resolve()),
                           "DW_RUN_CATALOG": str(args.catalog.resolve()),
