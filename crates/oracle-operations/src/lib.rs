@@ -8,3 +8,5 @@ mod published_cards;
 pub mod structure;
 
 pub mod ingress;
+
+pub mod shared_cards;
