@@ -16,12 +16,39 @@ struct State {
     mismatch: bool,
     cancel: Option<CancellationToken>,
     revoke_before_write: Option<Arc<std::sync::atomic::AtomicBool>>,
+    inject_collision_after_write: Option<(usize, PublishedCommand)>,
+    hold_create: Option<(String, Arc<Hold>)>,
+    hold_list: Option<(usize, usize, Arc<Hold>)>,
+}
+#[derive(Default)]
+struct Hold {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 #[derive(Default)]
 struct Backend(Mutex<State>);
 #[async_trait]
 impl CommandBackend for Backend {
     async fn list(&self, _: &GuildId) -> Result<Vec<PublishedCommand>> {
+        let hold = {
+            let mut state = self.0.lock().unwrap();
+            let writes = state.writes;
+            state.hold_list.as_mut().and_then(|(at, remaining, hold)| {
+                if *at != writes {
+                    return None;
+                }
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    None
+                } else {
+                    Some(hold.clone())
+                }
+            })
+        };
+        if let Some(hold) = hold {
+            hold.entered.notify_one();
+            hold.release.notified().await;
+        }
         Ok(self.0.lock().unwrap().commands.clone())
     }
     async fn create(
@@ -30,6 +57,18 @@ impl CommandBackend for Backend {
         definition: &Value,
         guard: &SendGuard,
     ) -> Result<PublishedCommand> {
+        let hold = self
+            .0
+            .lock()
+            .unwrap()
+            .hold_create
+            .as_ref()
+            .filter(|(name, _)| definition["name"] == *name)
+            .map(|(_, hold)| hold.clone());
+        if let Some(hold) = hold {
+            hold.entered.notify_one();
+            hold.release.notified().await;
+        }
         if let Some(active) = self.0.lock().unwrap().revoke_before_write.take() {
             active.store(false, std::sync::atomic::Ordering::SeqCst);
         }
@@ -44,6 +83,14 @@ impl CommandBackend for Backend {
                 command.definition["description"] = json!("wrong");
             }
             state.commands.push(command.clone());
+            if state
+                .inject_collision_after_write
+                .as_ref()
+                .is_some_and(|(after, _)| *after == state.writes)
+            {
+                let (_, collision) = state.inject_collision_after_write.take().unwrap();
+                state.commands.push(collision);
+            }
             if let Some(cancel) = &state.cancel {
                 cancel.cancel();
             }
@@ -149,7 +196,7 @@ async fn one_owner_can_publish_aliases_and_roll_back_only_its_aliases() {
 }
 
 #[tokio::test]
-async fn late_alias_collision_can_roll_back_partial_publication_without_adoption() {
+async fn alias_collision_preflight_preserves_the_entire_plan_without_writes() {
     let (_root, store, backend, guild) = setup().await;
     backend.0.lock().unwrap().commands.push(PublishedCommand {
         id: "50".into(),
@@ -166,10 +213,9 @@ async fn late_alias_collision_can_roll_back_partial_publication_without_adoption
         .await
         .unwrap_err();
     assert_eq!(result.code, ErrorCode::Conflict);
-    // Current reconciliation is incremental, not an atomic multi-command write.
-    // A caller must preflight the whole set and still handle late collisions.
-    assert_eq!(backend.0.lock().unwrap().writes, 2);
-    assert_eq!(reconciler.bindings(&guild).await.unwrap().len(), 2);
+    // The entire plan is checked before any member of an alias group is sent.
+    assert_eq!(backend.0.lock().unwrap().writes, 0);
+    assert!(reconciler.bindings(&guild).await.unwrap().is_empty());
     reconciler
         .reconcile(&guild, &[], &CancellationToken::new(), now() + 60)
         .await
@@ -641,4 +687,195 @@ fn canonical_option_defaults_do_not_hide_real_constraint_changes() {
             "changed {key} must remain visible"
         );
     }
+}
+
+#[tokio::test]
+async fn collision_after_preflight_compensates_only_confirmed_ids_and_restores_all_prior_bindings()
+{
+    let (_root, store, backend, guild) = setup().await;
+    let reconciler = CommandReconciler::new(store.clone(), backend.clone());
+    let cancel = CancellationToken::new();
+    let mut oracle = desired("oracle");
+    oracle.owner = ModuleId::new("oracle.bootstrap").unwrap();
+    oracle.route = None;
+    let mut unrelated = desired("other");
+    unrelated.owner = ModuleId::new("other.module").unwrap();
+    let old = vec![desired("catalog"), oracle, unrelated];
+    reconciler
+        .reconcile(&guild, &old, &cancel, now() + 60)
+        .await
+        .unwrap();
+    let before = reconciler.bindings(&guild).await.unwrap();
+    let writes = backend.0.lock().unwrap().writes;
+    backend.0.lock().unwrap().inject_collision_after_write = Some((
+        writes + 1,
+        PublishedCommand {
+            id: "external".into(),
+            definition: desired("signup").definition,
+        },
+    ));
+    let mut target = old.clone();
+    target.extend([desired("hostrun"), desired("signup")]);
+    assert_eq!(
+        reconciler
+            .reconcile(&guild, &target, &cancel, now() + 60)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(reconciler.bindings(&guild).await.unwrap(), before);
+    {
+        let state = backend.0.lock().unwrap();
+        assert_eq!(state.writes, writes + 2);
+        assert_eq!(state.commands.len(), old.len() + 1);
+        assert!(state.commands.iter().any(|c| c.id == "external"));
+        assert!(
+            !state
+                .commands
+                .iter()
+                .any(|c| c.definition["name"] == "hostrun")
+        );
+    }
+    store.close().await.unwrap();
+}
+#[tokio::test]
+async fn alias_group_is_fenced_until_all_members_are_confirmed_but_unrelated_routes_stay_live() {
+    let (_root, store, backend, guild) = setup().await;
+    let reconciler = Arc::new(CommandReconciler::new(store.clone(), backend.clone()));
+    let cancel = CancellationToken::new();
+    let mut unrelated = desired("other");
+    unrelated.owner = ModuleId::new("other.module").unwrap();
+    let old = vec![desired("catalog"), unrelated];
+    reconciler
+        .reconcile(&guild, &old, &cancel, now() + 60)
+        .await
+        .unwrap();
+    let hold = Arc::new(Hold::default());
+    backend.0.lock().unwrap().hold_create = Some(("signup".into(), hold.clone()));
+    let mut target = old.clone();
+    target.extend([desired("hostrun"), desired("signup")]);
+    let running = {
+        let reconciler = reconciler.clone();
+        let guild = guild.clone();
+        tokio::spawn(async move {
+            reconciler
+                .reconcile(&guild, &target, &CancellationToken::new(), now() + 60)
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), hold.entered.notified())
+        .await
+        .unwrap();
+    // hostrun is already a confirmed owned remote command, but none of its
+    // owner's group (including the old catalog route) is callable yet.
+    assert!(
+        backend
+            .0
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|c| c.definition["name"] == "hostrun")
+    );
+    let visible = reconciler.bindings(&guild).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].owner.as_str(), "other.module");
+    let restarted = CommandReconciler::new(store.clone(), backend.clone());
+    assert_eq!(restarted.bindings(&guild).await.unwrap(), visible);
+    let writes = backend.0.lock().unwrap().writes;
+    assert_eq!(
+        restarted
+            .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RecoveryRequired
+    );
+    assert_eq!(
+        backend.0.lock().unwrap().writes,
+        writes,
+        "another reconciler must not roll back a live publisher"
+    );
+    assert_eq!(
+        restarted.publication_status(&guild).await.unwrap().unwrap()["active"],
+        true
+    );
+    hold.release.notify_one();
+    running.await.unwrap().unwrap();
+    assert_eq!(reconciler.bindings(&guild).await.unwrap().len(), 4);
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_rolls_back_confirmed_partial_group_before_accepting_another_plan() {
+    let (_root, store, backend, guild) = setup().await;
+    let reconciler = Arc::new(CommandReconciler::new(store.clone(), backend.clone()));
+    let old = vec![desired("catalog")];
+    reconciler
+        .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+        .await
+        .unwrap();
+    let previous = reconciler.bindings(&guild).await.unwrap();
+    let writes = backend.0.lock().unwrap().writes;
+    let hold = Arc::new(Hold::default());
+    backend.0.lock().unwrap().hold_list = Some((writes + 1, 1, hold.clone()));
+    let task = {
+        let reconciler = reconciler.clone();
+        let guild = guild.clone();
+        tokio::spawn(async move {
+            reconciler
+                .reconcile(
+                    &guild,
+                    &[desired("catalog"), desired("hostrun"), desired("signup")],
+                    &CancellationToken::new(),
+                    now() + 60,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), hold.entered.notified())
+        .await
+        .unwrap();
+    assert!(reconciler.bindings(&guild).await.unwrap().is_empty());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    backend.0.lock().unwrap().hold_list = None;
+    let row = store
+        .workflow_get(&guild, WorkflowKind::CommandGroup, "publication")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut journal = row.value;
+    journal["expires_at"] = json!(now() - 1);
+    store
+        .workflow_put(
+            &guild,
+            WorkflowKind::CommandGroup,
+            "publication",
+            Some(row.revision),
+            &journal,
+        )
+        .await
+        .unwrap();
+    let restarted = CommandReconciler::new(store.clone(), backend.clone());
+    assert_eq!(
+        restarted
+            .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RecoveryRequired
+    );
+    assert_eq!(restarted.bindings(&guild).await.unwrap(), previous);
+    assert_eq!(backend.0.lock().unwrap().writes, writes + 2);
+    assert_eq!(
+        restarted
+            .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+            .await
+            .unwrap()
+            .unchanged,
+        1
+    );
+    store.close().await.unwrap();
 }

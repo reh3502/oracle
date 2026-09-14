@@ -76,6 +76,25 @@ pub trait CommandBackend: Send + Sync {
     ) -> Result<PublishedCommand>;
     async fn delete(&self, guild: &GuildId, id: &str, guard: &SendGuard) -> Result<()>;
 }
+/// A durable fence for all changed commands of each affected module. Sharded
+/// previous bindings retain complete definitions without a 64 KiB group document.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationGroup {
+    version: u32,
+    id: String,
+    active: bool,
+    prepared: bool,
+    expires_at: u64,
+    previous_count: usize,
+    affected: BTreeSet<ModuleId>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousCommand {
+    publication: String,
+    binding: CommandBinding,
+}
 pub struct CommandReconciler {
     repository: Arc<dyn WorkflowRepository>,
     backend: Arc<dyn CommandBackend>,
@@ -180,13 +199,28 @@ impl CommandReconciler {
         Ok(result)
     }
     pub async fn bindings(&self, guild: &GuildId) -> Result<Vec<CommandBinding>> {
-        Ok(self
-            .records(guild)
-            .await?
-            .into_values()
-            .map(|(_, b)| b)
-            .filter(|b| !b.deleted && b.pending.is_none())
-            .collect())
+        // A stable publication revision prevents a reader from mixing a group
+        // marker before publication with command records midway through it.
+        for _ in 0..3 {
+            let before = self.publication(guild).await?;
+            let records = self.records(guild).await?;
+            let after = self.publication(guild).await?;
+            if before.as_ref().map(|(r, _)| r) != after.as_ref().map(|(r, _)| r) {
+                continue;
+            }
+            return Ok(records
+                .into_values()
+                .map(|(_, b)| b)
+                .filter(|b| {
+                    !b.deleted
+                        && b.pending.is_none()
+                        && !after
+                            .as_ref()
+                            .is_some_and(|(_, g)| g.active && g.affected.contains(&b.owner))
+                })
+                .collect());
+        }
+        Err(error(ErrorCode::Conflict))
     }
     async fn save(
         &self,
@@ -223,6 +257,252 @@ impl CommandReconciler {
         }
         Ok(result)
     }
+    /// Durable publication recovery item for operator status surfaces. It never
+    /// exposes desired commands as live invocation bindings.
+    pub async fn publication_status(&self, guild: &GuildId) -> Result<Option<Value>> {
+        self.publication(guild)
+            .await?
+            .map(|(_, group)| serde_json::to_value(group).map_err(|_| error(ErrorCode::Integrity)))
+            .transpose()
+    }
+    async fn publication(&self, guild: &GuildId) -> Result<Option<(u64, PublicationGroup)>> {
+        self.repository
+            .workflow_get(guild, WorkflowKind::CommandGroup, "publication")
+            .await?
+            .map(|record| {
+                let group: PublicationGroup = serde_json::from_value(record.value)
+                    .map_err(|_| error(ErrorCode::Integrity))?;
+                if group.version != 1 || group.previous_count > 100 || group.affected.len() > 100 {
+                    return Err(error(ErrorCode::Integrity));
+                }
+                Ok((record.revision, group))
+            })
+            .transpose()
+    }
+    async fn save_publication(
+        &self,
+        guild: &GuildId,
+        revision: Option<u64>,
+        group: &PublicationGroup,
+    ) -> Result<u64> {
+        Ok(self
+            .repository
+            .workflow_put(
+                guild,
+                WorkflowKind::CommandGroup,
+                "publication",
+                revision,
+                &serde_json::to_value(group).map_err(|_| error(ErrorCode::Integrity))?,
+            )
+            .await?
+            .revision)
+    }
+    async fn previous_plan(
+        &self,
+        guild: &GuildId,
+        group: &PublicationGroup,
+    ) -> Result<Vec<CommandBinding>> {
+        let mut previous = Vec::new();
+        for index in 0..group.previous_count {
+            let row = self
+                .repository
+                .workflow_get(
+                    guild,
+                    WorkflowKind::CommandGroup,
+                    &format!("previous:{index:03}"),
+                )
+                .await?
+                .ok_or_else(|| error(ErrorCode::Integrity))?;
+            let slot: PreviousCommand =
+                serde_json::from_value(row.value).map_err(|_| error(ErrorCode::Integrity))?;
+            if slot.publication != group.id
+                || slot.binding.deleted
+                || slot.binding.pending.is_some()
+                || slot.binding.id.is_none()
+            {
+                return Err(error(ErrorCode::Integrity));
+            }
+            previous.push(slot.binding);
+        }
+        Ok(previous)
+    }
+    /// Full remote ownership preflight before the first write. The per-command
+    /// checks still run after this because Discord has no multi-command transaction.
+    async fn preflight(
+        &self,
+        guild: &GuildId,
+        wanted: &BTreeMap<String, DesiredCommand>,
+    ) -> Result<()> {
+        let records = self.records(guild).await?;
+        let observed = self.observed(guild).await?;
+        for key in records.keys().chain(wanted.keys()).collect::<BTreeSet<_>>() {
+            let current = records.get(key).map(|(_, binding)| binding);
+            let actual = observed.get(key);
+            if current.is_some_and(|b| b.pending.is_some()) {
+                return Err(error(ErrorCode::RecoveryRequired));
+            }
+            if let (Some(current), Some(desired)) = (current, wanted.get(key))
+                && current.owner != desired.owner
+            {
+                return Err(error(ErrorCode::Conflict));
+            }
+            match current {
+                Some(binding) if !binding.deleted => {
+                    if !actual.is_some_and(|remote| {
+                        Some(&remote.id) == binding.id.as_ref()
+                            && remote.definition == binding.definition
+                    }) {
+                        return Err(error(ErrorCode::Conflict));
+                    }
+                }
+                _ if actual.is_some() => return Err(error(ErrorCode::Conflict)),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    async fn begin_publication(
+        &self,
+        guild: &GuildId,
+        wanted: &BTreeMap<String, DesiredCommand>,
+        expires_at: u64,
+    ) -> Result<(u64, PublicationGroup)> {
+        let records = self.records(guild).await?;
+        let previous = records
+            .values()
+            .map(|(_, b)| b)
+            .filter(|b| !b.deleted)
+            .cloned()
+            .collect::<Vec<_>>();
+        if previous.len() > 100 || wanted.len() > 100 {
+            return Err(error(ErrorCode::QuotaExceeded));
+        }
+        let mut affected = BTreeSet::new();
+        for (key, (_, binding)) in &records {
+            if binding.deleted {
+                continue;
+            }
+            if wanted.get(key).is_none_or(|d| {
+                d.definition != binding.definition
+                    || d.route != binding.route
+                    || d.owner != binding.owner
+            }) {
+                affected.insert(binding.owner.clone());
+            }
+        }
+        for (key, desired) in wanted {
+            if records.get(key).is_none_or(|(_, b)| {
+                b.deleted
+                    || b.definition != desired.definition
+                    || b.route != desired.route
+                    || b.owner != desired.owner
+            }) {
+                affected.insert(desired.owner.clone());
+            }
+        }
+        let mut group = PublicationGroup {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            active: true,
+            prepared: false,
+            expires_at,
+            previous_count: previous.len(),
+            affected,
+        };
+        let prior = self.publication(guild).await?;
+        if prior.as_ref().is_some_and(|(_, group)| group.active) {
+            return Err(error(ErrorCode::RecoveryRequired));
+        }
+        // Claim the journal before staging fixed slots. CAS also serializes two
+        // host processes: another publisher cannot overwrite an active snapshot.
+        let revision = self
+            .save_publication(guild, prior.map(|(r, _)| r), &group)
+            .await?;
+        // A crash while unprepared is safe to unwind: no Discord write has begun.
+        for (index, binding) in previous.into_iter().enumerate() {
+            let key = format!("previous:{index:03}");
+            let previous = self
+                .repository
+                .workflow_get(guild, WorkflowKind::CommandGroup, &key)
+                .await?;
+            let value = serde_json::to_value(PreviousCommand {
+                publication: group.id.clone(),
+                binding,
+            })
+            .map_err(|_| error(ErrorCode::Integrity))?;
+            self.repository
+                .workflow_put(
+                    guild,
+                    WorkflowKind::CommandGroup,
+                    &key,
+                    previous.map(|r| r.revision),
+                    &value,
+                )
+                .await?;
+        }
+        group.prepared = true;
+        let revision = self.save_publication(guild, Some(revision), &group).await?;
+        Ok((revision, group))
+    }
+    async fn rollback_publication(
+        &self,
+        guild: &GuildId,
+        revision: u64,
+        mut group: PublicationGroup,
+        guard: &SendGuard,
+    ) -> Result<()> {
+        if !group.prepared {
+            group.active = false;
+            group.affected.clear();
+            self.save_publication(guild, Some(revision), &group).await?;
+            return Ok(());
+        }
+        let previous = self.previous_plan(guild, &group).await?;
+        let current = self.records(guild).await?;
+        // A lost create acknowledgement never proves ownership. Do not adopt a
+        // matching name, retry it, or release any affected owner's group.
+        if current.values().any(|(_, b)| b.pending.is_some()) {
+            return Err(error(ErrorCode::RecoveryRequired));
+        }
+        for old in &previous {
+            let key = command_key(&old.definition)?;
+            if current
+                .get(&key)
+                .is_none_or(|(_, now)| now.deleted || now.id != old.id || now.owner != old.owner)
+            {
+                // Discord cannot recreate a deleted command with its former ID.
+                return Err(error(ErrorCode::RecoveryRequired));
+            }
+        }
+        let wanted = previous
+            .iter()
+            .map(|b| {
+                Ok((
+                    command_key(&b.definition)?,
+                    DesiredCommand {
+                        owner: b.owner.clone(),
+                        definition: b.definition.clone(),
+                        route: b.route.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        self.apply_plan(guild, &wanted, guard).await?;
+        let restored = self.records(guild).await?;
+        for old in &previous {
+            if restored
+                .get(&command_key(&old.definition)?)
+                .is_none_or(|(_, now)| now != old)
+            {
+                return Err(error(ErrorCode::RecoveryRequired));
+            }
+        }
+        group.active = false;
+        group.affected.clear();
+        self.save_publication(guild, Some(revision), &group).await?;
+        Ok(())
+    }
+
     /// Cancel this run whenever its desired revision is superseded. A cancelled run never
     /// dispatches further changes; already-sent changes retain their durable pending record.
     pub async fn reconcile(
@@ -269,8 +549,63 @@ impl CommandReconciler {
                 return Err(error(ErrorCode::Conflict));
             }
         }
+        if wanted.len() > 100 {
+            return Err(error(ErrorCode::QuotaExceeded));
+        }
+        if let Some((revision, mut group)) = self.publication(guild).await?
+            && group.active
+        {
+            // Another host instance may still own this publication. Its send
+            // guard expires at the same durable lease boundary.
+            if crate::executor::now() < group.expires_at {
+                return Err(error(ErrorCode::RecoveryRequired));
+            }
+            group.expires_at = expires_at;
+            let revision = self.save_publication(guild, Some(revision), &group).await?;
+            self.rollback_publication(guild, revision, group, &guard)
+                .await?;
+            // Recovery never accepts a new group in the same attempt.
+            return Err(error(ErrorCode::RecoveryRequired));
+        }
+        self.preflight(guild, &wanted).await?;
+        let (revision, mut group) = self.begin_publication(guild, &wanted, expires_at).await?;
+        let result = match self.apply_plan(guild, &wanted, &guard).await {
+            Ok(report) => self
+                .preflight(guild, &wanted)
+                .await
+                .and_then(|_| guard.dispatch(|| Ok(report))),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(report) => {
+                group.active = false;
+                group.affected.clear();
+                self.save_publication(guild, Some(revision), &group).await?;
+                Ok(report)
+            }
+            Err(original) => {
+                // Cancellation and uncertain outcomes keep the durable fence.
+                // A known late collision can compensate using confirmed IDs.
+                if guard.dispatch(|| Ok(())).is_ok() {
+                    let _ = self
+                        .rollback_publication(guild, revision, group, &guard)
+                        .await;
+                }
+                Err(original)
+            }
+        }
+    }
+    async fn apply_plan(
+        &self,
+        guild: &GuildId,
+        wanted: &BTreeMap<String, DesiredCommand>,
+        guard: &SendGuard,
+    ) -> Result<CommandReport> {
         let mut records = self.records(guild).await?;
         let keys: BTreeSet<_> = records.keys().chain(wanted.keys()).cloned().collect();
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        // Confirm additions and edits before removing old routes where possible.
+        keys.sort_by_key(|key| (wanted.get(key).is_none(), key.clone()));
         let mut report = CommandReport::default();
         for key in keys {
             guard.dispatch(|| Ok(()))?;
@@ -369,7 +704,7 @@ impl CommandReconciler {
             let sent = match action {
                 PendingCommand::Create => Some(
                     self.backend
-                        .create(guild, binding.target.as_ref().unwrap(), &guard)
+                        .create(guild, binding.target.as_ref().unwrap(), guard)
                         .await?,
                 ),
                 PendingCommand::Edit => Some(
@@ -378,13 +713,13 @@ impl CommandReconciler {
                             guild,
                             binding.id.as_deref().unwrap(),
                             binding.target.as_ref().unwrap(),
-                            &guard,
+                            guard,
                         )
                         .await?,
                 ),
                 PendingCommand::Delete => {
                     self.backend
-                        .delete(guild, binding.id.as_deref().unwrap(), &guard)
+                        .delete(guild, binding.id.as_deref().unwrap(), guard)
                         .await?;
                     None
                 }
