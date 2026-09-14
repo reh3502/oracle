@@ -638,9 +638,9 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 description.push_str(if run.mode == RunMode::Casual {
                     "Choose any playable Toon, or leave the choice empty. There are no individual Toon limits."
                 } else if view == View::Switch {
-                    "Your current place stays saved if the new Toon is full."
+                    "Only the host's selected Toons with open places are shown. Your current place stays saved if the new Toon is full."
                 } else {
-                    "Choose your own Toon. This choice belongs only to you."
+                    "Choose from the host's selected Toons with open places. Other Toons are not included in this organized run."
                 });
                 let mut available: Vec<_> = run
                     .eligibility
@@ -662,6 +662,19 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 available.sort_by(|a, b| a.1.cmp(b.1));
                 let page = usize::from(input.page.unwrap_or(0))
                     .min(available.len().saturating_sub(1) / 25);
+                if !available.is_empty() {
+                    description.push_str(&format!(
+                        "\nShowing Toons {}–{} of {} · Page {} of {}.",
+                        page * 25 + 1,
+                        ((page + 1) * 25).min(available.len()),
+                        available.len(),
+                        page + 1,
+                        available.len().div_ceil(25)
+                    ));
+                    if available.len() > 25 {
+                        description.push_str(" Use Next Toons or Previous Toons to see the rest.");
+                    }
+                }
                 for (toon, name) in available.iter().skip(page * 25).take(25) {
                     let mut choice = base(
                         run,
@@ -675,9 +688,9 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                     choices.push(json!({"label":text(name,80),"description":if run.mode==RunMode::Casual{"Optional choice; no Toon quota".into()}else{let occupied=run.assignments.values().filter(|a|a.toon.as_ref()==Some(toon)).count();format!("{} places available",usize::from(run.allocations.as_ref().unwrap()[*toon]).saturating_sub(occupied))},"operation":"run_ui","input":choice}));
                 }
                 for (label, next) in [
-                    ("Previous", page.checked_sub(1)),
+                    ("Previous Toons", page.checked_sub(1)),
                     (
-                        "Next",
+                        "Next Toons",
                         (page + 1 < available.len().div_ceil(25)).then_some(page + 1),
                     ),
                 ] {

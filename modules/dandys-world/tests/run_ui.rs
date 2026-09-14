@@ -153,6 +153,89 @@ fn casual_never_renders_count_forms_and_all_requires_confirmation() {
     ));
     assert_eq!(organized, before);
 }
+
+#[test]
+fn casual_signup_and_switch_expose_every_requested_toon_across_named_pages() {
+    let names = [
+        "Blot",
+        "Boxten",
+        "Brightney",
+        "Brusha",
+        "Connie",
+        "Cosmo",
+        "Finn",
+        "Flutter",
+        "Gigi",
+        "Glisten",
+        "Goob",
+        "Looey",
+        "Poppy",
+        "Razzle & Dazzle",
+        "Rodger",
+        "Scraps",
+        "Shrimpo",
+        "Squirm",
+        "Teagan",
+        "Tisha",
+        "Toodles",
+        "Waxwell",
+        "Yatta",
+        "Astro",
+        "Bassie",
+        "Bobette",
+        "Gourdy",
+        "Pebble",
+        "Shelly",
+        "Sprout",
+        "Vee",
+        "Cocoa",
+        "Eggson",
+        "Flyte",
+        "Eclipse",
+        "Ribecca",
+        "Soulvester",
+        "Coal",
+        "Ginger",
+        "Rudie",
+    ];
+    let mut stored = draft(RunMode::Casual);
+    stored.run.eligibility.toons = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (format!("toon{i:02}"), (*name).into()))
+        .collect();
+    apply_input(&mut stored, json!({"action":"post","id":"abcd2345"}));
+    let guest = Actor {
+        user_id: "8".into(),
+        ..owner()
+    };
+    for view in [View::Join, View::Switch] {
+        let mut input = Input::show(&stored.run.id, view);
+        let mut seen = std::collections::BTreeSet::new();
+        for page in 0..2 {
+            input.page = Some(page);
+            let card = ui::render(&stored, &guest, &input, None);
+            let description = card["card"]["description"].as_str().unwrap();
+            assert!(description.contains(&format!("Page {} of 2", page + 1)));
+            for choice in card["choices"].as_array().unwrap() {
+                assert!(seen.insert(choice["label"].as_str().unwrap().to_owned()));
+            }
+            let label = if page == 0 {
+                "Next Toons"
+            } else {
+                "Previous Toons"
+            };
+            let nav = card["buttons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|button| button["label"] == label)
+                .unwrap();
+            assert_eq!(nav["input"]["page"], json!(1 - page));
+        }
+        assert_eq!(seen, names.iter().map(|name| (*name).to_owned()).collect());
+    }
+}
 #[test]
 fn modal_counts_and_actor_fields_are_strict_and_cards_stay_bounded() {
     for count in ["0", "9", "12", "1.0", "-1", " 2", "٢", ""] {
