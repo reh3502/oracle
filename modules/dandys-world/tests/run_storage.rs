@@ -81,7 +81,7 @@ impl Documents for Db {
             .document_get(&self.module, &self.guild, c, k)
             .await
             .map_err(map_error)?;
-        if c == "runs"
+        if matches!(c, "runs" | "run_index")
             && k == self.raced
             && self.first.swap(false, Ordering::SeqCst)
             && let Some(b) = &self.barrier
@@ -680,6 +680,30 @@ async fn lowered_limits_preserve_reads_and_low_sequence_receipts_use_multiple_sh
     assert_eq!(service.view(&owner, &id).await.unwrap(), before);
     let mut mod_actor = actor("500");
     mod_actor.manage_all_runs = true;
+    for tick in 0..127 {
+        change(
+            &service,
+            &mod_actor,
+            &id,
+            Command::Rename {
+                name: format!("Moderator edit {tick}"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        change(
+            &service,
+            &mod_actor,
+            &id,
+            Command::Rename {
+                name: "Audit full".into()
+            }
+        )
+        .await,
+        Err(storage::Error::Limit)
+    ));
     confirmed(
         &service,
         &mod_actor,
@@ -691,9 +715,9 @@ async fn lowered_limits_preserve_reads_and_low_sequence_receipts_use_multiple_sh
     .await
     .unwrap();
     let cancelled = service.view(&owner, &id).await.unwrap();
-    assert_eq!(cancelled.moderator_audit.len(), 1);
+    assert_eq!(cancelled.moderator_audit.len(), 128);
     assert_eq!(cancelled.moderator_audit[0].actor_id, "500");
-    assert_eq!(cancelled.moderator_audit[0].action, "cancel");
+    assert_eq!(cancelled.moderator_audit[127].action, "cancel");
     assert!(matches!(
         service
             .execute(
@@ -725,4 +749,188 @@ fn configured_limits_cannot_increase_storage_ceilings() {
     limits.receipts += 1;
     assert!(limits.validate().is_err());
     assert!(serde_json::from_value::<storage::Limits>(serde_json::json!({"players":9})).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creation_and_publication_limits_are_checked_in_the_atomic_batch() {
+    let root = std::env::temp_dir().join(format!("dw-admission-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let db = Db::new(store.clone());
+    let barrier = Arc::new(Barrier::new(8));
+    let mut tasks = tokio::task::JoinSet::new();
+    for user in 700..708 {
+        let mut d = db.clone();
+        d.barrier = Some(barrier.clone());
+        d.raced = "live".into();
+        d.first = Arc::new(AtomicBool::new(true));
+        tasks.spawn(async move {
+            let service = RunService::with_limits(
+                d,
+                storage::Limits {
+                    drafts_per_guild: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (
+                actor(&user.to_string()),
+                service
+                    .execute(
+                        &actor(&user.to_string()),
+                        &interaction(NOW),
+                        Request::Create {
+                            mode: RunMode::Casual,
+                            name: None,
+                        },
+                        &catalog(),
+                        NOW,
+                    )
+                    .await,
+            )
+        });
+    }
+    let mut winners = Vec::new();
+    while let Some(task) = tasks.join_next().await {
+        let (owner, result) = task.unwrap();
+        match result {
+            Ok(Response::Applied { result }) => winners.push((owner, result.run_id)),
+            Err(storage::Error::Limit | storage::Error::Busy) => (),
+            other => panic!("unexpected create race {other:?}"),
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    let service = RunService::new(db.clone());
+    let other = actor("900");
+    let second = create(&service, &other, RunMode::Casual).await;
+    winners.push((other, second));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (owner, id) in winners.clone() {
+        let mut d = db.clone();
+        d.barrier = Some(barrier.clone());
+        d.raced = "live".into();
+        d.first = Arc::new(AtomicBool::new(true));
+        tasks.spawn(async move {
+            let s = RunService::with_limits(
+                d,
+                storage::Limits {
+                    published_per_guild: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            change(&s, &owner, &id, Command::Publish).await
+        });
+    }
+    let mut count = 0;
+    while let Some(task) = tasks.join_next().await {
+        match task.unwrap() {
+            Ok(_) => count += 1,
+            Err(storage::Error::Limit | storage::Error::Busy) => (),
+            other => panic!("unexpected publish race {other:?}"),
+        }
+    }
+    assert_eq!(count, 1);
+    let mut published = 0;
+    for (owner, id) in winners {
+        let stored = service.view(&owner, &id).await.unwrap();
+        if stored.run.state == RunState::Open {
+            published += 1;
+            assert_eq!(stored.run.assignments.len(), 1);
+            assert!(stored.publication.is_some());
+        } else {
+            assert_eq!(stored.run.state, RunState::Draft);
+            assert!(stored.run.assignments.is_empty());
+            assert!(stored.publication.is_none());
+        }
+    }
+    assert_eq!(published, 1);
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn serialized_capacity_reserves_space_for_moderator_cancellation() {
+    let root = std::env::temp_dir().join(format!("dw-size-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let service = RunService::new(Db::new(store.clone()));
+    let owner = actor("100");
+    let mut large = catalog();
+    large.toons = (0..80)
+        .map(|i| (format!("toon{i}"), format!("{i:02}{}", "🟢".repeat(88))))
+        .collect();
+    let Response::Applied { result } = service
+        .execute(
+            &owner,
+            &interaction(NOW),
+            Request::Create {
+                mode: RunMode::Casual,
+                name: None,
+            },
+            &large,
+            NOW,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let id = result.run_id;
+    let mut moderator = actor("18446744073709551615");
+    moderator.manage_all_runs = true;
+    let mut edits = 0;
+    for tick in 0..127 {
+        let result = service
+            .execute(
+                &moderator,
+                &interaction(NOW),
+                Request::Change {
+                    run_id: id.clone(),
+                    command: Command::Rename {
+                        name: format!("Edit {tick}"),
+                    },
+                    confirmation: None,
+                },
+                &large,
+                NOW,
+            )
+            .await;
+        match result {
+            Ok(_) => edits += 1,
+            Err(storage::Error::Limit) => break,
+            other => panic!("unexpected size result {other:?}"),
+        }
+    }
+    assert!(
+        edits > 0 && edits < 127,
+        "must exercise serialized size, not entry count"
+    );
+    let live = service.view(&owner, &id).await.unwrap();
+    let live_bytes = serde_json::to_vec(&live).unwrap().len();
+    assert!(live_bytes <= 32 * 1024 - 512);
+    confirmed(
+        &service,
+        &moderator,
+        &id,
+        Command::Cancel {
+            confirmation: dummy(),
+        },
+    )
+    .await
+    .unwrap();
+    let terminal = service.view(&owner, &id).await.unwrap();
+    assert_eq!(terminal.run.state, RunState::Cancelled);
+    assert_eq!(terminal.moderator_audit.len(), edits + 1);
+    let bytes = serde_json::to_vec(&terminal).unwrap().len();
+    assert!(bytes > live_bytes && bytes <= 32 * 1024);
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

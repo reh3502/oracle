@@ -74,7 +74,7 @@ impl EligibilitySnapshot {
     }
 
     pub fn require_fresh(&self, now: u64) -> Result<(), Error> {
-        self.validate()?;
+        self.validate().map_err(|_| Error::CatalogUnavailable)?;
         if self.disputed || now < self.observed_at || now >= self.fresh_until {
             return Err(Error::CatalogUnavailable);
         }

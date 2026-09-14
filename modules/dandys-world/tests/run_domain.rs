@@ -685,3 +685,31 @@ fn casual_publish_rechecks_all_playable_names_before_pinning_membership() {
     .0;
     assert_eq!(joined.eligibility, active.eligibility);
 }
+
+#[test]
+fn unavailable_catalog_is_reported_as_source_unavailable() {
+    let mut current = catalog();
+    current.toons.clear();
+    current.disputed = true;
+    assert_eq!(
+        Run::new(
+            "ABCD2345".into(),
+            &actor("1"),
+            RunMode::Casual,
+            None,
+            current.clone(),
+            3_000
+        ),
+        Err(Error::CatalogUnavailable)
+    );
+    assert_eq!(
+        apply(
+            &configured(),
+            &actor("1"),
+            &Command::Publish,
+            &current,
+            3_000
+        ),
+        Err(Error::CatalogUnavailable)
+    );
+}

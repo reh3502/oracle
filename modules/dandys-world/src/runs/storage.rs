@@ -228,6 +228,15 @@ impl<'a, D: Documents> Transaction<'a, D> {
         let value = serde_json::to_value(value).map_err(|_| Error::Corrupt)?;
         let limit = if collection == "run_receipts" {
             512
+        } else if collection == "runs"
+            && !matches!(
+                value["run"]["state"].as_str(),
+                Some("completed" | "cancelled")
+            )
+        {
+            // Reserve a final moderator audit entry, terminal timestamp and
+            // publication metadata so even a full live aggregate can close.
+            MAX_BYTES - 512
         } else {
             MAX_BYTES
         };
@@ -727,7 +736,8 @@ impl<D: Documents> RunService<D> {
                                     Command::Join { .. } | Command::Switch { .. } | Command::Leave
                                 )
                             {
-                                if stored.moderator_audit.len() >= 128 {
+                                let audit_limit = if run.state.is_terminal() { 128 } else { 127 };
+                                if stored.moderator_audit.len() >= audit_limit {
                                     return Err(Error::Limit);
                                 }
                                 let encoded =
