@@ -104,6 +104,82 @@ async fn setup() -> (tempfile::TempDir, Arc<Storage>, Arc<Backend>, GuildId) {
         .unwrap();
     (root, store, Arc::new(Backend::default()), guild)
 }
+
+#[tokio::test]
+async fn one_owner_can_publish_aliases_and_roll_back_only_its_aliases() {
+    let (_root, store, backend, guild) = setup().await;
+    let baseline = desired("catalog");
+    let mut framework = desired("oracle");
+    framework.owner = ModuleId::new("oracle.framework").unwrap();
+    backend.0.lock().unwrap().commands.push(PublishedCommand {
+        id: "50".into(),
+        definition: desired("unrelated").definition,
+    });
+    let reconciler = CommandReconciler::new(store, backend.clone());
+    let cancel = CancellationToken::new();
+    let old = [baseline.clone(), framework.clone()];
+    reconciler
+        .reconcile(&guild, &old, &cancel, now() + 60)
+        .await
+        .unwrap();
+    let original = reconciler.bindings(&guild).await.unwrap();
+    let aliases = [baseline, framework, desired("hostrun"), desired("signup")];
+    let added = reconciler
+        .reconcile(&guild, &aliases, &cancel, now() + 60)
+        .await
+        .unwrap();
+    assert_eq!(added.created, 2);
+    assert_eq!(added.unchanged, 2);
+    let rolled_back = reconciler
+        .reconcile(&guild, &old, &cancel, now() + 60)
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.deleted, 2);
+    assert_eq!(reconciler.bindings(&guild).await.unwrap(), original);
+    assert_eq!(backend.0.lock().unwrap().commands.len(), 3);
+    assert!(
+        backend
+            .0
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|c| c.id == "50")
+    );
+}
+
+#[tokio::test]
+async fn late_alias_collision_can_roll_back_partial_publication_without_adoption() {
+    let (_root, store, backend, guild) = setup().await;
+    backend.0.lock().unwrap().commands.push(PublishedCommand {
+        id: "50".into(),
+        definition: desired("signup").definition,
+    });
+    let reconciler = CommandReconciler::new(store, backend.clone());
+    let result = reconciler
+        .reconcile(
+            &guild,
+            &[desired("catalog"), desired("hostrun"), desired("signup")],
+            &CancellationToken::new(),
+            now() + 60,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(result.code, ErrorCode::Conflict);
+    // Current reconciliation is incremental, not an atomic multi-command write.
+    // A caller must preflight the whole set and still handle late collisions.
+    assert_eq!(backend.0.lock().unwrap().writes, 2);
+    assert_eq!(reconciler.bindings(&guild).await.unwrap().len(), 2);
+    reconciler
+        .reconcile(&guild, &[], &CancellationToken::new(), now() + 60)
+        .await
+        .unwrap();
+    assert!(reconciler.bindings(&guild).await.unwrap().is_empty());
+    let state = backend.0.lock().unwrap();
+    assert_eq!(state.commands.len(), 1);
+    assert_eq!(state.commands[0].id, "50");
+    assert_eq!(state.commands[0].definition["name"], "signup");
+}
 #[tokio::test]
 async fn noop_add_remove_edit_preserve_ids_and_unrelated() {
     let (_root, store, backend, guild) = setup().await;
