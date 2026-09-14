@@ -424,7 +424,7 @@ fn interval(data: &CatalogData, now: u64, findings: &mut Findings) -> Option<(u6
 }
 // The API/importer uses UTC RFC3339, with either Z or +00:00 and up to nine
 // fractional digits. Validate the calendar rather than lexically ordering strings.
-fn parse_timestamp(value: &str) -> Option<u64> {
+pub(crate) fn parse_timestamp(value: &str) -> Option<u64> {
     let value = value
         .strip_suffix('Z')
         .or_else(|| value.strip_suffix("+00:00"))?;

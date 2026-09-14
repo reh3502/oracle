@@ -655,3 +655,33 @@ fn every_command_roundtrips_and_every_top_level_extra_field_is_rejected() {
         assert!(serde_json::from_value::<Command>(json).is_err());
     }
 }
+
+#[test]
+fn casual_publish_rechecks_all_playable_names_before_pinning_membership() {
+    let draft = new(RunMode::Casual);
+    let mut current = catalog();
+    current.toons.remove("poppy");
+    assert_eq!(
+        apply(&draft, &actor("1"), &Command::Publish, &current, 3_000),
+        Err(Error::CatalogChanged)
+    );
+    current = catalog();
+    current.toons.insert("rudie".into(), "Rudie".into());
+    assert_eq!(
+        apply(&draft, &actor("1"), &Command::Publish, &current, 3_000),
+        Err(Error::CatalogChanged)
+    );
+    let active = published(RunMode::Casual);
+    let joined = apply(
+        &active,
+        &actor("2"),
+        &Command::Join {
+            toon: Some("poppy".into()),
+        },
+        &current,
+        3_000,
+    )
+    .unwrap()
+    .0;
+    assert_eq!(joined.eligibility, active.eligibility);
+}

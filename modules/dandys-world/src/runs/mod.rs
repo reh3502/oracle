@@ -1,0 +1,4 @@
+//! Durable guild-scoped community run state, separate from wiki snapshots.
+pub mod domain;
+pub mod eligibility;
+pub mod storage;

@@ -558,6 +558,11 @@ pub fn apply(
                         }
                         run.validate_selection(run.host_toon.as_deref())?;
                     }
+                    if run.mode == RunMode::Casual
+                        && !run.eligibility.toons.keys().eq(current.toons.keys())
+                    {
+                        return Err(Error::CatalogChanged);
+                    }
                     next.state = RunState::Open;
                     next.assignments.insert(
                         run.owner_id.clone(),

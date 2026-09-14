@@ -20,6 +20,8 @@ tokio = { version = "1.53.1", features = ["io-std", "io-util", "process", "macro
 
 [dev-dependencies]
 oracle-rpc = { path = "../../crates/oracle-rpc" }
+oracle-core = { path = "../../crates/oracle-core" }
+oracle-storage = { path = "../../crates/oracle-storage" }
 
 [[bin]]
 name = "dw-query"

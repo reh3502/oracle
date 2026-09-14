@@ -6,4 +6,5 @@ pub mod refresh_job;
 pub mod refresh_policy;
 pub mod refresh_review;
 pub mod refresh_schedule;
+pub mod runs;
 pub mod snapshot;
