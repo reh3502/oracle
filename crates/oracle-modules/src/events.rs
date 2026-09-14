@@ -449,8 +449,26 @@ async fn event_worker(
             let configuration = manager
                 .configuration_ready(&PolicyContext::LocalOperator, &guild, &generation)
                 .await?;
+            let worker = if generation.installed.package.manifest.manifest_version == 3
+                && event.kind == GuildEventKind::Maintenance
+            {
+                Some(
+                    manager
+                        .core
+                        .member_mutation_gate()
+                        .worker(&guild, &generation.installed.package.manifest.id)?,
+                )
+            } else {
+                None
+            };
             generation
-                .event(&guild, event, configuration.revision, cancel.child_token())
+                .event(
+                    &guild,
+                    event,
+                    configuration.revision,
+                    cancel.child_token(),
+                    worker,
+                )
                 .await
         };
         let result = tokio::select! {biased;_=cancel.cancelled()=>Err(Error::new(ErrorCode::Cancelled)),result=outcome=>result};

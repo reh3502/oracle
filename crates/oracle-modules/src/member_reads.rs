@@ -59,6 +59,7 @@ impl ModuleManager {
     /// Called by trusted host pause/role/channel/membership event ingress.
     pub fn invalidate_member_reads(&self, guild: &GuildId) {
         self.member_gate.invalidate_guild(guild);
+        self.core.member_mutation_gate().invalidate_guild(guild);
     }
 
     pub async fn member_catalog(

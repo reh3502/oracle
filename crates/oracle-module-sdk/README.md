@@ -6,6 +6,8 @@ A module is a separate, operator-trusted native executable. Implement `Module` a
 
 `invoke(CallContext, operation, input)` receives an opaque invocation lease. `document_get`, `document_batch`, and `contract_invoke` attach that lease to typed requests. The context exposes no SQL, credentials, arbitrary RPC method, or replaceable guild authority. The host independently validates the live invocation, guild, generation, grants, schemas and CAS revisions. A retained context expires with its original RPC invocation. Guild quiescence also cancels ongoing calls and denies further callbacks.
 
+Manifest v3 uses protocol 1.2 and host API 1.4 or later. `CallContext::actor()` returns host-derived `AuthenticatedMember` metadata when present; `member_permissions()` contains only declared module permission labels. The member envelope is separate from operation input and cannot replace the opaque callback lease. Lifecycle/background calls have no actor. Never infer member authority when the actor is absent. Member mutation operations declare `callback_methods` (full names such as `host.document_get`) and `callback_collections`; the host intersects them with storage grants. MemberRead operations still have no callbacks.
+
 The handshake order is `hello`, `initialize`, then `activate` before normal invocations. The SDK rejects mismatched session/generation and stale guild epochs. A migration-mode process admits only migration transforms and lifecycle/health calls; transforms receive documents and return revision-preserving `DocumentWrite` values, with no host client. The host validates and commits the migration.
 
 `quiesce` fences and joins either one guild or the whole module. `deactivate` fences the guild before its hook. `shutdown` drains scopes and runs the shutdown hook before acknowledging. The host closes stdin after this response, and `serve_stdio` exits after transport handlers and scopes are joined. Unexpected EOF also drains scopes. Health reports safe task counts globally and per guild; payloads and panic text are excluded.
@@ -22,13 +24,15 @@ The process contract is versioned separately from the crate version:
 | --- | --- |
 | `manifest_version` | Host package validation selects the supported manifest version; the SDK returns the declared manifest unchanged |
 | `protocol_major` | Exactly `1` |
-| `protocol_minor_min` | Exactly `0` or `1`; the host hello must select that exact minor |
+| `protocol_minor_min` | Exactly `0`, `1`, or `2`; minor `2` requires manifest v3 and the host hello must select that exact minor |
 | `host_api` | Valid SemVer requirement matching the deploying host API; checked by the host |
 | `target` | Exact host target triple; example staging targets `x86_64-unknown-linux-gnu` |
 | `version` | Valid module SemVer; independent of document schema version |
 | Provided/consumed contracts | Explicit contract name and SemVer compatibility, plus a valid guild binding |
 
 Protocol 1.0 keeps its strict `initialize` payload `{session,generation,mode}` and original hook. Protocol 1.1 requires `{session,generation,mode,runtime}`, where `runtime` is `{}` when no directory is configured, or `{"data_directory":"/absolute/operator/path"}`. A null `data_directory` also means absent. Unknown initialization/runtime fields, a missing or null runtime object in 1.1, any runtime field in 1.0, unknown versions, and session/generation mismatches are rejected before module code runs. There is no silent downgrade. A 1.0 module does not receive 1.1 fields.
+
+Protocol 1.2 retains the 1.1 initialization envelope and adds a required `member` invocation field: null for lifecycle/background, or `{user_id,channel_id,interaction_id,permissions}` for authenticated member ingress. Protocol 1.0/1.1 invocation envelopes reject this field. Old manifest decoders reject v3 audiences and callback declarations.
 
 Unknown manifest fields are rejected. Do not assume adding a field is backward-compatible. A breaking wire change requires a new major and explicit host/module support; extensions require qualification on both sides before claiming compatibility. Installation checks a manifest and artifact, and execution still requires a matching handshake, fresh identity and granted capabilities. A successful install alone does not qualify module behavior.
 

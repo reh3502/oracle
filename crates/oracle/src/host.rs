@@ -134,6 +134,16 @@ impl Host {
                     )
                     .await?;
             }
+            for mutations in &config.member_mutations {
+                modules
+                    .configure_member_mutations(
+                        &PolicyContext::LocalOperator,
+                        &mutations.guild,
+                        &mutations.module,
+                        Some(mutations.policy.clone()),
+                    )
+                    .await?;
+            }
             for reads in &config.member_reads {
                 modules
                     .configure_member_reads(

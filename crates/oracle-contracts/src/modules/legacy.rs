@@ -73,6 +73,7 @@ fn version_one<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> 
 impl From<ModuleManifestV1> for ModuleManifest {
     fn from(v: ModuleManifestV1) -> Self {
         Self {
+            member_permissions: Vec::new(),
             manifest_version: v.manifest_version,
             id: v.id,
             version: v.version,
@@ -95,6 +96,8 @@ impl From<ModuleManifestV1> for ModuleManifest {
                 .operations
                 .into_iter()
                 .map(|o| ModuleOperation {
+                    callback_methods: Vec::new(),
+                    callback_collections: Vec::new(),
                     ai: o.ai,
                     name: o.name,
                     description: o.description,

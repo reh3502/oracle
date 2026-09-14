@@ -17,8 +17,8 @@ pub use manager::{
     EventDispatch, EventHealth, NotificationCheck, NotificationRequest, NotificationTransport,
 };
 
-pub use manager::MemberInvocation;
 pub use manager::ModuleCatalogEntry;
+pub use manager::{MemberInvocation, MemberMutationInvocation};
 
 mod registry;
 pub use registry::RegistryDispatchPermit;

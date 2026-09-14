@@ -65,6 +65,13 @@ impl Generation {
         if self.gate.authority(handle)?.audience == oracle_core::ModuleAudience::MemberRead {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
+        let authority = self.gate.authority(handle)?;
+        if let Some(methods) = &authority.callback_methods
+            && (!matches!(method, "host.document_get" | "host.document_batch")
+                || !methods.contains(method))
+        {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
         match method {
             "host.health" => {
                 let request: HealthRequest = decode(params)?;
@@ -146,6 +153,13 @@ impl Generation {
             "host.document_get" => {
                 let request: Get = decode(params)?;
                 let authority = self.storage_authority(&request.invocation)?;
+                if authority
+                    .callback_collections
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&request.collection))
+                {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
                 self.collection(&request.collection)?;
                 valid_key(&request.key)?;
                 let result = self
@@ -182,6 +196,13 @@ impl Generation {
                 }
                 let mut keys = BTreeSet::new();
                 for write in &request.writes {
+                    if authority
+                        .callback_collections
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(&write.collection))
+                    {
+                        return Err(error(ErrorCode::ForbiddenPermission));
+                    }
                     valid_key(&write.key)?;
                     let schema = self.collection(&write.collection)?;
                     if !keys.insert((&write.collection, &write.key))

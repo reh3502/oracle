@@ -38,11 +38,13 @@ fn legacy_configuration_keeps_opt_in_defaults_and_relative_resolution() {
     let config = load(root.path(), &legacy()).unwrap();
     assert!(config.module_runtime.is_empty());
     assert!(config.member_reads.is_empty());
+    assert!(config.member_mutations.is_empty());
     assert_eq!(config.state_dir, root.path().join("state"));
     assert_eq!(config.source_path, Some(root.path().join("oracle.json")));
     let encoded = serde_json::to_value(&config).unwrap();
     assert!(encoded.get("module_runtime").is_none());
     assert!(encoded.get("member_reads").is_none());
+    assert!(encoded.get("member_mutations").is_none());
     assert!(encoded.get("source_path").is_none());
 }
 #[test]
@@ -224,4 +226,27 @@ async fn valid_dedicated_runtime_directory_is_prepared_without_discord_or_ai() {
         0o700
     );
     host.close().await.unwrap();
+}
+
+#[test]
+fn member_mutation_scopes_are_separate_bounded_and_default_deny() {
+    let root = scratch();
+    let entry = json!({"guild":"100","module":"community.dandys-world","policy":{"channels":["300"],"permission_roles":{"manage_all_runs":["400"]},"per_user_per_minute":20,"per_guild_per_minute":200}});
+    let mut value = legacy();
+    value["member_mutations"] = json!([entry.clone()]);
+    let config = load(root.path(), &value).unwrap();
+    assert!(config.member_reads.is_empty());
+    assert_eq!(config.member_mutations.len(), 1);
+    value["member_mutations"] = json!([entry.clone(), entry.clone()]);
+    assert!(load(root.path(), &value).is_err());
+    value["member_mutations"] = json!(vec![entry.clone(); 1025]);
+    assert!(load(root.path(), &value).is_err());
+    let mut foreign = entry.clone();
+    foreign["guild"] = json!("999");
+    value["member_mutations"] = json!([foreign]);
+    assert!(load(root.path(), &value).is_err());
+    let mut forged = entry;
+    forged["policy"]["actor"] = json!("200");
+    value["member_mutations"] = json!([forged]);
+    assert!(load(root.path(), &value).is_err());
 }

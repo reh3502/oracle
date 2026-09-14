@@ -11,6 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub(crate) struct Authority {
+    pub member: Option<oracle_core::member_mutation::MemberMutationPermit>,
+    pub callback_methods: Option<BTreeSet<String>>,
+    pub callback_collections: Option<BTreeSet<String>>,
     pub audience: oracle_core::ModuleAudience,
     pub guild: GuildId,
     pub epoch: u64,
@@ -113,6 +116,9 @@ impl Admission {
     pub fn authority(&self, handle: &str) -> Result<Authority> {
         let state = self.state.lock().unwrap();
         let authority = state.leases.get(handle).ok_or_else(unavailable)?;
+        if let Some(member) = &authority.member {
+            member.check()?;
+        }
         if authority.cancel.is_cancelled() || authority.deadline <= Instant::now() {
             return Err(unavailable());
         }
@@ -125,6 +131,9 @@ impl Admission {
         let authority = state.leases.get(handle).ok_or_else(unavailable)?;
         if authority.cancel.is_cancelled() || authority.deadline <= Instant::now() {
             return Err(unavailable());
+        }
+        if let Some(member) = &authority.member {
+            return member.dispatch(send);
         }
         Ok(send())
     }
@@ -204,6 +213,9 @@ mod tests {
     use super::*;
     fn authority(guild: &str, epoch: u64) -> Authority {
         Authority {
+            member: None,
+            callback_methods: None,
+            callback_collections: None,
             audience: oracle_core::ModuleAudience::Operator,
             guild: guild.parse().unwrap(),
             epoch,
@@ -214,6 +226,42 @@ mod tests {
             configuration_revision: None,
             cancel: CancellationToken::new(),
         }
+    }
+    #[test]
+    fn member_policy_revocation_fences_callback_and_final_dispatch() {
+        use oracle_core::member_mutation::{MemberMutationGate, MemberMutationPolicy};
+        let policy = MemberMutationGate::default();
+        let guild: GuildId = "123".parse().unwrap();
+        let module: oracle_core::ModuleId = "fixture.mutation".parse().unwrap();
+        policy
+            .configure(
+                guild.clone(),
+                module.clone(),
+                Some(MemberMutationPolicy::default()),
+            )
+            .unwrap();
+        let gate = Arc::new(Admission::default());
+        gate.activate(guild.clone(), 1).unwrap();
+        let mut auth = authority("123", 1);
+        let permit = policy.worker(&guild, &module).unwrap();
+        auth.cancel = permit.cancellation();
+        auth.member = Some(permit);
+        let lease = gate.admit(auth).unwrap();
+        assert_eq!(gate.dispatch(&lease.handle, || 42).unwrap(), 42);
+        policy.invalidate_all();
+        assert!(gate.authority(&lease.handle).is_err());
+        assert!(
+            gate.dispatch(&lease.handle, || panic!(
+                "revoked dispatch must not execute"
+            ))
+            .is_err()
+        );
+        let mut new_auth = authority("123", 1);
+        new_auth.member = Some(policy.worker(&guild, &module).unwrap());
+        let new_lease = gate.admit(new_auth).unwrap();
+        assert!(gate.authority(&new_lease.handle).is_ok());
+        gate.fence(Some(&guild));
+        assert!(gate.authority(&new_lease.handle).is_err());
     }
     #[tokio::test]
     async fn quiescing_drains_existing_work_and_fences_stale_epoch() {

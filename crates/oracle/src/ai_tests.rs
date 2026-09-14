@@ -77,6 +77,7 @@ pub(super) async fn fixture() -> (tempfile::TempDir, Arc<Host>, Arc<World>) {
         source_path: None,
         module_runtime: Default::default(),
         member_reads: vec![],
+        member_mutations: vec![],
         version: 1,
         state_dir: root.path().join("state"),
         database: if std::env::var_os("ORACLE_TEST_AI_POSTGRES_URL").is_some() {

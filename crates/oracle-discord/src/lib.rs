@@ -294,6 +294,7 @@ impl DiscordBootstrap {
     fn set_gateway_coverage(&self, connected: bool) {
         if !connected {
             self.core.member_read_gate().invalidate_all();
+            self.core.member_mutation_gate().invalidate_all();
         }
         if let Some(runtime) = &self.runtime {
             let intents = if connected {
@@ -583,6 +584,7 @@ impl discord::EventHandler for DiscordBootstrap {
             match gateway_events::normalize(event, runtime.bot.load(Ordering::SeqCst), now) {
                 gateway_events::Normalized::Audit(guild, events) => {
                     self.core.member_read_gate().invalidate_guild(&guild);
+                    self.core.member_mutation_gate().invalidate_guild(&guild);
                     if events
                         .first()
                         .is_some_and(|event| event.origin == oracle_core::GuildEventOrigin::Unknown)
@@ -597,6 +599,7 @@ impl discord::EventHandler for DiscordBootstrap {
                 }
                 gateway_events::Normalized::Event(guild, event) => {
                     self.core.member_read_gate().invalidate_guild(&guild);
+                    self.core.member_mutation_gate().invalidate_guild(&guild);
                     if event.origin == oracle_core::GuildEventOrigin::Unknown {
                         runtime.unknown_origins.fetch_add(1, Ordering::Relaxed);
                     }
@@ -606,6 +609,7 @@ impl discord::EventHandler for DiscordBootstrap {
                 }
                 gateway_events::Normalized::MemberRolesGap(guild) => {
                     self.core.member_read_gate().invalidate_guild(&guild);
+                    self.core.member_mutation_gate().invalidate_guild(&guild);
                     if self
                         .core
                         .status(&PolicyContext::LocalOperator, Some(&guild))

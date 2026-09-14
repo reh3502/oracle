@@ -45,6 +45,7 @@ async fn host_startup_pauses_interrupted_discord_runs_and_settles_cancelled_spen
         source_path: None,
         module_runtime: Default::default(),
         member_reads: vec![],
+        member_mutations: vec![],
         version: 1,
         state_dir: root.path().join("state"),
         database: if std::env::var_os("ORACLE_TEST_AI_POSTGRES_URL").is_some() {
@@ -346,6 +347,8 @@ fn catalog_unprojectable_or_colliding_module_tools_cannot_remove_core_operations
         generation: 1,
         epoch: 1,
         operations: vec![ModuleOperation {
+            callback_methods: vec![],
+            callback_collections: vec![],
             audience: oracle_core::ModuleAudience::Operator,
             name: name.into(),
             description: "Inspect unrelated state".into(),

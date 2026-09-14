@@ -34,6 +34,7 @@ impl PolicyContext {
 }
 
 pub struct CoreService {
+    member_mutations: crate::member_mutation::MemberMutationGate,
     member_reads: crate::member_read::MemberReadGate,
     repository: Arc<dyn Repository>,
     policies: BTreeMap<GuildId, GuildPolicy>,
@@ -53,12 +54,16 @@ pub trait EffectAdapter: Send + Sync {
 impl CoreService {
     pub fn new(repository: Arc<dyn Repository>, policies: Vec<GuildPolicy>) -> Self {
         Self {
+            member_mutations: crate::member_mutation::MemberMutationGate::default(),
             member_reads: crate::member_read::MemberReadGate::default(),
             repository,
             modules: RwLock::new(BTreeMap::new()),
             policies: policies.into_iter().map(|p| (p.guild.clone(), p)).collect(),
             mutation: tokio::sync::Mutex::new(()),
         }
+    }
+    pub fn member_mutation_gate(&self) -> crate::member_mutation::MemberMutationGate {
+        self.member_mutations.clone()
     }
     pub fn member_read_gate(&self) -> crate::member_read::MemberReadGate {
         self.member_reads.clone()
@@ -174,6 +179,7 @@ impl CoreService {
             .await?;
         if paused {
             self.member_reads.invalidate_guild(guild);
+            self.member_mutations.invalidate_guild(guild);
         }
         Ok(receipt)
     }

@@ -427,7 +427,7 @@ fn validate_card_presentation(pointer: &str, schema: &Value) -> Result<()> {
 pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     if !matches!(
         (manifest.manifest_version, manifest.protocol_minor_min),
-        (1, 0) | (2, 1)
+        (1, 0) | (2, 1) | (3, 2)
     ) || manifest.protocol_major != 1
         || manifest.target != HOST_TARGET
     {
@@ -438,13 +438,38 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         semver::VersionReq::parse(&manifest.host_api).map_err(|_| err(ErrorCode::Compatibility))?;
     if !host.matches(&semver::Version::new(
         1,
-        if manifest.manifest_version == 2 { 3 } else { 0 },
+        match manifest.manifest_version {
+            3 => 4,
+            2 => 3,
+            _ => 0,
+        },
         0,
     )) || (manifest.manifest_version == 2
         && (host.matches(&semver::Version::new(1, 0, 0))
             || host.matches(&semver::Version::new(1, 0, u64::MAX))))
     {
         return Err(err(ErrorCode::Compatibility));
+    }
+    if manifest.manifest_version == 3
+        && (0..4).any(|minor| {
+            host.matches(&semver::Version::new(1, minor, 0))
+                || host.matches(&semver::Version::new(1, minor, u64::MAX))
+        })
+    {
+        return Err(err(ErrorCode::Compatibility));
+    }
+    if (manifest.manifest_version < 3
+        && (!manifest.member_permissions.is_empty()
+            || manifest.operations.iter().any(|o| {
+                o.audience == ModuleAudience::MemberMutation
+                    || !o.callback_methods.is_empty()
+                    || !o.callback_collections.is_empty()
+            })))
+        || manifest.member_permissions.len() > 16
+        || !unique(manifest.member_permissions.iter().map(String::as_str))
+        || manifest.member_permissions.iter().any(|p| !name(p))
+    {
+        return Err(err(ErrorCode::InvalidInput));
     }
     let uses_cards = manifest.commands.as_ref().is_some_and(|commands| {
         commands
@@ -619,7 +644,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
             {
                 return Err(err(ErrorCode::InvalidInput));
             }
-            if manifest.manifest_version == 2 {
+            if manifest.manifest_version >= 2 {
                 let input = route
                     .input
                     .as_ref()
@@ -665,8 +690,9 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         {
             return Err(err(ErrorCode::InvalidInput));
         }
-        if operation.audience == ModuleAudience::MemberRead
-            && (!operation.capabilities.is_empty()
+        if operation.audience != ModuleAudience::Operator
+            && ((operation.audience == ModuleAudience::MemberRead
+                && !operation.capabilities.is_empty())
                 || operation.ai.is_some()
                 || manifest
                     .migrations
@@ -691,6 +717,32 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                     operation.name.as_str(),
                     "initialize" | "shutdown" | "activate" | "deactivate"
                 ))
+        {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+        if operation.audience != ModuleAudience::MemberMutation
+            && (manifest.manifest_version != 3 || operation.name != "maintenance")
+        {
+            if !operation.callback_methods.is_empty() || !operation.callback_collections.is_empty()
+            {
+                return Err(err(ErrorCode::InvalidInput));
+            }
+        } else if operation.ai.is_some()
+            || operation.callback_methods.len() > 2
+            || !unique(operation.callback_methods.iter().map(String::as_str))
+            || !unique(operation.callback_collections.iter().map(String::as_str))
+            || operation
+                .callback_collections
+                .iter()
+                .any(|c| !manifest.collections.iter().any(|v| &v.name == c))
+            || operation.capabilities.iter().any(|c| c != "storage.own")
+            || operation
+                .callback_methods
+                .iter()
+                .any(|m| !matches!(m.as_str(), "host.document_get" | "host.document_batch"))
+            || (!operation.callback_methods.is_empty()
+                && (!operation.capabilities.iter().any(|c| c == "storage.own")
+                    || operation.callback_collections.is_empty()))
         {
             return Err(err(ErrorCode::InvalidInput));
         }
@@ -1383,6 +1435,55 @@ mod tests {
                     {"name":"details","description":"Include details","required":false,"type":"boolean"}]},
                 "presentation":{"kind":"plain_text_v1","pointer":"/reply"}}]}
         })).unwrap()
+    }
+    #[test]
+    fn member_mutation_requires_v3_and_scoped_declared_callbacks() {
+        let mut m = member_manifest();
+        m.manifest_version = 3;
+        m.protocol_minor_min = 2;
+        m.host_api = "^1.4".into();
+        m.commands = None;
+        m.member_permissions = vec!["manage_all_runs".into()];
+        m.capabilities = vec!["storage.own".into()];
+        m.collections = vec![oracle_core::ModuleCollection {
+            name: "runs".into(),
+            schema: json!({"type":"object"}),
+        }];
+        m.operations[0].audience = ModuleAudience::MemberMutation;
+        m.operations[0].capabilities = vec!["storage.own".into()];
+        m.operations[0].callback_methods = vec!["host.document_get".into()];
+        m.operations[0].callback_collections = vec!["runs".into()];
+        validate_manifest(&m).unwrap();
+        for api in ["^1.3", ">=1.0", "~1.3"] {
+            let mut bad = m.clone();
+            bad.host_api = api.into();
+            assert!(validate_manifest(&bad).is_err());
+        }
+        for method in [
+            "host.echo",
+            "host.notify",
+            "host.contract_invoke",
+            "unknown",
+        ] {
+            let mut bad = m.clone();
+            bad.operations[0].callback_methods = vec![method.into()];
+            assert!(validate_manifest(&bad).is_err());
+        }
+        let mut bad = m.clone();
+        bad.operations[0].callback_collections = vec!["foreign".into()];
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = m.clone();
+        bad.operations[0].audience = ModuleAudience::MemberRead;
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = m.clone();
+        bad.operations[0].name = "initialize".into();
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = m.clone();
+        bad.operations[0].capabilities.clear();
+        assert!(validate_manifest(&bad).is_err());
+        m.operations[0].audience = ModuleAudience::Operator;
+        m.operations[0].name = "maintenance".into();
+        validate_manifest(&m).unwrap();
     }
     #[test]
     fn cards_require_host_api_1_2_and_declared_reply_shape() {

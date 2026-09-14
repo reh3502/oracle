@@ -29,8 +29,11 @@ mod events;
 pub use events::{
     EventDispatch, EventHealth, NotificationCheck, NotificationRequest, NotificationTransport,
 };
+#[path = "member_mutations.rs"]
+mod member_mutations;
 #[path = "member_reads.rs"]
 mod member_reads;
+pub use member_mutations::MemberMutationInvocation;
 mod recovery;
 mod upgrade;
 pub use member_reads::MemberInvocation;

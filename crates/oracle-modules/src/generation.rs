@@ -145,7 +145,7 @@ impl Generation {
             return Err(error(ErrorCode::InvalidInput));
         }
         let minor = installed.package.manifest.protocol_minor_min;
-        if minor > 1 || (minor == 0 && data_directory.is_some()) {
+        if minor > 2 || (minor == 0 && data_directory.is_some()) {
             return Err(error(ErrorCode::Compatibility));
         }
         if installed
@@ -192,7 +192,7 @@ impl Generation {
             }
             let mut initialize =
                 json!({"session":generation.session,"generation":number,"mode":mode});
-            if minor == 1 {
+            if minor >= 1 {
                 initialize["runtime"] = match data_directory {
                     Some(path) => json!({"data_directory":path}),
                     None => json!({}),
@@ -297,6 +297,7 @@ impl Generation {
             configuration_revision,
             expected_epoch,
             None,
+            None,
         )
         .await
     }
@@ -322,6 +323,32 @@ impl Generation {
             None,
             Some(epoch),
             Some(permit),
+            None,
+        )
+        .await
+    }
+    pub async fn invoke_member_mutation(
+        &self,
+        actor: &oracle_core::member_read::MemberContext,
+        operation: &str,
+        input: Value,
+        epoch: u64,
+        permit: oracle_core::member_mutation::MemberMutationPermit,
+    ) -> Result<Value> {
+        self.invoke_inner(
+            PolicyContext::Discord {
+                guild: actor.guild.clone(),
+                user: actor.user.clone(),
+                manage_guild: false,
+            },
+            &actor.guild,
+            operation,
+            input,
+            None,
+            None,
+            Some(epoch),
+            None,
+            Some(permit),
         )
         .await
     }
@@ -336,6 +363,7 @@ impl Generation {
         configuration_revision: Option<u64>,
         expected_epoch: Option<u64>,
         member: Option<oracle_core::member_read::MemberReadPermit>,
+        mutation: Option<oracle_core::member_mutation::MemberMutationPermit>,
     ) -> Result<Value> {
         if !self.normal || !self.process().is_alive() {
             return Err(unavailable());
@@ -351,6 +379,10 @@ impl Generation {
             .iter()
             .find(|op| op.name == operation)
             .ok_or_else(|| error(ErrorCode::NotFound))?;
+        if self.installed.package.manifest.manifest_version == 3 && operation.name == "maintenance"
+        {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
         validate_input(operation, &input)?;
         if member.is_some() && operation.audience != oracle_core::ModuleAudience::MemberRead {
             return Err(error(ErrorCode::ForbiddenPermission));
@@ -359,6 +391,14 @@ impl Generation {
             && !operation.capabilities.is_empty()
         {
             return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        if (mutation.is_some())
+            != (operation.audience == oracle_core::ModuleAudience::MemberMutation)
+        {
+            return Err(error(ErrorCode::ForbiddenPermission));
+        }
+        if let Some(permit) = &mutation {
+            permit.check()?;
         }
         if let Some(permit) = &member {
             permit.check()?;
@@ -378,6 +418,13 @@ impl Generation {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         let mut authority = Authority {
+            member: mutation.clone(),
+            callback_methods: mutation
+                .as_ref()
+                .map(|_| operation.callback_methods.iter().cloned().collect()),
+            callback_collections: mutation
+                .as_ref()
+                .map(|_| operation.callback_collections.iter().cloned().collect()),
             audience: operation.audience,
             guild: guild.clone(),
             epoch: active.epoch,
@@ -409,9 +456,31 @@ impl Generation {
             authority.cancel = parent.cancel.child_token();
             authority.actor = parent.actor;
         }
+        if let Some(permit) = &mutation {
+            authority.cancel = permit.cancellation();
+            authority.deadline = authority
+                .deadline
+                .min(Instant::from_std(permit.expires_at()));
+        }
         authority.capabilities = capabilities;
         let lease = self.gate.admit(authority)?;
-        let result=self.process().call_with_cancel("operation.invoke",json!({"invocation":lease.handle,"session":self.session,"generation":self.number,"guild":guild,"epoch":active.epoch,"operation":operation.name,"input":input}),lease.authority.deadline.saturating_duration_since(Instant::now()),lease.authority.cancel.clone()).await.map_err(runtime_error)?;
+        let mut envelope = json!({"invocation":lease.handle,"session":self.session,"generation":self.number,"guild":guild,"epoch":active.epoch,"operation":operation.name,"input":input});
+        if self.installed.package.manifest.manifest_version == 3 {
+            envelope["member"] = json!(mutation.as_ref().and_then(|permit| permit.actor()));
+        }
+        let result = self
+            .process()
+            .call_with_cancel(
+                "operation.invoke",
+                envelope,
+                lease
+                    .authority
+                    .deadline
+                    .saturating_duration_since(Instant::now()),
+                lease.authority.cancel.clone(),
+            )
+            .await
+            .map_err(runtime_error)?;
         self.gate.authority(&lease.handle)?;
         if let Some(permit) = &member {
             permit.check()?;
@@ -425,6 +494,7 @@ impl Generation {
         event: GuildEvent,
         configuration_revision: u64,
         cancel: CancellationToken,
+        worker: Option<oracle_core::member_mutation::MemberMutationPermit>,
     ) -> Result<Value> {
         if !self.normal
             || !self.process().is_alive()
@@ -447,7 +517,32 @@ impl Generation {
         if !active.grants.contains("events.guild") || !active.grants.contains("config.own") {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
+        let maintenance = if self.installed.package.manifest.manifest_version == 3
+            && event.kind == oracle_core::GuildEventKind::Maintenance
+        {
+            let operation = self
+                .installed
+                .package
+                .manifest
+                .operations
+                .iter()
+                .find(|op| op.name == "maintenance")
+                .ok_or_else(|| error(ErrorCode::ForbiddenPermission))?;
+            if worker.is_none()
+                || operation.audience != oracle_core::ModuleAudience::Operator
+                || operation.capabilities.iter().any(|c| c != "storage.own")
+            {
+                return Err(error(ErrorCode::ForbiddenPermission));
+            }
+            Some(operation)
+        } else {
+            None
+        };
         let authority = Authority {
+            member: worker.clone(),
+            callback_methods: maintenance.map(|op| op.callback_methods.iter().cloned().collect()),
+            callback_collections: maintenance
+                .map(|op| op.callback_collections.iter().cloned().collect()),
             audience: oracle_core::ModuleAudience::Operator,
             guild: guild.clone(),
             epoch: active.epoch,
@@ -458,19 +553,37 @@ impl Generation {
                 .manifest
                 .capabilities
                 .iter()
-                .filter(|c| active.grants.contains(*c))
+                .filter(|c| {
+                    active.grants.contains(*c)
+                        && maintenance.is_none_or(|op| op.capabilities.contains(c))
+                })
                 .cloned()
                 .collect(),
             deadline: Instant::now() + Duration::from_secs(30),
             depth: 0,
             configuration_revision: Some(configuration_revision),
-            cancel,
+            cancel: worker
+                .as_ref()
+                .map_or(cancel, |permit| permit.cancellation()),
         };
         let lease = self.gate.admit(authority)?;
-        let value = self.process().call_with_cancel("event.deliver", json!({
+        let mut envelope = json!({
             "invocation":lease.handle,"session":self.session,"generation":self.number,"guild":guild,"epoch":active.epoch,
             "operation":"event.deliver","input":event
-        }), Duration::from_secs(30), lease.authority.cancel.clone()).await.map_err(runtime_error)?;
+        });
+        if self.installed.package.manifest.manifest_version == 3 {
+            envelope["member"] = Value::Null;
+        }
+        let value = self
+            .process()
+            .call_with_cancel(
+                "event.deliver",
+                envelope,
+                Duration::from_secs(30),
+                lease.authority.cancel.clone(),
+            )
+            .await
+            .map_err(runtime_error)?;
         self.gate.authority(&lease.handle)?;
         Ok(value)
     }

@@ -1,11 +1,13 @@
 //! Versioned module wire and persistence contracts. Native execution is operator-trusted.
-use crate::{GuildId, ModuleId};
+use crate::{GuildId, ModuleId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ModuleManifest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_permissions: Vec<String>,
     pub manifest_version: u32,
     pub id: ModuleId,
     pub version: String,
@@ -40,6 +42,10 @@ pub struct ModuleManifest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleOperation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_collections: Vec<String>,
     #[serde(default, skip_serializing_if = "ModuleAudience::is_operator")]
     pub audience: ModuleAudience,
     /// Optional reviewed projection; absence keeps the operation out of model tools.
@@ -289,6 +295,7 @@ pub enum ModuleAudience {
     #[default]
     Operator,
     MemberRead,
+    MemberMutation,
 }
 impl ModuleAudience {
     pub fn is_operator(&self) -> bool {
@@ -358,6 +365,43 @@ struct ModuleManifestV2 {
     pub provides: Vec<ProvidedContract>,
     #[serde(default)]
     pub consumes: Vec<ConsumedContract>,
+    pub operations: Vec<ModuleOperationV2>,
+    #[serde(default)]
+    pub collections: Vec<ModuleCollection>,
+    #[serde(default)]
+    pub migrations: Vec<ModuleMigration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<ModuleConfiguration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<GuildEventKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<ModuleCommands>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ModuleRuntimeRequirements>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleManifestV3 {
+    #[serde(deserialize_with = "version_three")]
+    pub manifest_version: u32,
+    #[serde(default)]
+    pub member_permissions: Vec<String>,
+    pub id: ModuleId,
+    pub version: String,
+    pub target: String,
+    pub protocol_major: u32,
+    pub protocol_minor_min: u32,
+    pub host_api: String,
+    pub data_version: u32,
+    pub readable_data_versions: Vec<u32>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub required_intents: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<ProvidedContract>,
+    #[serde(default)]
+    pub consumes: Vec<ConsumedContract>,
     pub operations: Vec<ModuleOperation>,
     #[serde(default)]
     pub collections: Vec<ModuleCollection>,
@@ -371,6 +415,40 @@ struct ModuleManifestV2 {
     pub commands: Option<ModuleCommands>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ModuleRuntimeRequirements>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ModuleOperationV2 {
+    #[serde(
+        default,
+        deserialize_with = "legacy_audience",
+        skip_serializing_if = "ModuleAudience::is_operator"
+    )]
+    pub audience: ModuleAudience,
+    /// Optional reviewed projection; absence keeps the operation out of model tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<ModuleAiOperation>,
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub output_schema: Value,
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+fn legacy_audience<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ModuleAudience, D::Error> {
+    let audience = ModuleAudience::deserialize(d)?;
+    if audience == ModuleAudience::MemberMutation {
+        return Err(serde::de::Error::custom("v3 audience"));
+    }
+    Ok(audience)
+}
+fn version_three<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let version = u32::deserialize(d)?;
+    if version != 3 {
+        return Err(serde::de::Error::custom("expected manifest version 3"));
+    }
+    Ok(version)
 }
 fn version_two<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let version = u32::deserialize(d)?;
@@ -386,10 +464,50 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         enum Wire {
             V1(legacy::ModuleManifestV1),
             V2(ModuleManifestV2),
+            V3(ModuleManifestV3),
         }
         Ok(match Wire::deserialize(d)? {
             Wire::V1(v) => v.into(),
             Wire::V2(v) => Self {
+                member_permissions: Vec::new(),
+                manifest_version: v.manifest_version,
+                id: v.id,
+                version: v.version,
+                target: v.target,
+                protocol_major: v.protocol_major,
+                protocol_minor_min: v.protocol_minor_min,
+                host_api: v.host_api,
+                data_version: v.data_version,
+                readable_data_versions: v.readable_data_versions,
+                capabilities: v.capabilities,
+                required_intents: v.required_intents,
+                provides: v.provides,
+                consumes: v.consumes,
+                collections: v.collections,
+                migrations: v.migrations,
+                configuration: v.configuration,
+                subscriptions: v.subscriptions,
+                operations: v
+                    .operations
+                    .into_iter()
+                    .map(|o| ModuleOperation {
+                        callback_methods: Vec::new(),
+                        callback_collections: Vec::new(),
+                        audience: o.audience,
+                        ai: o.ai,
+                        name: o.name,
+                        description: o.description,
+                        input_schema: o.input_schema,
+                        output_schema: o.output_schema,
+                        timeout_ms: o.timeout_ms,
+                        capabilities: o.capabilities,
+                    })
+                    .collect(),
+                commands: v.commands,
+                runtime: v.runtime,
+            },
+            Wire::V3(v) => Self {
+                member_permissions: v.member_permissions,
                 manifest_version: v.manifest_version,
                 id: v.id,
                 version: v.version,
@@ -593,8 +711,40 @@ mod version_tests {
         bad["runtime"] = json!({"data_directory_required":false});
         assert!(serde_json::from_value::<ModuleManifest>(bad).is_err());
         let mut bad = value;
-        bad["manifest_version"] = json!(3);
+        bad["manifest_version"] = json!(4);
         assert!(serde_json::from_value::<ModuleManifest>(bad).is_err());
+    }
+    #[test]
+    fn v3_extensions_round_trip_and_old_decoders_reject_them() {
+        let mut value = legacy();
+        value["manifest_version"] = json!(3);
+        value["protocol_minor_min"] = json!(2);
+        value["host_api"] = json!("^1.4");
+        value["member_permissions"] = json!(["manage_all_runs"]);
+        value["operations"][0]["audience"] = json!("member_mutation");
+        value["operations"][0]["callback_methods"] = json!(["host.document_get"]);
+        value["operations"][0]["callback_collections"] = json!(["runs"]);
+        let manifest: ModuleManifest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ModuleManifest>(serde_json::to_value(&manifest).unwrap())
+                .unwrap(),
+            manifest
+        );
+        for version in [1, 2] {
+            let mut old = value.clone();
+            old["manifest_version"] = json!(version);
+            assert!(serde_json::from_value::<ModuleManifest>(old).is_err());
+        }
+        for field in ["callback_methods", "callback_collections"] {
+            let mut old = legacy();
+            old["manifest_version"] = json!(2);
+            old["operations"][0][field] = json!([]);
+            assert!(serde_json::from_value::<ModuleManifest>(old).is_err());
+        }
+        let mut old = legacy();
+        old["manifest_version"] = json!(2);
+        old["operations"][0]["audience"] = json!("member_mutation");
+        assert!(serde_json::from_value::<ModuleManifest>(old).is_err());
     }
     #[test]
     fn v1_canonical_bytes_preserve_package_digests() {
@@ -638,4 +788,15 @@ mod version_tests {
         value["commands"]["routes"][0]["input"]["options"][0]["surprise"] = json!(true);
         assert!(serde_json::from_value::<ModuleManifest>(value).is_err());
     }
+}
+
+/// Immutable host-derived member metadata, outside operation input. Possession of
+/// these values does not grant callback authority; only the host lease does.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedMember {
+    pub user_id: UserId,
+    pub channel_id: String,
+    pub interaction_id: String,
+    pub permissions: BTreeSet<String>,
 }

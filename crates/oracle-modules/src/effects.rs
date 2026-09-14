@@ -140,6 +140,9 @@ mod tests {
         gate.activate(guild.clone(), 1).unwrap();
         let lease = gate
             .admit(Authority {
+                member: None,
+                callback_methods: None,
+                callback_collections: None,
                 audience: oracle_core::ModuleAudience::Operator,
                 guild,
                 epoch: 1,

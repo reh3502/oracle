@@ -2,6 +2,7 @@
 //! stdout is reserved for framed RPC. Use tracked scopes for background work.
 #![forbid(unsafe_code)]
 use async_trait::async_trait;
+pub use oracle_contracts::AuthenticatedMember;
 use oracle_contracts::{
     DocumentWrite, EffectiveConfiguration, GuildEvent, GuildId, ModuleDocument, ModuleManifest,
 };
@@ -11,7 +12,7 @@ pub use oracle_task_scope::{HostTasks, SpawnError, TaskError, TaskId, TaskStats}
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -99,6 +100,8 @@ pub struct GuildContext {
 pub struct CallContext {
     peer: RpcPeer,
     invocation: Value,
+    actor: Option<AuthenticatedMember>,
+    member_permissions: BTreeSet<String>,
     guild: GuildId,
     generation: u64,
     epoch: u64,
@@ -106,6 +109,12 @@ pub struct CallContext {
     guild_cancel: CancellationToken,
 }
 impl CallContext {
+    pub fn actor(&self) -> Option<&AuthenticatedMember> {
+        self.actor.as_ref()
+    }
+    pub fn member_permissions(&self) -> &BTreeSet<String> {
+        &self.member_permissions
+    }
     pub fn guild(&self) -> &GuildId {
         &self.guild
     }
@@ -396,6 +405,26 @@ impl<M: Module> RpcHandler for Driver<M> {
         cancel: CancellationToken,
     ) -> Result<Value> {
         if method == "operation.invoke" || method == "event.deliver" {
+            let mut params = params;
+            let manifest = self.module.manifest();
+            let actor: Option<AuthenticatedMember> = if manifest.manifest_version == 3 {
+                let member = params
+                    .as_object_mut()
+                    .and_then(|p| p.remove("member"))
+                    .ok_or_else(denied)?;
+                decode(member)?
+            } else {
+                None
+            };
+            if actor.as_ref().is_some_and(|a| {
+                method == "event.deliver"
+                    || a.permissions.len() > 16
+                    || a.permissions
+                        .iter()
+                        .any(|p| !manifest.member_permissions.contains(p))
+            }) {
+                return Err(denied());
+            }
             let request: Invocation = decode(params)?;
             let guild_cancel = {
                 let state = self.state.lock().unwrap();
@@ -408,6 +437,11 @@ impl<M: Module> RpcHandler for Driver<M> {
             let context = CallContext {
                 peer,
                 invocation: request.invocation,
+                member_permissions: actor
+                    .as_ref()
+                    .map(|a| a.permissions.clone())
+                    .unwrap_or_default(),
+                actor,
                 guild: request.guild,
                 generation: request.generation,
                 epoch: request.epoch,
@@ -471,7 +505,8 @@ impl<M: Module> RpcHandler for Driver<M> {
                 let manifest = self.module.manifest();
                 if request.protocol_major != 1
                     || manifest.protocol_major != 1
-                    || manifest.protocol_minor_min > 1
+                    || (manifest.protocol_minor_min > 2
+                        || (manifest.protocol_minor_min == 2) != (manifest.manifest_version == 3))
                     || request.protocol_minor != manifest.protocol_minor_min
                     || request.session.is_empty()
                 {
@@ -496,7 +531,7 @@ impl<M: Module> RpcHandler for Driver<M> {
                     .ok_or_else(denied)?;
                 let (request, runtime) = match minor {
                     0 => (decode::<Initialize>(params)?, None),
-                    1 => {
+                    1 | 2 => {
                         let request: InitializeV11 = decode(params)?;
                         (
                             Initialize {
@@ -838,6 +873,86 @@ mod tests {
             self.peer.close().await;
             self.server.close().await;
         }
+    }
+    struct ActorProbe;
+    #[async_trait]
+    impl Module for ActorProbe {
+        fn manifest(&self) -> ModuleManifest {
+            let mut m = Probe {
+                saved: Mutex::new(None),
+                entered: tokio::sync::Notify::new(),
+            }
+            .manifest();
+            m.manifest_version = 3;
+            m.protocol_minor_min = 2;
+            m.member_permissions = vec!["manage_all_runs".into()];
+            m
+        }
+        async fn invoke(&self, context: CallContext, _: &str, _: Value) -> Result<Value> {
+            Ok(
+                json!({"actor":context.actor(), "permissions":context.member_permissions(), "guild":context.guild()}),
+            )
+        }
+    }
+    #[tokio::test]
+    async fn authenticated_v3_envelope_is_separate_strict_and_versioned() {
+        let (a, b) = tokio::io::duplex(65536);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let peer = RpcPeer::new(
+            ar,
+            aw,
+            Arc::new(Host {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        let server = RpcPeer::new(br, bw, Arc::new(Driver::new(Arc::new(ActorProbe))));
+        rpc(&peer, "hello", hello(1, 2)).await.unwrap();
+        rpc(
+            &peer,
+            "initialize",
+            json!({"session":"session-one","generation":7,"mode":"normal","runtime":{}}),
+        )
+        .await
+        .unwrap();
+        rpc(&peer, "activate", json!({"guild":"100","epoch":2}))
+            .await
+            .unwrap();
+        let member = json!({"user_id":"123","channel_id":"456","interaction_id":"789","permissions":["manage_all_runs"]});
+        let mut request = Harness::invocation("read");
+        assert!(
+            rpc(&peer, "operation.invoke", request.clone())
+                .await
+                .is_err()
+        );
+        request["member"] = member.clone();
+        request["input"] = json!({"user_id":"999"});
+        let result = rpc(&peer, "operation.invoke", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["actor"], member);
+        assert_eq!(result["guild"], "100");
+        assert_eq!(result["permissions"], json!(["manage_all_runs"]));
+        request["member"]["permissions"] = json!(["administrator"]);
+        assert!(
+            rpc(&peer, "operation.invoke", request.clone())
+                .await
+                .is_err()
+        );
+        request["member"] = Value::Null;
+        assert_eq!(
+            rpc(&peer, "operation.invoke", request.clone())
+                .await
+                .unwrap()["actor"],
+            Value::Null
+        );
+        peer.close().await;
+        server.close().await;
+        let h = Harness::new();
+        h.initialize("normal").await;
+        h.activate("100", 2).await;
+        assert!(h.call("operation.invoke", request).await.is_err());
+        h.close().await;
     }
     struct RuntimeProbe {
         minor: u32,

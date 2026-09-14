@@ -25,6 +25,8 @@ pub struct Config {
         BTreeMap<oracle_core::ModuleId, oracle_modules::runtime_settings::ModuleRuntimeSettings>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_reads: Vec<MemberReads>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_mutations: Vec<MemberMutations>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +34,13 @@ pub struct MemberReads {
     pub guild: oracle_core::GuildId,
     pub module: oracle_core::ModuleId,
     pub policy: oracle_core::member_read::MemberReadPolicy,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberMutations {
+    pub guild: oracle_core::GuildId,
+    pub module: oracle_core::ModuleId,
+    pub policy: oracle_core::member_mutation::MemberMutationPolicy,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
@@ -67,11 +76,22 @@ impl Config {
         }
         let parent = path.parent().unwrap_or(Path::new("."));
         let mut member_scopes = std::collections::BTreeSet::new();
-        if config.member_reads.len() > 1024 || config.module_runtime.len() > 128 {
+        if config.member_mutations.len() > 1024
+            || config.member_reads.len() > 1024
+            || config.module_runtime.len() > 128
+        {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
         for reads in &config.member_reads {
             if !ids.contains(&reads.guild) || !member_scopes.insert((&reads.guild, &reads.module)) {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+        }
+        let mut mutation_scopes = std::collections::BTreeSet::new();
+        for mutations in &config.member_mutations {
+            if !ids.contains(&mutations.guild)
+                || !mutation_scopes.insert((&mutations.guild, &mutations.module))
+            {
                 return Err(Error::new(ErrorCode::InvalidInput));
             }
         }
@@ -150,6 +170,7 @@ pub fn initialize(path: &Path, postgres_env: Option<String>) -> Result<()> {
         source_path: None,
         module_runtime: BTreeMap::new(),
         member_reads: vec![],
+        member_mutations: vec![],
         version: 1,
         state_dir: PathBuf::from("state"),
         database: match postgres_env {
