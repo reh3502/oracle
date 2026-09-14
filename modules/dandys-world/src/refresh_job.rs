@@ -384,14 +384,27 @@ async fn run_inner(
     deadline: Instant,
 ) -> RefreshJobOutcome {
     use RefreshJobOutcome::*;
-    let checking = cancel.clone();
-    let prepared =
-        tokio::task::spawn_blocking(move || prepare(settings, root, &checking, deadline)).await;
-    let prepared = match prepared {
-        Ok(Ok(p)) => p,
-        Ok(Err(_)) if cancel.is_cancelled() => return Cancelled,
-        Ok(Err(e)) => return Failed(e),
-        Err(_) => return Failed(RefreshJobFailure::Storage),
+    let admission_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
+    let prepared = loop {
+        let checking = cancel.clone();
+        let settings = settings.clone();
+        let root = root.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || prepare(settings, root, &checking, deadline)).await;
+        match prepared {
+            Ok(Ok(prepared)) => break prepared,
+            Ok(Err(_)) if cancel.is_cancelled() => return Cancelled,
+            // Busy is returned before staging allocation or process creation.
+            // Await each attempt; never retry a worker that has started.
+            Ok(Err(RefreshJobFailure::Busy)) if Instant::now() < admission_deadline => {
+                tokio::select! {biased; _=cancel.cancelled()=>return Cancelled, _=tokio::time::sleep(Duration::from_millis(25))=>{}}
+            }
+            Ok(Err(RefreshJobFailure::Busy)) if Instant::now() >= deadline => {
+                return Failed(RefreshJobFailure::Timeout);
+            }
+            Ok(Err(error)) => return Failed(error),
+            Err(_) => return Failed(RefreshJobFailure::Storage),
+        }
     };
     let mut command = Command::new(prepared.settings.python.as_ref().unwrap());
     command
@@ -500,6 +513,95 @@ async fn run_inner(
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+    fn admission_fixture() -> (PathBuf, PathBuf, RefreshJobSettings, File) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "dw-job-admission-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let worker = root.join("worker.py");
+        fs::write(&worker,b"from pathlib import Path\nimport sys\np=Path(__file__).with_suffix('.count')\np.write_text(str(int(p.read_text())+1) if p.exists() else '1')\nsys.exit(3)\n").unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o600)).unwrap();
+        let store = root.join("store");
+        Store::new(&store).unwrap();
+        let writer = safe_open()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.join("writer.lock"))
+            .unwrap();
+        writer.lock().unwrap();
+        let settings = RefreshJobSettings {
+            enabled: true,
+            source_access_qualified: true,
+            python: Some(PathBuf::from("/usr/bin/python3")),
+            worker: Some(worker),
+            previous: None,
+        };
+        (root, store, settings, writer)
+    }
+    #[tokio::test]
+    async fn busy_admission_retries_only_before_staging_and_source_execution() {
+        let (root, store, settings, writer) = admission_fixture();
+        let worker = settings.worker.clone().unwrap();
+        let job_store = store.clone();
+        let job =
+            tokio::spawn(async move { run(&settings, &job_store, CancellationToken::new()).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!worker.with_extension("count").exists());
+        assert!(!fs::read_dir(&store).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("refresh-work-")
+        }));
+        writer.unlock().unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), job)
+                .await
+                .unwrap()
+                .unwrap(),
+            RefreshJobOutcome::Denied
+        );
+        assert_eq!(
+            fs::read_to_string(worker.with_extension("count")).unwrap(),
+            "1"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn cancelled_busy_admission_never_allocates_or_starts_after_unlock() {
+        let (root, store, settings, writer) = admission_fixture();
+        let worker = settings.worker.clone().unwrap();
+        let job_store = store.clone();
+        let cancel = CancellationToken::new();
+        let pending = cancel.clone();
+        let job = tokio::spawn(async move { run(&settings, &job_store, pending).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), job)
+                .await
+                .unwrap()
+                .unwrap(),
+            RefreshJobOutcome::Cancelled
+        );
+        writer.unlock().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!worker.with_extension("count").exists());
+        assert!(!fs::read_dir(&store).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("refresh-work-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[tokio::test]
     async fn supervisor_deadline_kills_started_worker_and_cleans_before_unlock() {
         use std::os::unix::fs::PermissionsExt;
