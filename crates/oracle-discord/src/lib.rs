@@ -661,6 +661,7 @@ mod member_transport;
 pub mod notification;
 pub mod operations;
 mod published_interaction;
+pub mod run_reminders;
 pub mod transport;
 
 mod gateway_events;

@@ -159,6 +159,18 @@ fn validate_effect(effect: &SharedEffect) -> Result<()> {
         sid(id)?;
     }
     let payload = &effect.payload;
+    // Only the host journal may freeze a deletion, bound to its existing identity.
+    if payload.is_null() {
+        return if effect.message_id.is_some()
+            && !effect.marker.is_empty()
+            && effect.marker.len() <= 128
+            && !effect.marker.chars().any(char::is_control)
+        {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorCode::InvalidInput))
+        };
+    }
     if effect.marker.is_empty()
         || effect.marker.len() > 128
         || effect.marker.chars().any(char::is_control)
@@ -218,6 +230,9 @@ fn canonical(value: &Value, component: bool) -> Value {
     }
 }
 fn confirms(effect: &SharedEffect, message: &Value) -> bool {
+    if effect.payload.is_null() {
+        return false; // A present message never confirms deletion.
+    }
     if message["channel_id"] != effect.target.channel_id
         || message["guild_id"]
             .as_str()
@@ -274,7 +289,11 @@ impl SharedCardTransport for DiscordSharedCards {
         };
         let (method, path) = match &effect.message_id {
             Some(id) => (
-                Method::PATCH,
+                if effect.payload.is_null() {
+                    Method::DELETE
+                } else {
+                    Method::PATCH
+                },
                 format!(
                     "/api/v10/channels/{}/messages/{id}",
                     effect.target.channel_id
@@ -291,6 +310,13 @@ impl SharedCardTransport for DiscordSharedCards {
             .execute(method, &path, &effect.payload, &guard, &fresh)
             .await;
         match outcome {
+            Ok(response)
+                if effect.payload.is_null()
+                    && ((200..300).contains(&response.status) || response.status == 404) =>
+            {
+                // DELETE acknowledgements (including 404) alone are insufficient.
+                self.observe(effect, cancel).await
+            }
             Ok(response) if (200..300).contains(&response.status) => {
                 if let Some(id) = response.body["id"].as_str().filter(|id| sid(id).is_ok()) {
                     if effect
@@ -412,6 +438,19 @@ mod tests {
         v
     }
 
+    #[test]
+    fn deletion_requires_exact_existing_identity_and_never_confirms_a_present_message() {
+        let original = effect();
+        let message = message(&original);
+        let mut delete = original;
+        delete.payload = Value::Null;
+        assert!(validate_effect(&delete).is_err());
+        delete.message_id = Some("555".into());
+        validate_effect(&delete).unwrap();
+        assert!(!confirms(&delete, &message));
+        delete.message_id = Some("555/other".into());
+        assert!(validate_effect(&delete).is_err());
+    }
     #[test]
     fn real_discord_embed_and_component_roundtrip_preserves_frozen_meaning() {
         let e = effect();

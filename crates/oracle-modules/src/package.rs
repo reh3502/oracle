@@ -440,7 +440,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     if !host.matches(&semver::Version::new(
         1,
         match manifest.manifest_version {
-            3 => 5,
+            3 => 6,
             2 => 3,
             _ => 0,
         },
@@ -449,6 +449,16 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         && (host.matches(&semver::Version::new(1, 0, 0))
             || host.matches(&semver::Version::new(1, 0, u64::MAX))))
     {
+        return Err(err(ErrorCode::Compatibility));
+    }
+    if manifest.operations.iter().any(|op| {
+        op.callback_methods
+            .iter()
+            .any(|method| method == "host.run_reminder")
+    }) && (0..6).any(|minor| {
+        host.matches(&semver::Version::new(1, minor, 0))
+            || host.matches(&semver::Version::new(1, minor, u64::MAX))
+    }) {
         return Err(err(ErrorCode::Compatibility));
     }
     if manifest.manifest_version == 3
@@ -797,7 +807,15 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                 return Err(err(ErrorCode::InvalidInput));
             }
         } else if operation.ai.is_some()
-            || operation.callback_methods.len() > 4
+            || operation.callback_methods.len()
+                > if operation.audience == ModuleAudience::Operator
+                    && manifest.manifest_version == 3
+                    && operation.name == "maintenance"
+                {
+                    5
+                } else {
+                    4
+                }
             || !unique(operation.callback_methods.iter().map(String::as_str))
             || !unique(operation.callback_collections.iter().map(String::as_str))
             || operation
@@ -815,7 +833,10 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                         | "host.document_batch"
                         | "host.shared_card_enqueue"
                         | "host.shared_card_status"
-                )
+                ) && !(m == "host.run_reminder"
+                    && manifest.manifest_version == 3
+                    && operation.name == "maintenance"
+                    && operation.audience == ModuleAudience::Operator)
             })
             || (operation
                 .callback_methods
@@ -826,7 +847,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
             || (operation
                 .callback_methods
                 .iter()
-                .any(|m| m.starts_with("host.shared_card_"))
+                .any(|m| m.starts_with("host.shared_card_") || m == "host.run_reminder")
                 && (!operation
                     .capabilities
                     .iter()
@@ -1624,6 +1645,7 @@ mod tests {
         for method in [
             "host.echo",
             "host.notify",
+            "host.run_reminder",
             "host.contract_invoke",
             "unknown",
         ] {
@@ -1646,6 +1668,43 @@ mod tests {
         m.operations[0].audience = ModuleAudience::Operator;
         m.operations[0].name = "maintenance".into();
         validate_manifest(&m).unwrap();
+        m.capabilities.push("shared_cards.publish".into());
+        m.shared_cards = Some(oracle_core::ModuleSharedCards {
+            collection: "runs".into(),
+            pointer: "/intent".into(),
+        });
+        m.operations[0]
+            .capabilities
+            .push("shared_cards.publish".into());
+        m.operations[0].callback_methods = vec![
+            "host.document_get".into(),
+            "host.document_batch".into(),
+            "host.shared_card_enqueue".into(),
+            "host.shared_card_status".into(),
+            "host.run_reminder".into(),
+        ];
+        assert!(
+            validate_manifest(&m).is_err(),
+            "reminders must declare the newer host API"
+        );
+        m.host_api = "^1.6".into();
+        validate_manifest(&m).unwrap();
+        for audience in [ModuleAudience::MemberMutation, ModuleAudience::MemberRead] {
+            let mut bad = m.clone();
+            bad.operations[0].audience = audience;
+            assert!(validate_manifest(&bad).is_err());
+        }
+        let mut bad = m.clone();
+        bad.operations[0].name = "run".into();
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = m.clone();
+        bad.operations[0].callback_methods = vec!["host.run_reminder".into()];
+        bad.operations[0].capabilities = vec!["storage.own".into()];
+        assert!(validate_manifest(&bad).is_err());
+        let mut bad = m;
+        bad.operations[0].callback_methods = vec!["host.run_reminder".into()];
+        bad.operations[0].callback_collections.clear();
+        assert!(validate_manifest(&bad).is_err());
     }
     #[test]
     fn cards_require_host_api_1_2_and_declared_reply_shape() {

@@ -40,6 +40,15 @@ pub(crate) trait ContractRouter: Send + Sync {
         intent: Option<Value>,
         key: &str,
     ) -> Result<Value>;
+    async fn run_reminder(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        generation: u64,
+        authority: Authority,
+        key: &str,
+        document: Value,
+    ) -> Result<Value>;
     async fn host_health(
         &self,
         module: &ModuleId,

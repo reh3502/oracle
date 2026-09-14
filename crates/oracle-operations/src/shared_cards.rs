@@ -12,6 +12,9 @@ pub struct SharedIntent {
     pub desired_revision: u64,
     #[serde(default)]
     pub repost_generation: u32,
+    /// Permanently remove this publication; never an implicit repost.
+    #[serde(default)]
+    pub delete: bool,
     pub destination: String,
     pub created_at: u64,
     pub card: PrivateCardBody,
@@ -167,6 +170,9 @@ impl SharedRecord {
     ) -> Result<SharedAction> {
         use hmac::Mac;
         let forbidden = || Error::new(ErrorCode::ForbiddenScope);
+        if self.desired.delete {
+            return Err(forbidden());
+        }
         let identity = self.identity.as_ref().ok_or_else(forbidden)?;
         if identity.target.channel_id != channel
             || identity.message_id != message
@@ -383,7 +389,13 @@ impl SharedCardJournal {
                 }
                 return Ok(record);
             }
+            if revision.is_some() && record.desired.delete && !intent.delete {
+                return Err(Error::new(ErrorCode::Conflict));
+            }
             if revision.is_some() && intent.repost_generation != record.desired.repost_generation {
+                if intent.delete || record.desired.delete {
+                    return Err(Error::new(ErrorCode::Conflict));
+                }
                 if record.phase != SharedPhase::Missing
                     || record.effect.is_some()
                     || record.desired.repost_generation.checked_add(1)
@@ -421,6 +433,8 @@ impl SharedCardJournal {
             || effect.desired_revision != record.desired.desired_revision
             || effect.effect_id.is_empty()
             || effect.marker.is_empty()
+            || effect.payload.is_null() != record.desired.delete
+            || (record.desired.delete && record.identity.is_none())
         {
             return Err(Error::new(ErrorCode::Conflict));
         }
@@ -456,7 +470,8 @@ impl SharedCardJournal {
             match &observation {
                 SharedObservation::Unknown => return Ok(record),
                 SharedObservation::Confirmed { message_id } => {
-                    if message_id.is_empty()
+                    if effect.payload.is_null()
+                        || message_id.is_empty()
                         || effect
                             .message_id
                             .as_ref()
@@ -482,7 +497,17 @@ impl SharedCardJournal {
                     };
                 }
                 SharedObservation::Missing if effect.message_id.is_some() => {
-                    record.phase = SharedPhase::Missing
+                    if effect.payload.is_null() {
+                        record.confirmed_revision = Some(effect.desired_revision);
+                        record.phase = if record.desired.desired_revision > effect.desired_revision
+                        {
+                            SharedPhase::Pending
+                        } else {
+                            SharedPhase::Confirmed
+                        };
+                    } else {
+                        record.phase = SharedPhase::Missing;
+                    }
                 }
                 SharedObservation::Missing => return Err(Error::new(ErrorCode::Integrity)),
                 SharedObservation::Rejected => record.phase = SharedPhase::Rejected,
@@ -497,6 +522,30 @@ impl SharedCardJournal {
         }
         Err(Error::new(ErrorCode::Conflict))
     }
+    /// Complete cancellation without a remote write only if no create is in doubt,
+    /// or an earlier authorized read already established that the message is absent.
+    pub async fn complete_unpublished_delete(
+        &self,
+        guild: &GuildId,
+        module: &ModuleId,
+        run_id: &str,
+    ) -> Result<SharedRecord> {
+        let (revision, mut record) = self
+            .get(guild, module, run_id)
+            .await?
+            .ok_or_else(|| Error::new(ErrorCode::NotFound))?;
+        if !record.desired.delete
+            || record.effect.is_some()
+            || record.phase == SharedPhase::Unknown
+            || (record.identity.is_some() && record.phase != SharedPhase::Missing)
+        {
+            return Err(Error::new(ErrorCode::Conflict));
+        }
+        record.phase = SharedPhase::Confirmed;
+        record.confirmed_revision = Some(record.desired.desired_revision);
+        self.save(guild, Some(revision), &record).await?;
+        Ok(record)
+    }
     /// A read-only remote probe positively established that this exact message
     /// is absent while the bot still has access to its channel.
     pub async fn mark_missing(
@@ -510,7 +559,8 @@ impl SharedCardJournal {
             .get(guild, module, run_id)
             .await?
             .ok_or_else(|| Error::new(ErrorCode::NotFound))?;
-        if record.phase != SharedPhase::Confirmed
+        if record.desired.delete
+            || record.phase != SharedPhase::Confirmed
             || record.effect.is_some()
             || record
                 .identity
@@ -529,7 +579,8 @@ impl SharedCardJournal {
             .get(guild, module, run_id)
             .await?
             .ok_or_else(|| Error::new(ErrorCode::NotFound))?;
-        if record.phase != SharedPhase::Missing || record.effect.is_some() {
+        if record.desired.delete || record.phase != SharedPhase::Missing || record.effect.is_some()
+        {
             return Err(Error::new(ErrorCode::Conflict));
         }
         record.identity = None;
@@ -543,4 +594,174 @@ fn decode(record: WorkflowRecord) -> Result<(u64, SharedRecord)> {
     let value =
         serde_json::from_value(record.value).map_err(|_| Error::new(ErrorCode::Integrity))?;
     Ok((record.revision, value))
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+    use oracle_storage::{DatabaseConfig, Storage};
+    use serde_json::json;
+
+    fn intent(revision: u64, delete: bool) -> SharedIntent {
+        serde_json::from_value(json!({"key":"RUN1","desired_revision":revision,"delete":delete,
+            "destination":"runs","created_at":1,"card":{"title":"Run","description":"Run","fields":[],"footer":""},"actions":[]})).unwrap()
+    }
+    fn effect(revision: u64, delete: bool, message: Option<&str>) -> SharedEffect {
+        SharedEffect {
+            effect_id: format!("effect-{revision}"),
+            guild: "123".parse().unwrap(),
+            module: "test.runs".parse().unwrap(),
+            run_id: "RUN1".into(),
+            target: SharedTarget {
+                channel_id: "456".into(),
+                application_id: "789".into(),
+                bot_id: "789".into(),
+            },
+            message_id: message.map(str::to_owned),
+            desired_revision: revision,
+            marker: "marker".into(),
+            payload: if delete {
+                Value::Null
+            } else {
+                json!({"content":"Run"})
+            },
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_unknown_create_recovers_exact_message_then_deletes_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = DatabaseConfig::Sqlite {
+            path: temp.path().join("cancel.sqlite"),
+        };
+        let store = Storage::open(config.clone()).await.unwrap();
+        let create = effect(1, false, None);
+        store
+            .initialize_guilds(std::slice::from_ref(&create.guild))
+            .await
+            .unwrap();
+        let journal = SharedCardJournal::new(Arc::new(store.clone()));
+        journal
+            .enqueue(&create.guild, &create.module, "RUN1", intent(1, false))
+            .await
+            .unwrap();
+        journal.prepare(create.clone()).await.unwrap();
+        journal
+            .enqueue(&create.guild, &create.module, "RUN1", intent(2, true))
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .complete_unpublished_delete(&create.guild, &create.module, "RUN1")
+                .await
+                .is_err()
+        );
+        drop(journal);
+        store.close().await.unwrap();
+        drop(store);
+        let store = Storage::open(config).await.unwrap();
+        let journal = SharedCardJournal::new(Arc::new(store.clone()));
+        let recovered = journal
+            .settle(
+                &create,
+                SharedObservation::Confirmed {
+                    message_id: "1000".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.phase, SharedPhase::Pending);
+        assert_eq!(recovered.identity.unwrap().message_id, "1000");
+        assert!(journal.prepare(effect(2, true, None)).await.is_err());
+        assert!(
+            journal
+                .prepare(effect(2, true, Some("9999")))
+                .await
+                .is_err()
+        );
+        assert!(
+            journal
+                .prepare(effect(2, false, Some("1000")))
+                .await
+                .is_err()
+        );
+        let delete = effect(2, true, Some("1000"));
+        let mut wrong_channel = delete.clone();
+        wrong_channel.target.channel_id = "999".into();
+        assert!(journal.prepare(wrong_channel).await.is_err());
+        journal.prepare(delete.clone()).await.unwrap();
+        assert!(
+            journal
+                .settle(
+                    &delete,
+                    SharedObservation::Confirmed {
+                        message_id: "1000".into()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            journal
+                .settle(&delete, SharedObservation::Unknown)
+                .await
+                .unwrap()
+                .phase,
+            SharedPhase::Unknown
+        );
+        let deleted = journal
+            .settle(&delete, SharedObservation::Missing)
+            .await
+            .unwrap();
+        assert_eq!(deleted.phase, SharedPhase::Confirmed);
+        assert_eq!(deleted.confirmed_revision, Some(2));
+        assert_eq!(deleted.identity.unwrap().message_id, "1000");
+        assert!(
+            journal
+                .repost(&create.guild, &create.module, "RUN1")
+                .await
+                .is_err()
+        );
+        assert!(
+            journal
+                .enqueue(&create.guild, &create.module, "RUN1", intent(3, false))
+                .await
+                .is_err()
+        );
+        store.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn cancellation_before_send_completes_without_creating_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Storage::open(DatabaseConfig::Sqlite {
+            path: temp.path().join("cancel.sqlite"),
+        })
+        .await
+        .unwrap();
+        let create = effect(1, false, None);
+        store
+            .initialize_guilds(std::slice::from_ref(&create.guild))
+            .await
+            .unwrap();
+        let journal = SharedCardJournal::new(Arc::new(store.clone()));
+        journal
+            .enqueue(&create.guild, &create.module, "RUN1", intent(1, false))
+            .await
+            .unwrap();
+        // A delete sentinel may never be prepared for a live publication or no target.
+        assert!(journal.prepare(effect(1, true, None)).await.is_err());
+        journal
+            .enqueue(&create.guild, &create.module, "RUN1", intent(2, true))
+            .await
+            .unwrap();
+        let cancelled = journal
+            .complete_unpublished_delete(&create.guild, &create.module, "RUN1")
+            .await
+            .unwrap();
+        assert_eq!(cancelled.phase, SharedPhase::Confirmed);
+        assert_eq!(cancelled.confirmed_revision, Some(2));
+        assert!(cancelled.identity.is_none());
+        assert!(cancelled.effect.is_none());
+        assert!(journal.prepare(effect(2, false, None)).await.is_err());
+        store.close().await.unwrap();
+    }
 }

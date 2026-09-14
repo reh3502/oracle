@@ -4,12 +4,22 @@ use crate::admission::{Authority, Lease};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-/// Implementations enqueue/status host-owned records only. No remote message is
-/// sent through this module callback; a separately authorized worker owns sends.
+/// Shared-card enqueue/status only touch host-owned records. Reminder delivery
+/// additionally requires a separately authorized maintenance worker lease.
 #[async_trait]
 pub trait SharedCardService: Send + Sync {
     async fn enqueue(&self, module: &ModuleId, guild: &GuildId, intent: Value) -> Result<Value>;
     async fn status(&self, module: &ModuleId, guild: &GuildId, intent_key: &str) -> Result<Value>;
+    /// Process a persisted run reminder under authenticated maintenance authority.
+    async fn run_reminder(
+        &self,
+        _module: &ModuleId,
+        _guild: &GuildId,
+        _key: &str,
+        _document: Value,
+    ) -> Result<Value> {
+        Err(Error::new(ErrorCode::ModuleUnavailable))
+    }
 }
 #[derive(Clone)]
 pub struct SharedCardDispatch {
@@ -147,6 +157,7 @@ pub struct SharedCardSourceSnapshot {
     pub generation: u64,
     pub epoch: u64,
     pub intent: Value,
+    pub configuration: Value,
 }
 impl ModuleManager {
     pub async fn shared_card_source(
@@ -190,12 +201,17 @@ impl ModuleManager {
             .cloned()
             .filter(|value| !value.is_null())
             .ok_or_else(|| Error::new(ErrorCode::NotFound))?;
+        let configuration = self
+            .configuration_ready(&PolicyContext::LocalOperator, guild, &generation)
+            .await?
+            .values;
         lease.dispatch(|| ())?;
         Ok(SharedCardSourceSnapshot {
             session: generation.session.clone(),
             generation: generation.number,
             epoch: active.epoch,
             intent,
+            configuration,
         })
     }
 }

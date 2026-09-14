@@ -73,12 +73,13 @@ impl Generation {
                     | "host.document_batch"
                     | "host.shared_card_enqueue"
                     | "host.shared_card_status"
+                    | "host.run_reminder"
             ) || !methods.contains(method))
         {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         match method {
-            "host.shared_card_enqueue" | "host.shared_card_status" => {
+            "host.shared_card_enqueue" | "host.shared_card_status" | "host.run_reminder" => {
                 let request: SharedRequest = decode(params)?;
                 let authority = self.gate.authority(&request.invocation)?;
                 if !authority.capabilities.contains("shared_cards.publish")
@@ -86,6 +87,15 @@ impl Generation {
                         .callback_methods
                         .as_ref()
                         .is_none_or(|methods| !methods.contains(method))
+                {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                if method == "host.run_reminder"
+                    && (authority.audience != oracle_core::ModuleAudience::Operator
+                        || authority
+                            .member
+                            .as_ref()
+                            .is_none_or(|permit| permit.actor().is_some()))
                 {
                     return Err(error(ErrorCode::ForbiddenPermission));
                 }
@@ -104,7 +114,7 @@ impl Generation {
                     return Err(error(ErrorCode::ForbiddenPermission));
                 }
                 valid_key(&request.intent_key)?;
-                let intent = if method == "host.shared_card_enqueue" {
+                let intent = if method != "host.shared_card_status" {
                     let expected = request
                         .expected_revision
                         .filter(|r| *r > 0)
@@ -139,6 +149,23 @@ impl Generation {
                         &request.intent_key,
                         &self.installed.package.manifest,
                     )?;
+                    if method == "host.run_reminder" {
+                        return self
+                            .bounded(
+                                &request.invocation,
+                                &authority,
+                                &cancel,
+                                self.router.run_reminder(
+                                    &self.installed.package.manifest.id,
+                                    &self.session,
+                                    self.number,
+                                    authority.clone(),
+                                    &request.intent_key,
+                                    document.value,
+                                ),
+                            )
+                            .await;
+                    }
                     Some(intent)
                 } else {
                     if request.expected_revision.is_some() {
@@ -390,6 +417,8 @@ struct SharedRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SharedIntent {
+    #[serde(default)]
+    delete: bool,
     key: String,
     desired_revision: u64,
     destination: String,
@@ -432,6 +461,7 @@ fn validate_shared_intent(
         || !alias(&intent.destination)
         || !intent.card.is_object()
         || intent.actions.len() > 5
+        || intent.delete && !intent.actions.is_empty()
         || intent.created_at == 0
         || intent.repost_generation > intent.desired_revision
     {

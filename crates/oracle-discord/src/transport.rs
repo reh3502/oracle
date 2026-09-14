@@ -44,6 +44,23 @@ fn valid_write_path(method: &Method, path: &str) -> bool {
     if path.len() > 512 {
         return false;
     }
+    // Attendance seeds exactly one Unicode reaction on a known bot message.
+    // Keep percent encoding and @ restricted to this exact idempotent route.
+    if path.ends_with("/reactions/%E2%9C%85/@me") {
+        let parts: Vec<_> = path.split('/').collect();
+        return method == Method::PUT
+            && parts.len() == 10
+            && parts[0].is_empty()
+            && parts[1..4] == ["api", "v10", "channels"]
+            && parts[5] == "messages"
+            && [parts[4], parts[6]].iter().all(|id| {
+                !id.is_empty()
+                    && id.bytes().all(|b| b.is_ascii_digit())
+                    && id
+                        .parse::<u64>()
+                        .is_ok_and(|parsed| parsed > 0 && parsed.to_string() == *id)
+            });
+    }
     if path.starts_with("/api/v10/webhooks/") {
         let parts: Vec<_> = path.split('/').collect();
         return method == Method::PATCH
@@ -494,6 +511,25 @@ mod tests {
     }
     async fn reply(stream: &mut TcpStream, status: u16, body: &str) {
         stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    }
+    #[test]
+    fn attendance_reaction_route_is_exact_and_put_only() {
+        let path = "/api/v10/channels/123/messages/456/reactions/%E2%9C%85/@me";
+        assert!(valid_write_path(&Method::PUT, path));
+        for method in [Method::POST, Method::PATCH, Method::DELETE, Method::GET] {
+            assert!(!valid_write_path(&method, path));
+        }
+        for path in [
+            "/api/v10/channels/0/messages/456/reactions/%E2%9C%85/@me",
+            "/api/v10/channels/0123/messages/456/reactions/%E2%9C%85/@me",
+            "/api/v10/channels/123/messages/../reactions/%E2%9C%85/@me",
+            "/api/v10/channels/123/messages/456/reactions/%E2%9C%85/789",
+            "/api/v10/channels/123/messages/456/reactions/%E2%9C%85/@me?x=1",
+            "/api/v10/channels/123/messages/456/reactions/%2F/@me",
+            "x/api/v10/channels/123/messages/456/reactions/%E2%9C%85/@me",
+        ] {
+            assert!(!valid_write_path(&Method::PUT, path), "{path}");
+        }
     }
     #[test]
     fn interaction_reply_endpoint_is_exact_and_patch_only() {

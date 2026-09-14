@@ -186,6 +186,14 @@ impl CallContext {
         )
         .await
     }
+    /// Process a persisted run reminder from an authorized maintenance event.
+    pub async fn run_reminder(&self, intent_key: &str, expected_revision: u64) -> Result<Value> {
+        self.host(
+            "host.run_reminder",
+            json!({"intent_key":intent_key,"expected_revision":expected_revision}),
+        )
+        .await
+    }
     /// Read the host-owned delivery status without exposing remote message identity.
     pub async fn shared_card_status(&self, intent_key: &str) -> Result<SharedCardStatus> {
         self.host("host.shared_card_status", json!({"intent_key":intent_key}))

@@ -199,6 +199,39 @@ impl ContractRouter for Router {
         shared_cards::validate_status(&value)?;
         Ok(value)
     }
+    async fn run_reminder(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        generation: u64,
+        authority: Authority,
+        key: &str,
+        document: Value,
+    ) -> Result<Value> {
+        if authority.audience != ModuleAudience::Operator
+            || authority
+                .member
+                .as_ref()
+                .is_none_or(|permit| permit.actor().is_some())
+        {
+            return Err(Error::new(ErrorCode::ForbiddenPermission));
+        }
+        let manager = self.0.upgrade().ok_or_else(unavailable)?;
+        let service = manager.shared_card_service(module, session, generation, &authority)?;
+        let value = service
+            .run_reminder(module, &authority.guild, key, document)
+            .await?;
+        manager.shared_card_service(module, session, generation, &authority)?;
+        if !value.is_object()
+            || serde_json::to_vec(&value)
+                .map_err(|_| Error::new(ErrorCode::Integrity))?
+                .len()
+                > 65_536
+        {
+            return Err(Error::new(ErrorCode::Integrity));
+        }
+        Ok(value)
+    }
     async fn host_health(
         &self,
         module: &ModuleId,
