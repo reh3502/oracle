@@ -209,7 +209,7 @@ pub(super) async fn process(
     id: &str,
     document: Value,
 ) -> Result<Value> {
-    process_inner(shared, module, guild, id, document, false).await
+    process_inner(shared, module, guild, id, document, None).await
 }
 fn configured(values: &Value) -> bool {
     values["reminders"]
@@ -226,7 +226,7 @@ async fn process_inner(
     guild: &GuildId,
     id: &str,
     document: Value,
-    network: bool,
+    write_deadline: Option<tokio::time::Instant>,
 ) -> Result<Value> {
     if module.as_str() != "community.dandys-world"
         || document["run"]["id"] != id
@@ -329,7 +329,7 @@ async fn process_inner(
         .get(&effect_key)
         .cloned()
         .ok_or_else(invalid)?;
-    if !network {
+    if write_deadline.is_none() {
         return Ok(status(&delivery, &intent));
     }
     // Only definitely unsent requests may follow roster/text changes. Once a send
@@ -383,11 +383,17 @@ async fn process_inner(
             // A lost process after this CAS always recovers; another worker cannot send.
             revision = Some(save(shared, guild, &key, revision, &journal).await?);
             match sending_transport
-                .send(&delivery.request, &lease.permit(), lease.cancellation())
+                .send_before(
+                    &delivery.request,
+                    &lease.permit(),
+                    lease.cancellation(),
+                    write_deadline.ok_or_else(invalid)?,
+                )
                 .await
             {
                 Ok(id) => Ok(Some(id)),
                 Err(error) if error.code != ErrorCode::UnknownOutcome => {
+                    tracing::debug!(error=?error.code,run=%id,"run reminder definitely not delivered; retry pending");
                     delivery.retryable = true;
                     journal.deliveries.insert(effect_key.clone(), delivery);
                     save(shared, guild, &key, revision, &journal).await?;
@@ -615,9 +621,11 @@ pub(super) async fn run(shared: Arc<SharedCards>, cancel: CancellationToken) -> 
                     let job=work[index].clone();let shared=shared.clone();let stop=cancel.child_token();
                     let key=(job.guild.clone(),job.module.clone(),job.id.clone());active.insert(key.clone());
                     let handle = running.spawn(async move {
+                        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(20);
+                        let write_deadline=deadline-std::time::Duration::from_secs(5);
                         let result=tokio::select! {biased;
                             _=stop.cancelled()=>Err(Error::new(ErrorCode::Cancelled)),
-                            result=tokio::time::timeout(std::time::Duration::from_secs(20),process_inner(&shared,&job.module,&job.guild,&job.id,job.document,true))=>result.unwrap_or_else(|_|Err(Error::new(ErrorCode::Cancelled))),
+                            result=tokio::time::timeout_at(deadline,process_inner(&shared,&job.module,&job.guild,&job.id,job.document,Some(write_deadline)))=>result.unwrap_or_else(|_|Err(Error::new(ErrorCode::Cancelled))),
                         };
                         if let Err(error)=result {tracing::debug!(error=?error.code,run=%job.id,"reminder delivery deferred");}
                     });

@@ -12,7 +12,7 @@ use oracle_operations::executor::{DispatchFence, SendGuard, now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use serenity::all as discord;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 const EMOJI: &str = "%E2%9C%85";
@@ -61,6 +61,31 @@ fn invalid() -> Error {
 }
 fn unknown() -> Error {
     Error::new(ErrorCode::UnknownOutcome)
+}
+async fn bounded_write<T>(
+    guard: &SendGuard,
+    deadline: tokio::time::Instant,
+    write: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let result = if deadline <= tokio::time::Instant::now() {
+        Err(Error::new(ErrorCode::Cancelled))
+    } else {
+        tokio::time::timeout_at(deadline, write)
+            .await
+            .unwrap_or_else(|_| Err(Error::new(ErrorCode::Cancelled)))
+    };
+    if result.is_err() {
+        // Freeze the evidence before inspecting it: a delayed connection driver
+        // must not submit bytes after a timeout was classified as unsent.
+        guard.revoke();
+    }
+    result.map_err(|error| {
+        if guard.request_started() {
+            unknown()
+        } else {
+            error
+        }
+    })
 }
 fn rejected_status(status: u16) -> Error {
     Error::new(match status {
@@ -233,31 +258,44 @@ impl DiscordRunReminders {
         permit: &DispatchPermit,
         cancel: CancellationToken,
     ) -> Result<String> {
+        self.send_before(
+            request,
+            permit,
+            cancel,
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await
+    }
+    /// The enclosing worker supplies an absolute deadline with enough remaining
+    /// time to persist a known non-send result. Preparation time consumes this
+    /// budget too; a slow preflight cannot outlive the worker's classifier.
+    pub async fn send_before(
+        &self,
+        request: &RunReminderMessage,
+        permit: &DispatchPermit,
+        cancel: CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<String> {
         let payload = body(request)?;
-        let guard = SendGuard::with_fence(cancel, now() + 60, Arc::new(Fence(permit.clone())));
+        let deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(15));
+        let guard = SendGuard::with_fence(cancel, now() + 15, Arc::new(Fence(permit.clone())));
         let fresh = Fresh {
             transport: self,
             request,
             seed: false,
         };
-        let response = self
-            .adapter
-            .writer
-            .execute(
+        let response = bounded_write(
+            &guard,
+            deadline,
+            self.adapter.writer.execute(
                 Method::POST,
                 &format!("/api/v10/channels/{}/messages", request.channel),
                 &payload,
                 &guard,
                 &fresh,
-            )
-            .await
-            .map_err(|error| {
-                if guard.request_started() {
-                    unknown()
-                } else {
-                    error
-                }
-            })?;
+            ),
+        )
+        .await?;
         if !(200..300).contains(&response.status) {
             return Err(rejected_status(response.status));
         }
@@ -411,6 +449,58 @@ impl DiscordRunReminders {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct WaitingFresh(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl FreshCheck for WaitingFresh {
+        async fn check(&self) -> Result<()> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn pre_send_freshness_deadline_is_known_unsent_and_retryable() {
+        let guard = SendGuard::new(CancellationToken::new(), now() + 15);
+        let fresh = WaitingFresh(false.into());
+        let result = bounded_write(
+            &guard,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            async {
+                fresh.check().await?;
+                guard.mark_request_started()?;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(fresh.0.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!guard.request_started());
+        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+        assert!(guard.mark_request_started().is_err());
+    }
+    #[tokio::test]
+    async fn post_submission_deadline_remains_unknown_and_cannot_retry() {
+        let guard = SendGuard::new(CancellationToken::new(), now() + 15);
+        let result: Result<()> = bounded_write(
+            &guard,
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            async {
+                guard.mark_request_started()?;
+                std::future::pending().await
+            },
+        )
+        .await;
+        assert!(guard.request_started());
+        assert_eq!(result.unwrap_err().code, ErrorCode::UnknownOutcome);
+    }
+    #[tokio::test]
+    async fn exhausted_worker_budget_never_polls_the_write() {
+        let guard = SendGuard::new(CancellationToken::new(), now() + 15);
+        let result: Result<()> = bounded_write(&guard, tokio::time::Instant::now(), async {
+            panic!("already expired worker must not start another write")
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+        assert!(!guard.request_started());
+    }
     fn request() -> RunReminderMessage {
         RunReminderMessage {
             guild: GuildId::new("100").unwrap(),
