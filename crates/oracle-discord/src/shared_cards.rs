@@ -42,7 +42,11 @@ impl DiscordSharedCards {
         // Re-fetch the bot's complete channel permission facts together.
         let snapshot = self
             .adapter
-            .mutation_authority(&PolicyContext::LocalOperator, &effect.guild)
+            .channel_mutation_authority(
+                &PolicyContext::LocalOperator,
+                &effect.guild,
+                &effect.target.channel_id,
+            )
             .await?;
         let channel = snapshot
             .channels
@@ -327,7 +331,7 @@ impl SharedCardTransport for DiscordSharedCards {
         cancel: CancellationToken,
     ) -> Result<SharedObservation> {
         validate_effect(effect)?;
-        tokio::select! {biased; _=cancel.cancelled()=>Ok(SharedObservation::Unknown),outcome=tokio::time::timeout(Duration::from_secs(20),self.observe_inner(effect))=>Ok(match outcome {Ok(Ok(value))=>value,_=>SharedObservation::Unknown})}
+        tokio::select! {biased; _=cancel.cancelled()=>Ok(SharedObservation::Unknown),outcome=tokio::time::timeout(Duration::from_secs(20),self.observe_inner(effect))=>match outcome {Ok(value)=>value,Err(_)=>Err(Error::new(ErrorCode::UnknownOutcome))}}
     }
 }
 
@@ -344,7 +348,7 @@ impl DiscordOperations {
         let app = read(self.http.get_current_application_info()).await?;
         let bot = self.bot_id().await?;
         let snapshot = self
-            .mutation_authority(&PolicyContext::LocalOperator, guild)
+            .channel_mutation_authority(&PolicyContext::LocalOperator, guild, channel)
             .await?;
         let item = snapshot
             .channels

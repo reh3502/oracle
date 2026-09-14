@@ -34,7 +34,7 @@ impl ConfigurationPolicy for DiscordOperations {
         if subscriptions.is_empty() {
             return Ok(());
         }
-        let snapshot = self.mutation_authority(actor, guild).await?;
+        let snapshot = self.guild_mutation_authority(actor, guild).await?;
         let bits = oracle_operations::permissions::guild_permissions(
             guild.as_str(),
             &snapshot.owner,
@@ -51,7 +51,7 @@ impl ConfigurationPolicy for DiscordOperations {
         _module: &ModuleId,
         values: &Value,
     ) -> Result<()> {
-        self.mutation_authority(actor, guild).await?;
+        self.guild_mutation_authority(actor, guild).await?;
         if let Some(destination) = values.get("destination") {
             let destination = destination
                 .as_str()

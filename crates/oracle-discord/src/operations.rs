@@ -20,6 +20,9 @@ const READ_BUDGET: Duration = Duration::from_secs(90);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
+#[path = "permission_read_tests.rs"]
+mod permission_read_tests;
+#[cfg(test)]
 #[path = "read_tests.rs"]
 mod read_tests;
 
@@ -112,6 +115,26 @@ impl DiscordOperations {
     async fn fresh_snapshot(&self, context: &PolicyContext, guild: &GuildId) -> Result<Snapshot> {
         self.core.status(context, Some(guild)).await?;
         let guild_id = discord::GuildId::new(sid(guild.as_str())?);
+        // Refresh permission facts after the potentially minute-long inventory queue.
+        let channels = read(self.http.get_channels(guild_id)).await?;
+        let mut snapshot = self.guild_permission_snapshot(context, guild).await?;
+        snapshot.channels = channels
+            .iter()
+            .map(|channel| {
+                let value =
+                    serde_json::to_value(channel).map_err(|_| error(ErrorCode::InvalidInput))?;
+                channel_from_json(&value, guild)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        snapshot.visible()
+    }
+    async fn guild_permission_snapshot(
+        &self,
+        context: &PolicyContext,
+        guild: &GuildId,
+    ) -> Result<Snapshot> {
+        self.core.status(context, Some(guild)).await?;
+        let guild_id = discord::GuildId::new(sid(guild.as_str())?);
         let bot_id = self.bot_id().await?;
         let actor_id = match context {
             PolicyContext::LocalOperator => bot_id,
@@ -124,9 +147,6 @@ impl DiscordOperations {
                 discord::UserId::new(sid(user.as_str())?)
             }
         };
-        // Channel inventory has a minute-long rate-limit bucket. Refresh
-        // permission facts after that queue wait, before using them for writes.
-        let channels = read(self.http.get_channels(guild_id)).await?;
         let (details, actor, bot) = tokio::try_join!(
             read(self.http.get_guild(guild_id)),
             read(self.http.get_member(guild_id, actor_id)),
@@ -159,21 +179,13 @@ impl DiscordOperations {
             &bot,
         )? & permissions::ADMINISTRATOR
             != 0;
-        let channels = channels
-            .iter()
-            .map(|channel| {
-                let value =
-                    serde_json::to_value(channel).map_err(|_| error(ErrorCode::InvalidInput))?;
-                channel_from_json(&value, guild)
-            })
-            .collect::<Result<Vec<_>>>()?;
         Snapshot {
             guild: guild.clone(),
             owner: details.owner_id.to_string(),
             actor,
             bot,
             roles,
-            channels,
+            channels: vec![],
             complete,
             observed_at: now(),
         }
@@ -186,6 +198,14 @@ impl DiscordOperations {
     ) -> Result<Snapshot> {
         self.core.authorize_module(context, guild).await?;
         let snapshot = self.fresh_snapshot(context, guild).await?;
+        self.check_mutation_actor(context, guild, snapshot)
+    }
+    fn check_mutation_actor(
+        &self,
+        context: &PolicyContext,
+        guild: &GuildId,
+        snapshot: Snapshot,
+    ) -> Result<Snapshot> {
         if matches!(context, PolicyContext::Discord { .. })
             && permissions::guild_permissions(
                 guild.as_str(),
@@ -198,6 +218,40 @@ impl DiscordOperations {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         Ok(snapshot)
+    }
+    /// Guild authorization needs fresh roles and members, not a channel inventory.
+    pub(crate) async fn guild_mutation_authority(
+        &self,
+        context: &PolicyContext,
+        guild: &GuildId,
+    ) -> Result<Snapshot> {
+        self.core.authorize_module(context, guild).await?;
+        let mut snapshot = self.guild_permission_snapshot(context, guild).await?;
+        snapshot.complete = false;
+        self.check_mutation_actor(context, guild, snapshot)
+    }
+    /// Read the exact destination before refreshing the member and role facts.
+    pub(crate) async fn channel_mutation_authority(
+        &self,
+        context: &PolicyContext,
+        guild: &GuildId,
+        channel: &str,
+    ) -> Result<Snapshot> {
+        self.core.authorize_module(context, guild).await?;
+        let fetched = read(
+            self.http
+                .get_channel(discord::GenericChannelId::new(sid(channel)?)),
+        )
+        .await?;
+        let value = serde_json::to_value(fetched).map_err(|_| error(ErrorCode::InvalidInput))?;
+        let item = channel_from_json(&value, guild)?;
+        if item.id != channel {
+            return Err(error(ErrorCode::ForbiddenScope));
+        }
+        let mut snapshot = self.guild_permission_snapshot(context, guild).await?;
+        snapshot.channels = vec![item];
+        snapshot.complete = false;
+        self.check_mutation_actor(context, guild, snapshot.visible()?)
     }
     /// Inspect a logging destination and its current audience, without sending a message.
     pub async fn validate_destination(

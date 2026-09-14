@@ -103,7 +103,10 @@ impl SharedCards {
             let observed = transport
                 .observe(effect, cancel.child_token())
                 .await
-                .unwrap_or(SharedObservation::Unknown);
+                .unwrap_or_else(|error| {
+                    tracing::debug!(%guild,%module,run=%id,error=?error.code,"shared card observation unavailable");
+                    SharedObservation::Unknown
+                });
             self.journal.settle(effect, observed).await?;
             return Ok(());
         }
