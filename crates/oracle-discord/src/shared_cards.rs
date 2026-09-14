@@ -198,7 +198,7 @@ fn canonical(value: &Value, component: bool) -> Value {
                 if matches!(
                     key.as_str(),
                     "proxy_url" | "proxy_icon_url" | "height" | "width" | "id"
-                ) || (!component && key == "type")
+                ) || (!component && matches!(key.as_str(), "type" | "content_scan_version"))
                     || (matches!(key.as_str(), "disabled" | "default")
                         && value == &Value::Bool(false))
                     || (!component && key == "fields" && value == &json!([]))
@@ -418,6 +418,7 @@ mod tests {
         validate_effect(&e).unwrap();
         let mut m = message(&e);
         m["embeds"][0]["type"] = json!("rich");
+        m["embeds"][0]["content_scan_version"] = json!(0);
         m["components"][0]["id"] = json!(1);
         m["components"][0]["components"][0]["disabled"] = json!(false);
         assert!(confirms(&e, &m));
