@@ -531,8 +531,36 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
         })
         .unwrap_or_default();
     let backup = root.join("backup");
+    let active = service.view(&owner, &id).await.unwrap();
+    assert_eq!(active.run.state, RunState::Open);
     store.backup(&backup, &tools).await.unwrap();
+    // A backup is a point in time. Never roll it over newer committed signups.
+    change(
+        &service,
+        &actor("777"),
+        &id,
+        Command::Join {
+            toon: Some("poppy".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let newer = service.view(&owner, &id).await.unwrap();
+    assert!(newer.run.assignments.contains_key("777"));
+    assert!(
+        Storage::restore(config.clone(), &backup, &tools)
+            .await
+            .is_err()
+    );
+    assert_eq!(service.view(&owner, &id).await.unwrap(), newer);
     let restored = Arc::new(Storage::restore(restore, &backup, &tools).await.unwrap());
+    assert_eq!(
+        RunService::new(Db::new(restored.clone()))
+            .view(&owner, &id)
+            .await
+            .unwrap(),
+        active
+    );
     assert_eq!(
         RunService::new(Db::new(restored.clone()))
             .view(&owner, &casual)
@@ -547,6 +575,13 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
     drop(db);
     drop(store);
     let reopened = Arc::new(Storage::open(config).await.unwrap());
+    assert_eq!(
+        RunService::new(Db::new(reopened.clone()))
+            .view(&owner, &id)
+            .await
+            .unwrap(),
+        newer
+    );
     assert_eq!(
         RunService::new(Db::new(reopened.clone()))
             .view(&owner, &casual)
