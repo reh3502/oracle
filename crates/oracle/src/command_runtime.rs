@@ -6,39 +6,56 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 pub fn compile_catalog(entries: &[ModuleCatalogEntry]) -> Result<Vec<DesiredCommand>> {
-    // Discord permits 100 guild chat-input commands. Reserve one for /oracle.
-    if entries.len() > 99 {
+    // Aliases occupy top-level Discord slots too. Keep one for /oracle.
+    if entries
+        .iter()
+        .map(|entry| entry.commands.groups().count())
+        .sum::<usize>()
+        > 99
+    {
         return Err(Error::new(ErrorCode::QuotaExceeded));
     }
     let mut namespaces = BTreeSet::new();
     let mut desired = Vec::new();
     for entry in entries {
-        let descriptor = &entry.commands;
-        if descriptor.namespace == "oracle" || !namespaces.insert(&descriptor.namespace) {
-            return Err(Error::new(ErrorCode::Conflict));
+        for (name, description, routes, direct) in entry.commands.groups() {
+            if name == "oracle" || !namespaces.insert(name) {
+                return Err(Error::new(ErrorCode::Conflict));
+            }
+            let options = if direct {
+                oracle_operations::published::compile_route(&routes[0])?["options"].clone()
+            } else {
+                serde_json::Value::Array(
+                    routes
+                        .iter()
+                        .map(oracle_operations::published::compile_route)
+                        .collect::<Result<_>>()?,
+                )
+            };
+            let member_visible = routes.iter().any(|route| {
+                entry.operations.iter().any(|op| {
+                    op.name == route.operation
+                        && matches!(
+                            op.audience,
+                            oracle_core::ModuleAudience::MemberRead
+                                | oracle_core::ModuleAudience::MemberMutation
+                        )
+                })
+            });
+            desired.push(DesiredCommand {
+                owner: entry.module.clone(),
+                route: Some(CommandRoute { session: entry.session.clone(), generation: entry.generation, epoch: entry.epoch }),
+                definition: json!({"type":1,"name":name,"description":description,"default_member_permissions":if member_visible {serde_json::Value::Null} else {json!("32")},"options":options}),
+            });
         }
-        let options: Vec<_> = descriptor
-            .routes
-            .iter()
-            .map(oracle_operations::published::compile_route)
-            .collect::<Result<_>>()?;
-        let member_visible = entry
-            .operations
-            .iter()
-            .any(|op| op.audience == oracle_core::ModuleAudience::MemberRead);
-        desired.push(DesiredCommand {
-            owner: entry.module.clone(),
-            route: Some(CommandRoute {
-                session: entry.session.clone(),
-                generation: entry.generation,
-                epoch: entry.epoch,
-            }),
-            definition: json!({"type":1,"name":descriptor.namespace,
-                "description":descriptor.description,"default_member_permissions":if member_visible {serde_json::Value::Null} else {json!("32")},
-                "options":options}),
-        });
     }
-    desired.sort_by(|a, b| a.owner.cmp(&b.owner));
+    desired.sort_by(|a, b| {
+        a.owner.cmp(&b.owner).then_with(|| {
+            a.definition["name"]
+                .as_str()
+                .cmp(&b.definition["name"].as_str())
+        })
+    });
     Ok(desired)
 }
 
@@ -80,14 +97,12 @@ pub async fn invoke_published(
                 && entry.session == identity.session
                 && entry.generation == identity.generation
                 && entry.epoch == identity.epoch
-                && entry.commands.namespace == command_name
+                && entry.commands.contains_name(&command_name)
         })
         .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
     let operation = entry
         .commands
-        .routes
-        .iter()
-        .find(|candidate| candidate.name == route)
+        .resolve_route(&command_name, &route)
         .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
     manager
         .invoke_bound(
@@ -231,7 +246,7 @@ async fn resolve_published_entry(
                 && entry.session == identity.session
                 && entry.generation == identity.generation
                 && entry.epoch == identity.epoch
-                && entry.commands.namespace == request.command_name
+                && entry.commands.contains_name(&request.command_name)
         })
         .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
     if request
@@ -255,16 +270,17 @@ pub async fn published_uses_member_identity(
     let entry = resolve_published_entry(manager, reconciler, actor, member, guild, request).await?;
     let route = entry
         .commands
-        .routes
-        .iter()
-        .find(|r| r.name == request.route)
+        .resolve_route(&request.command_name, &request.route)
         .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
     let operation = entry
         .operations
         .iter()
         .find(|op| op.name == route.operation)
         .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
-    Ok(operation.audience == oracle_core::ModuleAudience::MemberRead)
+    Ok(matches!(
+        operation.audience,
+        oracle_core::ModuleAudience::MemberRead | oracle_core::ModuleAudience::MemberMutation
+    ))
 }
 
 pub async fn invoke_published_options(
@@ -284,19 +300,79 @@ pub async fn invoke_published_options(
         resolve_published_entry(manager, reconciler, actor, member, guild, &request).await?;
     let route = entry
         .commands
-        .routes
-        .iter()
-        .find(|route| route.name == request.route)
+        .resolve_route(&request.command_name, &request.route)
         .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+    if request.private_action.is_some()
+        && (request.expected_binding.is_none()
+            || !matches!(
+                route.presentation,
+                Some(oracle_core::ModulePresentation::PrivateCardV2 { .. })
+            ))
+    {
+        return Err(Error::new(ErrorCode::ForbiddenPermission));
+    }
+    let name = request
+        .private_action
+        .as_ref()
+        .map(|a| a.operation.as_str())
+        .unwrap_or(&route.operation);
     let operation = entry
         .operations
         .iter()
-        .find(|op| op.name == route.operation)
+        .find(|op| op.name == name)
         .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
-    if request.member_only && operation.audience != ModuleAudience::MemberRead {
+    if (request.member_only && operation.audience != ModuleAudience::MemberRead)
+        || (request.private_action.is_some()
+            && operation.audience != ModuleAudience::MemberMutation)
+    {
         return Err(Error::new(ErrorCode::ForbiddenPermission));
     }
-    let input = decode_input(route, &request.options)?;
+    let input = match &request.private_action {
+        Some(action) => serde_json::Value::Object(action.input.clone()),
+        None => decode_input(route, &request.options)?,
+    };
+    if operation.audience == ModuleAudience::MemberMutation {
+        if !matches!(
+            route.presentation,
+            Some(oracle_core::ModulePresentation::PrivateCardV2 { .. })
+        ) {
+            return Err(Error::new(ErrorCode::Compatibility));
+        }
+        let invocation = manager
+            .invoke_member_mutation_bound(
+                member,
+                request
+                    .interaction_id
+                    .as_deref()
+                    .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?,
+                guild,
+                &entry.module,
+                &operation.name,
+                input,
+                &entry.session,
+                entry.generation,
+                entry.epoch,
+            )
+            .await?;
+        let card = oracle_operations::published::render_private_card(&invocation.value)?;
+        validate_private_actions(&card, &entry)?;
+        return Ok(PublishedReply {
+            private_card: Some(card),
+            mutation_policy: Some(invocation.policy.clone()),
+            card: None,
+            binding: Some(interaction_binding(&entry)),
+            control_fence: Some(std::sync::Arc::new(RegistryFence(
+                invocation.registry.clone(),
+            ))),
+            value: invocation.value,
+            text: None,
+            policy: None,
+            fence: Some(std::sync::Arc::new(MutationResponseFence {
+                policy: invocation.policy,
+                registry: invocation.registry,
+            })),
+        });
+    }
     let settings = manager.runtime_settings(&entry.module);
     let prefix = settings
         .as_ref()
@@ -330,6 +406,8 @@ pub async fn invoke_published_options(
             return Err(Error::new(ErrorCode::Compatibility));
         }
         Ok(PublishedReply {
+            private_card: None,
+            mutation_policy: None,
             card,
             binding: Some(interaction_binding(&entry)),
             control_fence: Some(std::sync::Arc::new(RegistryFence(
@@ -364,6 +442,8 @@ pub async fn invoke_published_options(
         }
         let text = render_presentation(route, &value, prefix)?;
         Ok(PublishedReply {
+            private_card: None,
+            mutation_policy: None,
             card: None,
             binding: None,
             control_fence: None,
@@ -477,6 +557,7 @@ mod tests {
             epoch: 9,
             operations: vec![],
             commands: ModuleCommands {
+                aliases: Vec::new(),
                 namespace: namespace.into(),
                 description: "Sample module".into(),
                 routes: vec![ModuleCommandRoute {
@@ -511,6 +592,128 @@ mod tests {
             })
         );
         assert_eq!(compiled[0].definition["default_member_permissions"], "32");
+    }
+    #[test]
+    fn aliases_compile_exact_shape_visibility_and_shared_identity() {
+        use oracle_core::{
+            ModuleAudience, ModuleCommandAlias, ModuleCommandInput, ModuleCommandOption,
+            ModuleCommandOptionType, ModuleOperation,
+        };
+        let mut sample = entry("dw");
+        let mut route = sample.commands.routes[0].clone();
+        route.name = "organized".into();
+        route.operation = "host_organized".into();
+        route.input = Some(ModuleCommandInput::Typed { options: vec![] });
+        let mut signup = route.clone();
+        signup.name = "signup".into();
+        signup.operation = "join".into();
+        signup.input = Some(ModuleCommandInput::Typed {
+            options: vec![ModuleCommandOption {
+                name: "id".into(),
+                description: "Run ID".into(),
+                required: true,
+                value_type: ModuleCommandOptionType::String {
+                    min_length: 8,
+                    max_length: 8,
+                    choices: vec![],
+                },
+            }],
+        });
+        sample.commands.aliases = vec![
+            ModuleCommandAlias::Subcommands {
+                name: "hostrun".into(),
+                description: "Host a run".into(),
+                routes: vec![route],
+            },
+            ModuleCommandAlias::Direct {
+                name: "signup".into(),
+                description: "Join a run".into(),
+                route: signup,
+            },
+        ];
+        sample.operations = ["host_organized", "join"]
+            .into_iter()
+            .map(|name| ModuleOperation {
+                name: name.into(),
+                description: name.into(),
+                input_schema: json!({}),
+                output_schema: json!({}),
+                timeout_ms: 1000,
+                capabilities: vec![],
+                audience: ModuleAudience::MemberMutation,
+                ai: None,
+                callback_methods: vec![],
+                callback_collections: vec![],
+            })
+            .collect();
+        let compiled = compile_catalog(std::slice::from_ref(&sample)).unwrap();
+        assert_eq!(compiled.len(), 3);
+        let host = compiled
+            .iter()
+            .find(|c| c.definition["name"] == "hostrun")
+            .unwrap();
+        assert_eq!(host.definition["options"][0]["name"], "organized");
+        assert_eq!(host.definition["options"][0]["type"], 1);
+        assert!(host.definition["default_member_permissions"].is_null());
+        let signup = compiled
+            .iter()
+            .find(|c| c.definition["name"] == "signup")
+            .unwrap();
+        assert_eq!(signup.definition["options"][0]["name"], "id");
+        assert_eq!(signup.definition["options"][0]["type"], 3);
+        assert_eq!(signup.route, host.route);
+        assert_eq!(
+            sample
+                .commands
+                .resolve_route("signup", "")
+                .unwrap()
+                .operation,
+            "join"
+        );
+        assert!(sample.commands.resolve_route("signup", "signup").is_none());
+        assert!(sample.commands.resolve_route("hostrun", "").is_none());
+        assert!(
+            sample
+                .commands
+                .resolve_route("unknown", "organized")
+                .is_none()
+        );
+        assert_eq!(
+            sample
+                .commands
+                .resolve_route("hostrun", "organized")
+                .unwrap()
+                .operation,
+            "host_organized"
+        );
+        let mut collision = entry("other");
+        collision.commands.namespace = "signup".into();
+        assert_eq!(
+            compile_catalog(&[sample.clone(), collision])
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let mut many = Vec::new();
+        for index in 0..33 {
+            let mut e = sample.clone();
+            e.commands.namespace = format!("dw-{index}");
+            for (n, alias) in e.commands.aliases.iter_mut().enumerate() {
+                match alias {
+                    ModuleCommandAlias::Subcommands { name, .. }
+                    | ModuleCommandAlias::Direct { name, .. } => {
+                        *name = format!("alias-{index}-{n}")
+                    }
+                }
+            }
+            many.push(e);
+        }
+        assert_eq!(compile_catalog(&many).unwrap().len(), 99);
+        many.push(sample);
+        assert_eq!(
+            compile_catalog(&many).unwrap_err().code,
+            ErrorCode::QuotaExceeded
+        );
     }
     #[test]
     fn reserved_names_collisions_and_scope_limit_fail_before_publication() {
@@ -582,4 +785,102 @@ pub async fn publish_once(host: &super::Host) -> Result<serde_json::Value> {
         reports.push(json!({"guild":guild.guild,"revision":revision,"report":report}));
     }
     Ok(json!(reports))
+}
+
+struct MutationResponseFence {
+    policy: oracle_core::member_mutation::MemberMutationPermit,
+    registry: oracle_modules::RegistryDispatchPermit,
+}
+impl oracle_operations::executor::DispatchFence for MutationResponseFence {
+    fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.registry.dispatch(|| self.policy.dispatch(send))??
+    }
+}
+fn validate_private_actions(
+    card: &oracle_operations::published::PrivateCardPresentation,
+    entry: &ModuleCatalogEntry,
+) -> Result<()> {
+    let actions = card
+        .controls
+        .buttons
+        .iter()
+        .map(|a| (&a.operation, &a.input, a.prompt.as_ref()))
+        .chain(
+            card.controls
+                .choices
+                .iter()
+                .map(|a| (&a.operation, &a.input, None)),
+        );
+    for (name, input, prompt) in actions {
+        let operation = entry
+            .operations
+            .iter()
+            .find(|op| {
+                &op.name == name && op.audience == oracle_core::ModuleAudience::MemberMutation
+            })
+            .ok_or_else(|| Error::new(ErrorCode::ForbiddenPermission))?;
+        let mut input = input.clone();
+        if let Some(p) = prompt {
+            let field = &operation.input_schema["properties"][&p.option];
+            if field["type"] != "string"
+                || field.get("enum").is_some()
+                || field.get("pattern").is_some()
+                || field["maxLength"]
+                    .as_u64()
+                    .is_none_or(|max| u64::from(p.max_length) > max)
+            {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+            let min = field["minLength"].as_u64().unwrap_or(0).max(1);
+            if min > u64::from(p.max_length) {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+            input.insert(
+                p.option.clone(),
+                serde_json::Value::String("x".repeat(min as usize)),
+            );
+        }
+        if !oracle_modules::package::schema_validator(&operation.input_schema)?
+            .is_valid(&serde_json::Value::Object(input))
+        {
+            return Err(Error::new(ErrorCode::InvalidInput));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod private_action_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn private_actions_require_declared_mutations_and_exact_input_schema() {
+        let mut entry: ModuleCatalogEntry = ModuleCatalogEntry {
+            module: "sample.cards".parse().unwrap(), session: "session".into(), generation:1, epoch:1,
+            commands: oracle_core::ModuleCommands {namespace:"sample".into(),description:"Sample".into(),routes:vec![],aliases:vec![]},
+            operations: vec![serde_json::from_value(json!({"name":"run_ui","description":"Run setup","audience":"member_mutation","timeout_ms":1000,"capabilities":[],"input_schema":{"type":"object","required":["id","count"],"additionalProperties":false,"properties":{"id":{"type":"string","const":"ABCD1234"},"count":{"type":"string","minLength":1,"maxLength":1}}},"output_schema":{"type":"object"}})).unwrap()],
+        };
+        let mut value = json!({"reply":{"card":{"title":"Setup","description":"Choose count"},"buttons":[{"label":"Count","operation":"run_ui","input":{"id":"ABCD1234"},"prompt":{"option":"count","label":"Places","max_length":1}}]}});
+        let card = oracle_operations::published::render_private_card(&value).unwrap();
+        assert!(validate_private_actions(&card, &entry).is_ok());
+        entry.operations[0].audience = oracle_core::ModuleAudience::MemberRead;
+        assert!(validate_private_actions(&card, &entry).is_err());
+        entry.operations[0].audience = oracle_core::ModuleAudience::MemberMutation;
+        value["reply"]["buttons"][0]["input"]["undeclared"] = json!(true);
+        assert!(
+            validate_private_actions(
+                &oracle_operations::published::render_private_card(&value).unwrap(),
+                &entry
+            )
+            .is_err()
+        );
+        value["reply"]["buttons"][0]["input"] = json!({"id":"FORGED99"});
+        assert!(
+            validate_private_actions(
+                &oracle_operations::published::render_private_card(&value).unwrap(),
+                &entry
+            )
+            .is_err()
+        );
+    }
 }

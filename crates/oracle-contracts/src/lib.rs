@@ -322,3 +322,6 @@ mod diagnostic_tests {
         assert_eq!(error.diagnostic().detail, None);
     }
 }
+
+pub mod private_cards;
+pub use private_cards::*;

@@ -9,6 +9,10 @@ use tokio_util::sync::CancellationToken;
 /// Authenticated Discord option values. Duplicate option names are rejected at ingress.
 #[derive(Clone, Debug)]
 pub struct PublishedRequest {
+    /// Fresh Discord interaction snowflake; never read from module input.
+    pub interaction_id: Option<String>,
+    /// Host-resolved private control, never accepted by slash or legacy JSON ingress.
+    pub private_action: Option<PrivateAction>,
     /// Optional host-issued module/session/generation/epoch identity for a follow-up.
     pub expected_binding: Option<String>,
     /// Interactive follow-ups can invoke only member-read routes, even for operators.
@@ -18,7 +22,14 @@ pub struct PublishedRequest {
     pub route: String,
     pub options: serde_json::Map<String, Value>,
 }
+#[derive(Clone, Debug)]
+pub struct PrivateAction {
+    pub operation: String,
+    pub input: serde_json::Map<String, Value>,
+}
 pub struct PublishedReply {
+    pub private_card: Option<crate::published::PrivateCardPresentation>,
+    pub mutation_policy: Option<oracle_core::member_mutation::MemberMutationPermit>,
     pub card: Option<crate::published::CardPresentation>,
     pub binding: Option<String>,
     pub control_fence: Option<std::sync::Arc<dyn crate::executor::DispatchFence>>,
@@ -95,7 +106,10 @@ pub trait HumanOperations: Send + Sync {
         request: PublishedRequest,
         cancel: &CancellationToken,
     ) -> Result<PublishedReply> {
-        if request.member_only || request.expected_binding.is_some() {
+        if request.member_only
+            || request.expected_binding.is_some()
+            || request.private_action.is_some()
+        {
             return Err(oracle_core::Error::new(
                 oracle_core::ErrorCode::Compatibility,
             ));
@@ -131,6 +145,8 @@ pub trait HumanOperations: Send + Sync {
             )
             .await?;
         Ok(PublishedReply {
+            private_card: None,
+            mutation_policy: None,
             card: None,
             binding: None,
             control_fence: None,

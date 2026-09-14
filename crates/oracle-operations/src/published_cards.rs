@@ -502,3 +502,230 @@ mod tests {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct PrivateCardPresentation {
+    pub embed: Value,
+    pub controls: oracle_core::PrivateCardV2,
+}
+/// Protocol 1.2 controls have their own strict decoder; CardV1 stays unchanged.
+pub fn render_private_card(result: &Value) -> Result<PrivateCardPresentation> {
+    let mut controls: oracle_core::PrivateCardV2 =
+        serde_json::from_value(result.get("reply").cloned().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+    if controls.buttons.len() > 15 || controls.choices.len() > 25 || controls.card.fields.len() > 20
+    {
+        return Err(invalid());
+    }
+    if controls
+        .card
+        .fields
+        .iter()
+        .map(|f| f.members.len())
+        .sum::<usize>()
+        > 9
+    {
+        return Err(invalid());
+    }
+    for f in &controls.card.fields {
+        for member in &f.members {
+            checked(&member.prefix, 128, true)?;
+            checked(&member.suffix, 128, true)?;
+        }
+    }
+    let title = rich(&controls.card.title, 256, false)?;
+    let description = rich(&controls.card.description, 4096, true)?;
+    let footer = label(&controls.card.footer, 512, true)?;
+    let mut total = len(&title) + len(&description) + len(&footer);
+    let mut fields = Vec::new();
+    for f in &controls.card.fields {
+        let name = rich(&f.name, 256, false)?;
+        let value = rich(&f.value, 1024, !f.members.is_empty())?;
+        total += len(&name) + len(&value);
+        fields.push(json!({"name":name,"value":value,"inline":f.inline}));
+    }
+    if total > 6000 {
+        return Err(invalid());
+    }
+    controls.select_placeholder = label(&controls.select_placeholder, 150, true)?;
+    for b in &mut controls.buttons {
+        b.label = label(&b.label, 80, false)?;
+        private_action(&b.operation, &b.input)?;
+        if let Some(p) = &mut b.prompt {
+            p.label = label(&p.label, 45, false)?;
+            p.placeholder = label(&p.placeholder, 100, true)?;
+            if !name(&p.option)
+                || !(1..=200).contains(&p.max_length)
+                || b.input.contains_key(&p.option)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    for c in &mut controls.choices {
+        c.label = label(&c.label, 80, false)?;
+        c.description = label(&c.description, 100, true)?;
+        private_action(&c.operation, &c.input)?;
+    }
+    let embed = json!({"title":title,"description":description,"footer":{"text":footer},"fields":fields,"color":0x9678D3});
+    Ok(PrivateCardPresentation { embed, controls })
+}
+fn private_action(operation: &str, input: &Map<String, Value>) -> Result<()> {
+    // Actions are flat typed data. Member authority only comes from the host envelope.
+    action(operation, input)?;
+    if input.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "actor"
+                | "actor_id"
+                | "user_id"
+                | "guild_id"
+                | "channel_id"
+                | "interaction_id"
+                | "permissions"
+                | "roles"
+                | "member"
+        )
+    }) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod private_tests {
+    use super::*;
+    fn card() -> Value {
+        json!({"reply":{"card":{"title":"Run","description":"Choose toons"},"choices":[],"buttons":[{"label":"Count","operation":"run_ui","input":{"id":"ABCD1234","expected_revision":1},"prompt":{"option":"count","label":"Places","max_length":1}}]}})
+    }
+    #[test]
+    fn v2_has_separate_strict_bounds_and_no_actor_authority() {
+        assert!(render_private_card(&card()).is_ok());
+        for key in [
+            "actor",
+            "actor_id",
+            "user_id",
+            "guild_id",
+            "channel_id",
+            "interaction_id",
+            "permissions",
+            "roles",
+            "member",
+        ] {
+            let mut v = card();
+            v["reply"]["buttons"][0]["input"][key] = json!("forged");
+            assert!(render_private_card(&v).is_err());
+        }
+        let mut v = card();
+        v["reply"]["buttons"][0]["input"]["nested"] = json!({"actor":"forged"});
+        assert!(render_private_card(&v).is_err());
+        let mut v = card();
+        let b = v["reply"]["buttons"][0].clone();
+        v["reply"]["buttons"] = json!(vec![b; 16]);
+        assert!(render_private_card(&v).is_err());
+        let mut v = card();
+        v["reply"]["buttons"][0]["input"]["count"] = json!("2");
+        assert!(render_private_card(&v).is_err());
+    }
+    #[test]
+    fn v2_neutralizes_mentions_and_rejects_raw_discord_fields() {
+        let mut v = card();
+        v["reply"]["card"]["description"] = json!("@everyone <@123> https://evil.test");
+        let text = render_private_card(&v).unwrap().embed["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!text.contains("@everyone"));
+        assert!(!text.contains("<@123>"));
+        v["reply"]["components"] = json!([]);
+        assert!(render_private_card(&v).is_err());
+    }
+}
+
+/// Resolve typed member references using names supplied by the host, then run all
+/// ordinary rendering bounds and sanitization again. Missing members expose no ID.
+pub fn resolve_private_card_names(
+    card: &mut PrivateCardPresentation,
+    names: &std::collections::BTreeMap<oracle_core::UserId, String>,
+) -> Result<()> {
+    for (index, field) in card.controls.card.fields.iter_mut().enumerate() {
+        let mut value = card.embed["fields"][index]["value"]
+            .as_str()
+            .ok_or_else(invalid)?
+            .to_owned();
+        for member in field.members.drain(..) {
+            let name = names
+                .get(&member.user_id)
+                .map(String::as_str)
+                .unwrap_or("Member unavailable");
+            let safe_name = rich(name, 256, false).unwrap_or_else(|_| "Member unavailable".into());
+            if !value.is_empty() {
+                value.push('\n');
+            }
+            value.push_str(&rich(&member.prefix, 256, true)?);
+            value.push_str(&safe_name);
+            value.push_str(&rich(&member.suffix, 256, true)?);
+        }
+        if len(&value) > 1024 {
+            return Err(invalid());
+        }
+        card.embed["fields"][index]["value"] = json!(value);
+    }
+    for choice in &mut card.controls.choices {
+        if let Some(id) = choice.member_id.take() {
+            let name = names
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or("Member unavailable");
+            choice.label = label(name, 80, false).unwrap_or_else(|_| "Member unavailable".into());
+        }
+    }
+    let mut total = [
+        card.embed["title"].as_str(),
+        card.embed["description"].as_str(),
+        card.embed["footer"]["text"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(len)
+    .sum::<usize>();
+    for field in card.embed["fields"].as_array().ok_or_else(invalid)? {
+        total += len(field["name"].as_str().ok_or_else(invalid)?)
+            + len(field["value"].as_str().ok_or_else(invalid)?);
+    }
+    if total > 6000 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod member_name_tests {
+    use super::*;
+    #[test]
+    fn typed_names_are_inert_and_missing_members_never_expose_ids() {
+        let value = json!({"reply":{"card":{"title":"Run","description":"Players","fields":[{"name":"Roster","value":"","inline":false,"members":[{"user_id":"123","suffix":" — Poppy"},{"user_id":"456"}]}]},"choices":[{"label":"Player","member_id":"123","description":"Remove player","operation":"run_ui","input":{"target":"123"}}]}});
+        let mut card = render_private_card(&value).unwrap();
+        resolve_private_card_names(
+            &mut card,
+            &std::collections::BTreeMap::from([(
+                "123".parse().unwrap(),
+                "@everyone **name**".into(),
+            )]),
+        )
+        .unwrap();
+        let body = card.embed.to_string();
+        assert!(!body.contains("123"));
+        assert!(!body.contains("456"));
+        assert!(!body.contains("@everyone"));
+        assert!(body.contains("Member unavailable"));
+        assert!(body.contains("Poppy"));
+        assert!(!card.controls.choices[0].label.contains("@everyone"));
+    }
+    #[test]
+    fn member_expansion_cannot_exceed_embed_field_budget() {
+        let value = json!({"reply":{"card":{"title":"Run","description":"Players","fields":[{"name":"Roster","value":"x".repeat(1024),"inline":false,"members":[{"user_id":"123"}]}]}}});
+        let mut card = render_private_card(&value).unwrap();
+        assert!(resolve_private_card_names(&mut card, &Default::default()).is_err());
+    }
+}

@@ -29,6 +29,8 @@ pub(super) fn identity(
 }
 fn options(id: &str, route: &str, value: Value) -> PublishedRequest {
     PublishedRequest {
+        interaction_id: None,
+        private_action: None,
         expected_binding: None,
         member_only: false,
         command_id: id.into(),

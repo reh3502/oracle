@@ -85,6 +85,30 @@ impl InteractionResponder for DiscordResponder<'_> {
         member: &oracle_core::member_read::MemberContext,
         cancel: CancellationToken,
     ) -> Result<()> {
+        if let Some(policy) = &reply.mutation_policy {
+            let reader = self.reader.ok_or(Error::InvalidInteraction)?;
+            let (_, _, request) = published_interaction::parse(self.interaction)?;
+            let mut card = reply
+                .private_card
+                .clone()
+                .ok_or(Error::InvalidInteraction)?;
+            reader
+                .resolve_card_members(&member.guild, &mut card, &cancel)
+                .await?;
+            let payload = self.cards.1.payload(&card, reply, member, &request)?;
+            return reader
+                .send_mutation_payload(
+                    self.interaction.application_id.get(),
+                    self.interaction.token.as_str(),
+                    &payload,
+                    member,
+                    policy,
+                    reply.fence.clone().ok_or(Error::InvalidInteraction)?,
+                    cancel,
+                )
+                .await
+                .map_err(Error::from);
+        }
         if let Some(policy) = &reply.policy {
             let reader = self
                 .reader
@@ -645,3 +669,5 @@ pub use command_presentation::{
     PublishedCommand, cleanup_published_command, oracle_command, publish_guild_command,
     verify_published_command,
 };
+
+mod private_controls;

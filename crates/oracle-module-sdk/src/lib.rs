@@ -2,7 +2,10 @@
 //! stdout is reserved for framed RPC. Use tracked scopes for background work.
 #![forbid(unsafe_code)]
 use async_trait::async_trait;
-pub use oracle_contracts::AuthenticatedMember;
+pub use oracle_contracts::{
+    AuthenticatedMember, PrivateCardBody, PrivateCardButton, PrivateCardChoice, PrivateCardField,
+    PrivateCardMember, PrivateCardPrompt, PrivateCardV2,
+};
 use oracle_contracts::{
     DocumentWrite, EffectiveConfiguration, GuildEvent, GuildId, ModuleDocument, ModuleManifest,
 };
@@ -21,6 +24,22 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 pub use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCardState {
+    Pending,
+    Confirmed,
+    RecoveryRequired,
+    Missing,
+    Rejected,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SharedCardStatus {
+    pub state: SharedCardState,
+    pub desired_revision: u64,
+    pub confirmed_revision: Option<u64>,
+}
 pub type Result<T> = std::result::Result<T, RpcError>;
 const GRACE: Duration = Duration::from_secs(2);
 fn denied() -> RpcError {
@@ -153,6 +172,23 @@ impl CallContext {
     }
     pub async fn document_batch(&self, writes: Vec<DocumentWrite>) -> Result<Vec<ModuleDocument>> {
         self.host("host.document_batch", json!({"writes":writes}))
+            .await
+    }
+    /// Enqueue a committed, declared intent; the host resolves its approved destination.
+    pub async fn shared_card_enqueue(
+        &self,
+        intent_key: &str,
+        expected_revision: u64,
+    ) -> Result<SharedCardStatus> {
+        self.host(
+            "host.shared_card_enqueue",
+            json!({"intent_key":intent_key,"expected_revision":expected_revision}),
+        )
+        .await
+    }
+    /// Read the host-owned delivery status without exposing remote message identity.
+    pub async fn shared_card_status(&self, intent_key: &str) -> Result<SharedCardStatus> {
+        self.host("host.shared_card_status", json!({"intent_key":intent_key}))
             .await
     }
     /// Request the host's journaled diagnostic echo using this invocation's opaque lease.

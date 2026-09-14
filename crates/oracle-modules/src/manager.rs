@@ -101,35 +101,43 @@ fn validate_command_admission(
     grants: &BTreeSet<String>,
     active: &[(ModuleManifest, BTreeSet<String>)],
 ) -> Result<()> {
-    let Some(commands) = &candidate.commands else {
-        return Ok(());
-    };
-    if active.iter().any(|(manifest, _)| {
-        manifest
-            .commands
-            .as_ref()
-            .is_some_and(|other| other.namespace == commands.namespace)
-    }) {
-        return Err(Error::new(ErrorCode::Conflict));
+    let mut names = BTreeSet::new();
+    for manifest in active
+        .iter()
+        .map(|(manifest, _)| manifest)
+        .chain(std::iter::once(candidate))
+    {
+        if let Some(commands) = &manifest.commands {
+            for (name, _, _, _) in commands.groups() {
+                if name == "oracle" || !names.insert(name) {
+                    return Err(Error::new(ErrorCode::Conflict));
+                }
+            }
+        }
     }
     let publishes = |manifest: &ModuleManifest, grants: &BTreeSet<String>| {
-        manifest.commands.as_ref().is_some_and(|commands| {
-            commands.routes.iter().any(|route| {
-                manifest.operations.iter().any(|operation| {
-                    operation.name == route.operation
-                        && operation
-                            .capabilities
-                            .iter()
-                            .all(|capability| grants.contains(capability))
+        manifest.commands.as_ref().map_or(0, |commands| {
+            commands
+                .groups()
+                .filter(|(_, _, routes, _)| {
+                    routes.iter().any(|route| {
+                        manifest.operations.iter().any(|operation| {
+                            operation.name == route.operation
+                                && operation
+                                    .capabilities
+                                    .iter()
+                                    .all(|capability| grants.contains(capability))
+                        })
+                    })
                 })
-            })
+                .count()
         })
     };
-    let count = active
+    let count: usize = active
         .iter()
-        .filter(|(manifest, grants)| publishes(manifest, grants))
-        .count()
-        + usize::from(publishes(candidate, grants));
+        .map(|(manifest, grants)| publishes(manifest, grants))
+        .sum::<usize>()
+        + publishes(candidate, grants);
     if count > 99 {
         return Err(Error::new(ErrorCode::QuotaExceeded));
     }
@@ -800,17 +808,16 @@ impl ModuleManager {
                 .filter(|op| op.capabilities.iter().all(|c| active.grants.contains(c)))
                 .cloned()
                 .collect::<Vec<_>>();
-            commands
-                .routes
-                .retain(|route| operations.iter().any(|op| op.name == route.operation));
-            if !commands.routes.is_empty() {
+            commands.retain_routes(|route| operations.iter().any(|op| op.name == route.operation));
+            if commands.all_routes().next().is_some() {
+                // Private v3 controls may target declared mutation operations without publishing them.
                 let operations = operations
                     .into_iter()
                     .filter(|op| {
-                        commands
-                            .routes
-                            .iter()
-                            .any(|route| route.operation == op.name)
+                        op.audience == ModuleAudience::MemberMutation
+                            || commands
+                                .all_routes()
+                                .any(|route| route.operation == op.name)
                     })
                     .collect();
                 catalog.push(ModuleCatalogEntry {

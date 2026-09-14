@@ -17,14 +17,25 @@ pub(super) fn parse(
             && s.bytes()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_-".contains(&c))
     }
-    let [command] = interaction.data.options.as_ref() else {
-        return Err(Error::InvalidInteraction);
-    };
-    if !name(interaction.data.name.as_str()) || !name(command.name.as_str()) {
+    if !name(interaction.data.name.as_str()) {
         return Err(Error::InvalidInteraction);
     }
-    let discord::CommandDataOptionValue::SubCommand(options) = &command.value else {
-        return Err(Error::InvalidInteraction);
+    let (route, options) = match interaction.data.options.as_ref() {
+        [command]
+            if matches!(
+                command.value,
+                discord::CommandDataOptionValue::SubCommand(_)
+            ) =>
+        {
+            if !name(command.name.as_str()) {
+                return Err(Error::InvalidInteraction);
+            }
+            let discord::CommandDataOptionValue::SubCommand(options) = &command.value else {
+                unreachable!()
+            };
+            (command.name.to_string(), options.as_ref())
+        }
+        options => (String::new(), options),
     };
     if options.len() > 25 {
         return Err(Error::InvalidInteraction);
@@ -65,9 +76,11 @@ pub(super) fn parse(
         actor,
         member,
         PublishedRequest {
+            interaction_id: Some(interaction.id.to_string()),
+            private_action: None,
             command_id: interaction.data.id.to_string(),
             command_name: interaction.data.name.to_string(),
-            route: command.name.to_string(),
+            route,
             options: values,
             expected_binding: None,
             member_only: false,

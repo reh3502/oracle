@@ -256,6 +256,114 @@ impl FreshCheck for ReplyFresh<'_> {
         Ok(())
     }
 }
+
+impl DiscordOperations {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_mutation_payload(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        payload: &serde_json::Value,
+        context: &MemberContext,
+        policy: &oracle_core::member_mutation::MemberMutationPermit,
+        fence: Arc<dyn DispatchFence>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let path = reply_path(application_id, interaction_token)?;
+        let body = member_payload(payload)?;
+        let guard = SendGuard::with_fence(cancel, now() + 30, fence);
+        let fresh = MutationReplyFresh {
+            operations: self,
+            context,
+            policy,
+        };
+        success(
+            self.writer
+                .execute(Method::PATCH, &path, &body, &guard, &fresh)
+                .await?,
+        )?;
+        Ok(())
+    }
+}
+struct MutationReplyFresh<'a> {
+    operations: &'a DiscordOperations,
+    context: &'a MemberContext,
+    policy: &'a oracle_core::member_mutation::MemberMutationPermit,
+}
+#[async_trait]
+impl FreshCheck for MutationReplyFresh<'_> {
+    async fn check(&self) -> Result<()> {
+        self.policy.check()?;
+        let fresh = self.operations.refresh_member(self.context).await?;
+        if fresh.roles != self.context.roles
+            || fresh.guild != self.context.guild
+            || fresh.user != self.context.user
+            || fresh.channel != self.context.channel
+        {
+            return Err(denied());
+        }
+        self.operations
+            .core
+            .authorize_member_read(&fresh, &fresh.guild)
+            .await?;
+        self.policy.check()?;
+        Ok(())
+    }
+}
+
+impl DiscordOperations {
+    /// Display-only member lookups; no role or mutation authority is taken from these names.
+    pub async fn resolve_card_members(
+        &self,
+        guild: &oracle_core::GuildId,
+        card: &mut oracle_operations::published::PrivateCardPresentation,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let ids: std::collections::BTreeSet<_> = card
+            .controls
+            .card
+            .fields
+            .iter()
+            .flat_map(|f| f.members.iter().map(|m| m.user_id.clone()))
+            .chain(
+                card.controls
+                    .choices
+                    .iter()
+                    .filter_map(|c| c.member_id.clone()),
+            )
+            .collect();
+        if ids.len() > 9 {
+            return Err(Error::new(ErrorCode::InvalidInput));
+        }
+        let mut names = std::collections::BTreeMap::new();
+        let guild_id = discord::GuildId::new(sid(guild.as_str())?);
+        let lookups = async {
+            for id in ids {
+                let member = read(
+                    self.http
+                        .get_member(guild_id, discord::UserId::new(sid(id.as_str())?)),
+                )
+                .await;
+                if let Ok(member) = member {
+                    if member.guild_id != guild_id || member.user.id.to_string() != id.as_str() {
+                        return Err(Error::new(ErrorCode::ForbiddenScope));
+                    }
+                    let name = member
+                        .nick
+                        .as_deref()
+                        .or(member.user.global_name.as_deref())
+                        .unwrap_or(member.user.name.as_str());
+                    // Unicode/control sanitization is applied by the renderer below.
+                    names.insert(id, name.to_owned());
+                }
+            }
+            Ok(())
+        };
+        tokio::select! { biased; _ = cancel.cancelled() => return Err(Error::new(ErrorCode::Cancelled)), result = tokio::time::timeout(Duration::from_secs(3), lookups) => { if let Ok(result) = result { result?; } } }
+        oracle_operations::published::resolve_private_card_names(card, &names)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

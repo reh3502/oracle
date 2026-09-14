@@ -71,23 +71,25 @@ impl ModuleManager {
         Ok(self.registry_signal.snapshot(|revision| {
             let mut entries = self.catalog_current(guild);
             for entry in &mut entries {
-                if self
+                let read = self
                     .member_gate
                     .check_access(actor, guild, &entry.module)
-                    .is_err()
-                {
-                    entry.operations.clear();
-                } else {
-                    entry.operations.retain(|op| {
-                        op.audience == ModuleAudience::MemberRead && op.capabilities.is_empty()
-                    });
-                }
-                entry
-                    .commands
-                    .routes
-                    .retain(|route| entry.operations.iter().any(|op| op.name == route.operation));
+                    .is_ok();
+                let mutation = self
+                    .core
+                    .member_mutation_gate()
+                    .check_access(actor, guild, &entry.module)
+                    .is_ok();
+                entry.operations.retain(|op| match op.audience {
+                    ModuleAudience::MemberRead => read && op.capabilities.is_empty(),
+                    ModuleAudience::MemberMutation => mutation,
+                    ModuleAudience::Operator => false,
+                });
+                entry.commands.retain_routes(|route| {
+                    entry.operations.iter().any(|op| op.name == route.operation)
+                });
             }
-            entries.retain(|entry| !entry.commands.routes.is_empty());
+            entries.retain(|entry| entry.commands.all_routes().next().is_some());
             ModuleCatalogSnapshot { revision, entries }
         }))
     }
@@ -121,8 +123,7 @@ impl ModuleManager {
             || !operation.capabilities.is_empty()
             || !manifest.commands.as_ref().is_some_and(|commands| {
                 commands
-                    .routes
-                    .iter()
+                    .all_routes()
                     .any(|route| route.operation == operation.name)
             })
         {

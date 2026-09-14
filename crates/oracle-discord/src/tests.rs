@@ -820,9 +820,8 @@ async fn unrelated_published_commands_without_operations_are_not_claimed() {
 }
 
 #[tokio::test]
-async fn published_commands_require_exactly_one_subcommand_and_share_cancellation() {
+async fn published_commands_reject_nested_or_multiple_subcommands_and_share_cancellation() {
     for options in [
-        json!([]),
         json!([{"name":"probe","type":1,"options":[]},{"name":"status","type":1,"options":[]}]),
         json!([{"name":"group","type":2,"options":[{"name":"probe","type":1,"options":[]}]}]),
     ] {
@@ -910,4 +909,26 @@ fn agent_controls_use_authenticated_identity_and_exact_arguments() {
             }
         }
     ));
+}
+
+#[test]
+fn direct_aliases_preserve_top_level_typed_options_and_fresh_interaction() {
+    let mut raw = serde_json::to_value(published_interaction("404", json!([]))).unwrap();
+    raw["data"]["options"] =
+        json!([{"name":"id","type":3,"value":"ABCD1234"},{"name":"toon","type":3,"value":"Poppy"}]);
+    let command = serde_json::from_str(&raw.to_string()).unwrap();
+    let (_, _, request) = super::published_interaction::parse(&command).unwrap();
+    assert_eq!(request.route, "");
+    assert_eq!(request.options["id"], "ABCD1234");
+    assert_eq!(
+        request.interaction_id.as_deref(),
+        Some(command.id.to_string().as_str())
+    );
+    assert!(request.private_action.is_none());
+    raw["data"]["options"] = json!([]);
+    let (_, _, request) =
+        super::published_interaction::parse(&serde_json::from_str(&raw.to_string()).unwrap())
+            .unwrap();
+    assert!(request.route.is_empty());
+    assert!(request.options.is_empty());
 }

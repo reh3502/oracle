@@ -32,7 +32,10 @@ struct Session {
     history: Vec<PublishedRequest>,
 }
 #[derive(Default)]
-pub(super) struct Cards(Mutex<HashMap<String, Session>>);
+pub(super) struct Cards(
+    Mutex<HashMap<String, Session>>,
+    pub(super) super::private_controls::PrivateCards,
+);
 impl Cards {
     fn insert(&self, session: Session) -> Result<String> {
         let mut entries = self.0.lock().map_err(|_| Error::Transport)?;
@@ -185,7 +188,7 @@ impl Cards {
         )
     }
 }
-fn identity(
+pub(super) fn identity(
     guild: Option<discord::GuildId>,
     channel: discord::GenericChannelId,
     user: &discord::User,
@@ -229,6 +232,8 @@ fn request(session: &Session, action: Action, input: Option<&str>) -> Result<Pub
         _ => return Err(Error::InvalidInteraction),
     }
     Ok(PublishedRequest {
+        interaction_id: None,
+        private_action: None,
         command_id: session.command_id.clone(),
         command_name: session.command_name.clone(),
         route: action.route,
@@ -322,6 +327,9 @@ impl DiscordBootstrap {
         i: &discord::ComponentInteraction,
         http: &discord::Http,
     ) -> Result<()> {
+        if i.data.custom_id.starts_with("op2:") {
+            return self.handle_private_component(i, http).await;
+        }
         if !i.data.custom_id.starts_with("oc:") {
             return Ok(());
         }
@@ -405,6 +413,9 @@ impl DiscordBootstrap {
         i: &discord::ModalInteraction,
         http: &discord::Http,
     ) -> Result<()> {
+        if i.data.custom_id.starts_with("op2:") {
+            return self.handle_private_modal(i, http).await;
+        }
         if !i.data.custom_id.starts_with("oc:") {
             return Ok(());
         }
@@ -521,6 +532,8 @@ mod tests {
             actions: HashMap::from([("b0".into(), action())]),
             created: Instant::now(),
             current: PublishedRequest {
+                interaction_id: None,
+                private_action: None,
                 command_id: "1234".into(),
                 command_name: "dw".into(),
                 route: "lookup".into(),
@@ -657,6 +670,8 @@ mod tests {
             }],
         };
         let reply = PublishedReply {
+            private_card: None,
+            mutation_policy: None,
             card: Some(card.clone()),
             binding: Some("binding".into()),
             control_fence: Some(Arc::new(Fence(true.into()))),
@@ -804,6 +819,8 @@ mod tests {
             choices: vec![],
         };
         let reply = PublishedReply {
+            private_card: None,
+            mutation_policy: None,
             card: Some(card.clone()),
             binding: Some("binding".into()),
             control_fence: Some(Arc::new(Fence(true.into()))),
