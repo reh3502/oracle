@@ -27,6 +27,16 @@ pub struct Config {
     pub member_reads: Vec<MemberReads>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_mutations: Vec<MemberMutations>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_card_destinations: Vec<SharedCardDestination>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedCardDestination {
+    pub guild: oracle_core::GuildId,
+    pub module: oracle_core::ModuleId,
+    pub destination: String,
+    pub channel: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,7 +86,8 @@ impl Config {
         }
         let parent = path.parent().unwrap_or(Path::new("."));
         let mut member_scopes = std::collections::BTreeSet::new();
-        if config.member_mutations.len() > 1024
+        if config.shared_card_destinations.len() > 1024
+            || config.member_mutations.len() > 1024
             || config.member_reads.len() > 1024
             || config.module_runtime.len() > 128
         {
@@ -91,6 +102,20 @@ impl Config {
         for mutations in &config.member_mutations {
             if !ids.contains(&mutations.guild)
                 || !mutation_scopes.insert((&mutations.guild, &mutations.module))
+            {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+        }
+        let mut destinations = std::collections::BTreeSet::new();
+        for binding in &config.shared_card_destinations {
+            if oracle_core::GuildId::new(&binding.channel).is_err()
+                || !ids.contains(&binding.guild)
+                || binding.destination.is_empty()
+                || binding.destination.len() > 64
+                || !binding.destination.bytes().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-')
+                })
+                || !destinations.insert((&binding.guild, &binding.module, &binding.destination))
             {
                 return Err(Error::new(ErrorCode::InvalidInput));
             }
@@ -171,6 +196,7 @@ pub fn initialize(path: &Path, postgres_env: Option<String>) -> Result<()> {
         module_runtime: BTreeMap::new(),
         member_reads: vec![],
         member_mutations: vec![],
+        shared_card_destinations: vec![],
         version: 1,
         state_dir: PathBuf::from("state"),
         database: match postgres_env {

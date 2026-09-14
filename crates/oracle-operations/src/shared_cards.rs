@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 pub struct SharedIntent {
     pub key: String,
     pub desired_revision: u64,
+    #[serde(default)]
+    pub repost_generation: u32,
     pub destination: String,
     pub created_at: u64,
     pub card: PrivateCardBody,
@@ -37,7 +39,7 @@ pub struct SharedIdentity {
     pub control_version: String,
 }
 /// Frozen before a remote request; observations compare this exact payload.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SharedEffect {
     pub effect_id: String,
     pub guild: GuildId,
@@ -95,11 +97,109 @@ pub enum SharedPhase {
 pub struct SharedRecord {
     pub module: ModuleId,
     pub run_id: String,
+    secret: ControlSecret,
     pub desired: SharedIntent,
     pub phase: SharedPhase,
     pub identity: Option<SharedIdentity>,
     pub confirmed_revision: Option<u64>,
     pub effect: Option<SharedEffect>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct ControlSecret([u8; 32]);
+impl std::fmt::Debug for ControlSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+impl ControlSecret {
+    fn new() -> Self {
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        Self(bytes)
+    }
+}
+impl SharedRecord {
+    fn control_mac(
+        &self,
+        guild: &GuildId,
+        version: &str,
+        action: usize,
+    ) -> Result<hmac::Hmac<Sha256>> {
+        use hmac::Mac;
+        let action = self
+            .desired
+            .actions
+            .get(action)
+            .ok_or_else(|| Error::new(ErrorCode::InvalidInput))?;
+        let input = serde_json::to_vec(&(guild, &self.module, &self.run_id, version, action))
+            .map_err(|_| Error::new(ErrorCode::Integrity))?;
+        let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&self.secret.0)
+            .map_err(|_| Error::new(ErrorCode::Integrity))?;
+        mac.update(&input);
+        Ok(mac)
+    }
+    pub fn control_id(&self, guild: &GuildId, version: &str, action: usize) -> Result<String> {
+        use hmac::Mac;
+        if action > 4 {
+            return Err(Error::new(ErrorCode::InvalidInput));
+        }
+        let tag = self
+            .control_mac(guild, version, action)?
+            .finalize()
+            .into_bytes();
+        let tag: String = tag[..12].iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(format!(
+            "os:{}:{action}:{tag}",
+            SharedCardJournal::key(&self.module, &self.run_id)
+        ))
+    }
+    pub fn verify_control(
+        &self,
+        guild: &GuildId,
+        channel: &str,
+        message: &str,
+        application: &str,
+        author: &str,
+        custom_id: &str,
+    ) -> Result<SharedAction> {
+        use hmac::Mac;
+        let forbidden = || Error::new(ErrorCode::ForbiddenScope);
+        let identity = self.identity.as_ref().ok_or_else(forbidden)?;
+        if identity.target.channel_id != channel
+            || identity.message_id != message
+            || identity.target.application_id != application
+            || identity.target.bot_id != author
+        {
+            return Err(forbidden());
+        }
+        let parts: Vec<_> = custom_id.split(':').collect();
+        if parts.len() != 4
+            || parts[0] != "os"
+            || parts[1] != SharedCardJournal::key(&self.module, &self.run_id)
+            || parts[2].len() != 1
+            || parts[3].len() != 24
+            || !parts[3].is_ascii()
+        {
+            return Err(forbidden());
+        }
+        let index: usize = parts[2].parse().map_err(|_| forbidden())?;
+        if index > 4 {
+            return Err(forbidden());
+        }
+        let mut tag = [0; 12];
+        for (i, byte) in tag.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).map_err(|_| forbidden())?;
+        }
+        self.control_mac(guild, &identity.control_version, index)?
+            .verify_truncated_left(&tag)
+            .map_err(|_| forbidden())?;
+        self.desired
+            .actions
+            .get(index)
+            .cloned()
+            .ok_or_else(forbidden)
+    }
 }
 /// CAS is the serialization boundary, including across a host restart. A saved
 /// unknown effect blocks replacement until a positive observation settles it.
@@ -123,11 +223,40 @@ impl SharedCardJournal {
         module: &ModuleId,
         run_id: &str,
     ) -> Result<Option<(u64, SharedRecord)>> {
-        self.repository
+        let found = self
+            .repository
             .workflow_get(guild, WorkflowKind::SharedCard, &Self::key(module, run_id))
             .await?
             .map(decode)
-            .transpose()
+            .transpose()?;
+        if found
+            .as_ref()
+            .is_some_and(|(_, record)| &record.module != module || record.run_id != run_id)
+        {
+            return Err(Error::new(ErrorCode::Integrity));
+        }
+        Ok(found)
+    }
+    pub async fn resolve_control(&self, guild: &GuildId, custom_id: &str) -> Result<SharedRecord> {
+        let parts: Vec<_> = custom_id.split(':').collect();
+        if parts.len() != 4
+            || parts[0] != "os"
+            || parts[1].len() != 64
+            || !parts[1].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(Error::new(ErrorCode::InvalidInput));
+        }
+        let (_, record) = self
+            .repository
+            .workflow_get(guild, WorkflowKind::SharedCard, parts[1])
+            .await?
+            .map(decode)
+            .transpose()?
+            .ok_or_else(|| Error::new(ErrorCode::NotFound))?;
+        if Self::key(&record.module, &record.run_id) != parts[1] {
+            return Err(Error::new(ErrorCode::Integrity));
+        }
+        Ok(record)
     }
     async fn save(
         &self,
@@ -156,6 +285,58 @@ impl SharedCardJournal {
             .await?
             .revision)
     }
+    async fn reserve(&self, guild: &GuildId, module: &ModuleId, run_id: &str) -> Result<()> {
+        // Reserve a bounded slot before creating its journal. A crash between
+        // these writes retains the reservation and cannot exceed the quota.
+        let key = format!("index:{}", Self::key(module, ""));
+        for _ in 0..8 {
+            let existing = self
+                .repository
+                .workflow_get(guild, WorkflowKind::SharedCard, &key)
+                .await?;
+            let revision = existing.as_ref().map(|row| row.revision);
+            let mut runs: std::collections::BTreeSet<String> = existing
+                .map(|row| {
+                    serde_json::from_value(row.value).map_err(|_| Error::new(ErrorCode::Integrity))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if runs.contains(run_id) {
+                return Ok(());
+            }
+            if runs.len() >= 700 {
+                return Err(Error::new(ErrorCode::QuotaExceeded));
+            }
+            runs.insert(run_id.into());
+            match self
+                .repository
+                .workflow_put(
+                    guild,
+                    WorkflowKind::SharedCard,
+                    &key,
+                    revision,
+                    &serde_json::to_value(runs).map_err(|_| Error::new(ErrorCode::Integrity))?,
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if error.code == ErrorCode::Conflict => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::new(ErrorCode::Conflict))
+    }
+    pub async fn run_ids(&self, guild: &GuildId, module: &ModuleId) -> Result<Vec<String>> {
+        let key = format!("index:{}", Self::key(module, ""));
+        self.repository
+            .workflow_get(guild, WorkflowKind::SharedCard, &key)
+            .await?
+            .map(|row| {
+                serde_json::from_value(row.value).map_err(|_| Error::new(ErrorCode::Integrity))
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
     /// The caller has already loaded and validated the manifest-declared intent.
     /// Repeating a revision is idempotent only when its complete intent agrees.
     pub async fn enqueue(
@@ -166,12 +347,13 @@ impl SharedCardJournal {
         intent: SharedIntent,
     ) -> Result<SharedRecord> {
         if run_id.is_empty()
-            || run_id.len() > 128
+            || run_id.len() > 64
             || intent.desired_revision == 0
             || intent.key != run_id
         {
             return Err(Error::new(ErrorCode::InvalidInput));
         }
+        self.reserve(guild, module, run_id).await?;
         for _ in 0..8 {
             let existing = self.get(guild, module, run_id).await?;
             let (revision, mut record) = match existing {
@@ -181,6 +363,7 @@ impl SharedCardJournal {
                     SharedRecord {
                         module: module.clone(),
                         run_id: run_id.into(),
+                        secret: ControlSecret::new(),
                         desired: intent.clone(),
                         phase: SharedPhase::Pending,
                         identity: None,
@@ -197,6 +380,20 @@ impl SharedCardJournal {
                     return Err(Error::new(ErrorCode::Conflict));
                 }
                 return Ok(record);
+            }
+            if revision.is_some() && intent.repost_generation != record.desired.repost_generation {
+                if record.phase != SharedPhase::Missing
+                    || record.effect.is_some()
+                    || record.desired.repost_generation.checked_add(1)
+                        != Some(intent.repost_generation)
+                {
+                    return Err(Error::new(ErrorCode::Conflict));
+                }
+                record.identity = None;
+                record.confirmed_revision = None;
+                record.phase = SharedPhase::Pending;
+            } else if revision.is_none() && intent.repost_generation != 0 {
+                return Err(Error::new(ErrorCode::Conflict));
             }
             record.desired = intent.clone();
             if !matches!(record.phase, SharedPhase::Unknown | SharedPhase::Missing) {
@@ -251,7 +448,7 @@ impl SharedCardJournal {
                 .effect
                 .as_ref()
                 .ok_or_else(|| Error::new(ErrorCode::Conflict))?;
-            if saved.effect_id != effect.effect_id || record.phase != SharedPhase::Unknown {
+            if saved != effect || record.phase != SharedPhase::Unknown {
                 return Err(Error::new(ErrorCode::Conflict));
             }
             match &observation {
@@ -296,6 +493,32 @@ impl SharedCardJournal {
             }
         }
         Err(Error::new(ErrorCode::Conflict))
+    }
+    /// A read-only remote probe positively established that this exact message
+    /// is absent while the bot still has access to its channel.
+    pub async fn mark_missing(
+        &self,
+        guild: &GuildId,
+        module: &ModuleId,
+        run_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let (revision, mut record) = self
+            .get(guild, module, run_id)
+            .await?
+            .ok_or_else(|| Error::new(ErrorCode::NotFound))?;
+        if record.phase != SharedPhase::Confirmed
+            || record.effect.is_some()
+            || record
+                .identity
+                .as_ref()
+                .is_none_or(|identity| identity.message_id != message_id)
+        {
+            return Err(Error::new(ErrorCode::Conflict));
+        }
+        record.phase = SharedPhase::Missing;
+        self.save(guild, Some(revision), &record).await?;
+        Ok(())
     }
     /// Used only after a fresh authorized explicit repost action.
     pub async fn repost(&self, guild: &GuildId, module: &ModuleId, run_id: &str) -> Result<()> {

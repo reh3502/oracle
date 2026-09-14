@@ -12,6 +12,7 @@ use oracle_storage::{PgTools, Storage};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 pub(crate) struct Host {
+    pub(crate) shared_cards: std::sync::OnceLock<Arc<crate::shared_cards::SharedCards>>,
     pub(crate) ai: std::sync::OnceLock<Arc<oracle_ai::coordinator::Coordinator>>,
     pub(crate) operations: std::sync::OnceLock<Arc<oracle_operations::executor::StructureExecutor>>,
     pub(crate) command_sync:
@@ -163,6 +164,7 @@ impl Host {
             return Err(error);
         }
         Ok(Self {
+            shared_cards: std::sync::OnceLock::new(),
             ai: std::sync::OnceLock::new(),
             operations: std::sync::OnceLock::new(),
             command_sync: std::sync::OnceLock::new(),

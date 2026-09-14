@@ -67,12 +67,100 @@ impl Generation {
         }
         let authority = self.gate.authority(handle)?;
         if let Some(methods) = &authority.callback_methods
-            && (!matches!(method, "host.document_get" | "host.document_batch")
-                || !methods.contains(method))
+            && (!matches!(
+                method,
+                "host.document_get"
+                    | "host.document_batch"
+                    | "host.shared_card_enqueue"
+                    | "host.shared_card_status"
+            ) || !methods.contains(method))
         {
             return Err(error(ErrorCode::ForbiddenPermission));
         }
         match method {
+            "host.shared_card_enqueue" | "host.shared_card_status" => {
+                let request: SharedRequest = decode(params)?;
+                let authority = self.gate.authority(&request.invocation)?;
+                if !authority.capabilities.contains("shared_cards.publish")
+                    || authority
+                        .callback_methods
+                        .as_ref()
+                        .is_none_or(|methods| !methods.contains(method))
+                {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                let source = self
+                    .installed
+                    .package
+                    .manifest
+                    .shared_cards
+                    .as_ref()
+                    .ok_or_else(|| error(ErrorCode::ForbiddenPermission))?;
+                if authority
+                    .callback_collections
+                    .as_ref()
+                    .is_none_or(|collections| !collections.contains(&source.collection))
+                {
+                    return Err(error(ErrorCode::ForbiddenPermission));
+                }
+                valid_key(&request.intent_key)?;
+                let intent = if method == "host.shared_card_enqueue" {
+                    let expected = request
+                        .expected_revision
+                        .filter(|r| *r > 0)
+                        .ok_or_else(|| error(ErrorCode::InvalidInput))?;
+                    let document = self
+                        .bounded(
+                            &request.invocation,
+                            &authority,
+                            &cancel,
+                            self.repository.document_get(
+                                &self.installed.package.manifest.id,
+                                &authority.guild,
+                                &source.collection,
+                                &request.intent_key,
+                            ),
+                        )
+                        .await?
+                        .ok_or_else(|| error(ErrorCode::NotFound))?;
+                    if document.revision != expected {
+                        return Err(error(ErrorCode::Conflict));
+                    }
+                    schema_validator(self.collection(&source.collection)?)?
+                        .validate(&document.value)
+                        .map_err(|_| error(ErrorCode::SchemaInvalid))?;
+                    let intent = document
+                        .value
+                        .pointer(&source.pointer)
+                        .ok_or_else(|| error(ErrorCode::InvalidInput))?
+                        .clone();
+                    validate_shared_intent(
+                        &intent,
+                        &request.intent_key,
+                        &self.installed.package.manifest,
+                    )?;
+                    Some(intent)
+                } else {
+                    if request.expected_revision.is_some() {
+                        return Err(error(ErrorCode::InvalidInput));
+                    }
+                    None
+                };
+                self.bounded(
+                    &request.invocation,
+                    &authority,
+                    &cancel,
+                    self.router.shared_card(
+                        &self.installed.package.manifest.id,
+                        &self.session,
+                        self.number,
+                        authority.clone(),
+                        intent,
+                        &request.intent_key,
+                    ),
+                )
+                .await
+            }
             "host.health" => {
                 let request: HealthRequest = decode(params)?;
                 let authority = self.gate.authority(&request.invocation)?;
@@ -293,6 +381,102 @@ fn valid_key(key: &str) -> Result<()> {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SharedRequest {
+    invocation: String,
+    intent_key: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedIntent {
+    key: String,
+    desired_revision: u64,
+    destination: String,
+    created_at: u64,
+    #[serde(default)]
+    repost_generation: u64,
+    card: Value,
+    actions: Vec<SharedAction>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedAction {
+    name: String,
+    label: String,
+    operation: String,
+    input: serde_json::Map<String, Value>,
+}
+fn validate_shared_intent(
+    value: &Value,
+    key: &str,
+    manifest: &oracle_core::ModuleManifest,
+) -> Result<()> {
+    if serde_json::to_vec(value)
+        .map_err(|_| error(ErrorCode::InvalidInput))?
+        .len()
+        > 6 * 1024
+    {
+        return Err(error(ErrorCode::QuotaExceeded));
+    }
+    let intent: SharedIntent =
+        serde_json::from_value(value.clone()).map_err(|_| error(ErrorCode::InvalidInput))?;
+    let alias = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 32
+            && v.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+    };
+    if intent.key != key
+        || intent.desired_revision == 0
+        || !alias(&intent.destination)
+        || !intent.card.is_object()
+        || intent.actions.len() > 5
+        || intent.created_at == 0
+        || intent.repost_generation > intent.desired_revision
+    {
+        return Err(error(ErrorCode::InvalidInput));
+    }
+    let mut names = BTreeSet::new();
+    for action in intent.actions {
+        if !alias(&action.name)
+            || !names.insert(action.name)
+            || action.label.is_empty()
+            || action.label.chars().count() > 80
+            || action.label.chars().any(char::is_control)
+            || action.input.iter().any(|(key, value)| {
+                matches!(
+                    key.as_str(),
+                    "actor"
+                        | "actor_id"
+                        | "guild"
+                        | "guild_id"
+                        | "user_id"
+                        | "interaction_id"
+                        | "permissions"
+                        | "invocation"
+                ) || value.is_array()
+                    || value.is_object()
+            })
+        {
+            return Err(error(ErrorCode::InvalidInput));
+        }
+        let operation = manifest
+            .operations
+            .iter()
+            .find(|op| {
+                op.name == action.operation
+                    && op.audience == oracle_core::ModuleAudience::MemberMutation
+            })
+            .ok_or_else(|| error(ErrorCode::ForbiddenPermission))?;
+        schema_validator(&operation.input_schema)?
+            .validate(&Value::Object(action.input))
+            .map_err(|_| error(ErrorCode::SchemaInvalid))?;
+    }
+    Ok(())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Get {
     invocation: String,
     collection: String,
@@ -348,4 +532,19 @@ impl RpcHandler for Callbacks {
 #[serde(deny_unknown_fields)]
 struct HealthRequest {
     invocation: String,
+}
+
+#[cfg(test)]
+mod shared_intent_tests {
+    use super::*;
+    #[test]
+    fn terminal_projection_can_remove_every_public_control() {
+        let manifest: oracle_core::ModuleManifest = serde_json::from_str(include_str!(
+            "../../../../modules/dandys-world/manifest.json"
+        ))
+        .unwrap();
+        crate::package::validate_manifest(&manifest).unwrap();
+        let intent = serde_json::json!({"key":"ABCD2345","desired_revision":7,"destination":"runs","created_at":1,"card":{"title":"Completed run"},"actions":[]});
+        validate_shared_intent(&intent, "ABCD2345", &manifest).unwrap();
+    }
 }

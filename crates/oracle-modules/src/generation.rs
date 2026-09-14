@@ -31,6 +31,15 @@ pub(crate) struct Activation {
 }
 #[async_trait]
 pub(crate) trait ContractRouter: Send + Sync {
+    async fn shared_card(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        generation: u64,
+        authority: Authority,
+        intent: Option<Value>,
+        key: &str,
+    ) -> Result<Value>;
     async fn host_health(
         &self,
         module: &ModuleId,
@@ -530,7 +539,10 @@ impl Generation {
                 .ok_or_else(|| error(ErrorCode::ForbiddenPermission))?;
             if worker.is_none()
                 || operation.audience != oracle_core::ModuleAudience::Operator
-                || operation.capabilities.iter().any(|c| c != "storage.own")
+                || operation
+                    .capabilities
+                    .iter()
+                    .any(|c| !matches!(c.as_str(), "storage.own" | "shared_cards.publish"))
             {
                 return Err(error(ErrorCode::ForbiddenPermission));
             }

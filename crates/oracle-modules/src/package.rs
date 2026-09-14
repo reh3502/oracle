@@ -55,6 +55,7 @@ fn allowed_capability(value: &str) -> bool {
             | "config.own"
             | "events.guild"
             | "discord.notify"
+            | "shared_cards.publish"
     )
 }
 
@@ -513,6 +514,40 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     {
         return Err(err(ErrorCode::Compatibility));
     }
+    if let Some(source) = &manifest.shared_cards {
+        let pointer = source.pointer.as_bytes();
+        if manifest.manifest_version != 3
+            || !manifest
+                .capabilities
+                .iter()
+                .any(|c| c == "shared_cards.publish")
+            || !manifest
+                .collections
+                .iter()
+                .any(|c| c.name == source.collection)
+            || pointer.is_empty()
+            || pointer.len() > 128
+            || pointer[0] != b'/'
+            || source.pointer.chars().any(char::is_control)
+            || source.pointer.split('/').count() > 9
+            || pointer.iter().enumerate().any(|(i, b)| {
+                *b == b'~'
+                    && !pointer
+                        .get(i + 1)
+                        .is_some_and(|n| matches!(*n, b'0' | b'1'))
+            })
+        {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+    }
+    if manifest
+        .capabilities
+        .iter()
+        .any(|c| c == "shared_cards.publish")
+        && (manifest.manifest_version != 3 || manifest.shared_cards.is_none())
+    {
+        return Err(err(ErrorCode::InvalidInput));
+    }
     if manifest.capabilities.len() > 16
         || !unique(manifest.capabilities.iter().map(String::as_str))
         || manifest.capabilities.iter().any(|c| !allowed_capability(c))
@@ -762,21 +797,43 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                 return Err(err(ErrorCode::InvalidInput));
             }
         } else if operation.ai.is_some()
-            || operation.callback_methods.len() > 2
+            || operation.callback_methods.len() > 4
             || !unique(operation.callback_methods.iter().map(String::as_str))
             || !unique(operation.callback_collections.iter().map(String::as_str))
             || operation
                 .callback_collections
                 .iter()
                 .any(|c| !manifest.collections.iter().any(|v| &v.name == c))
-            || operation.capabilities.iter().any(|c| c != "storage.own")
             || operation
+                .capabilities
+                .iter()
+                .any(|c| !matches!(c.as_str(), "storage.own" | "shared_cards.publish"))
+            || operation.callback_methods.iter().any(|m| {
+                !matches!(
+                    m.as_str(),
+                    "host.document_get"
+                        | "host.document_batch"
+                        | "host.shared_card_enqueue"
+                        | "host.shared_card_status"
+                )
+            })
+            || (operation
                 .callback_methods
                 .iter()
-                .any(|m| !matches!(m.as_str(), "host.document_get" | "host.document_batch"))
-            || (!operation.callback_methods.is_empty()
+                .any(|m| m.starts_with("host.document_"))
                 && (!operation.capabilities.iter().any(|c| c == "storage.own")
                     || operation.callback_collections.is_empty()))
+            || (operation
+                .callback_methods
+                .iter()
+                .any(|m| m.starts_with("host.shared_card_"))
+                && (!operation
+                    .capabilities
+                    .iter()
+                    .any(|c| c == "shared_cards.publish")
+                    || manifest.shared_cards.as_ref().is_none_or(|source| {
+                        !operation.callback_collections.contains(&source.collection)
+                    })))
         {
             return Err(err(ErrorCode::InvalidInput));
         }

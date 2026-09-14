@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ModuleManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_cards: Option<ModuleSharedCards>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_permissions: Vec<String>,
     pub manifest_version: u32,
@@ -38,6 +40,12 @@ pub struct ModuleManifest {
     pub commands: Option<ModuleCommands>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ModuleRuntimeRequirements>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleSharedCards {
+    pub collection: String,
+    pub pointer: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -492,6 +500,8 @@ struct ModuleManifestV2 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModuleManifestV3 {
+    #[serde(default)]
+    pub shared_cards: Option<ModuleSharedCards>,
     #[serde(deserialize_with = "version_three")]
     pub manifest_version: u32,
     #[serde(default)]
@@ -579,6 +589,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         Ok(match Wire::deserialize(d)? {
             Wire::V1(v) => v.into(),
             Wire::V2(v) => Self {
+                shared_cards: None,
                 member_permissions: Vec::new(),
                 manifest_version: v.manifest_version,
                 id: v.id,
@@ -617,6 +628,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
                 runtime: v.runtime,
             },
             Wire::V3(v) => Self {
+                shared_cards: v.shared_cards,
                 member_permissions: v.member_permissions,
                 manifest_version: v.manifest_version,
                 id: v.id,

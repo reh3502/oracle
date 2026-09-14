@@ -42,6 +42,15 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
             host.core.clone(),
         )?);
         published_adapter = Some(adapter.clone());
+        let shared = crate::shared_cards::SharedCards::new(
+            &host,
+            adapter.clone(),
+            config.shared_card_destinations.clone(),
+        );
+        host.modules.set_shared_card_service(shared.clone())?;
+        host.shared_cards
+            .set(shared)
+            .map_err(|_| Error::new(ErrorCode::Conflict))?;
         host.operations
             .set(Arc::new(
                 oracle_operations::executor::StructureExecutor::new(
@@ -159,6 +168,25 @@ async fn run(
             }
         })
         .map_err(|_| Error::new(ErrorCode::Cancelled))?;
+    if let Some(shared) = host.shared_cards.get().cloned() {
+        let shared_stop = stop.clone();
+        tasks
+            .spawn("shared_cards", async move {
+                loop {
+                    tokio::select! {biased;
+                        _ = shared_stop.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                    if let Err(error) = shared.tick(&shared_stop).await {
+                        if shared_stop.is_cancelled() {
+                            return Ok(());
+                        }
+                        tracing::warn!(error=?error.code, "shared card reconciliation deferred");
+                    }
+                }
+            })
+            .map_err(|_| Error::new(ErrorCode::Cancelled))?;
+    }
     let gateway = if let Some((token, published_adapter)) = discord {
         let gateway = Arc::new(
             oracle_discord::DiscordBootstrap::with_runtime(

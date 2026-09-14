@@ -9,6 +9,7 @@ mod control;
 mod host;
 mod human_ops;
 mod server;
+mod shared_cards;
 use clap::Parser;
 use cli::{Action, Cli, Command};
 use config::Config;

@@ -26,3 +26,5 @@ pub use registry::RegistryDispatchPermit;
 pub use manager::ModuleCatalogSnapshot;
 
 pub use manager::{ModuleAiCatalogEntry, ModuleAiCatalogSnapshot};
+
+pub use manager::{SharedCardDispatch, SharedCardService};

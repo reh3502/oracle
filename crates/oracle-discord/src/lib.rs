@@ -571,6 +571,9 @@ impl discord::EventHandler for DiscordBootstrap {
         self.observe_connection(event);
         if let discord::FullEvent::InteractionCreate { interaction, .. } = event {
             let result = match interaction {
+                discord::Interaction::Component(i) if i.data.custom_id.starts_with("os:") => {
+                    self.handle_shared_component(i, &context.http).await
+                }
                 discord::Interaction::Component(i) => {
                     self.handle_card_component(i, &context.http).await
                 }
@@ -671,3 +674,7 @@ pub use command_presentation::{
 };
 
 mod private_controls;
+
+pub mod shared_cards;
+
+mod shared_controls;

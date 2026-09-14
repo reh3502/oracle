@@ -73,6 +73,7 @@ fn version_one<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> 
 impl From<ModuleManifestV1> for ModuleManifest {
     fn from(v: ModuleManifestV1) -> Self {
         Self {
+            shared_cards: None,
             member_permissions: Vec::new(),
             manifest_version: v.manifest_version,
             id: v.id,

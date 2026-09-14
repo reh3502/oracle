@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+/// Trusted gateway component identity. Scope comes from the accompanying MemberContext.
+#[derive(Clone, Debug)]
+pub struct SharedControlRequest {
+    pub custom_id: String,
+    pub message_id: String,
+    pub application_id: String,
+    pub author_id: String,
+    pub interaction_id: String,
+}
+
 /// Authenticated Discord option values. Duplicate option names are rejected at ingress.
 #[derive(Clone, Debug)]
 pub struct PublishedRequest {
@@ -84,6 +94,18 @@ pub enum OperationRequest {
 
 #[async_trait]
 pub trait HumanOperations: Send + Sync {
+    async fn resolve_shared(
+        &self,
+        _context: &PolicyContext,
+        _member: &oracle_core::member_read::MemberContext,
+        _request: SharedControlRequest,
+        _cancel: &CancellationToken,
+    ) -> Result<PublishedRequest> {
+        Err(oracle_core::Error::new(
+            oracle_core::ErrorCode::ForbiddenPermission,
+        ))
+    }
+
     /// Resolve the currently bound route before selecting member-specific HTTP
     /// checks. Invocation resolves it again to fence intervening registry changes.
     async fn published_uses_member_identity(

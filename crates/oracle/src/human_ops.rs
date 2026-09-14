@@ -11,6 +11,89 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait::async_trait]
 impl HumanOperations for Host {
+    async fn resolve_shared(
+        &self,
+        _context: &PolicyContext,
+        member: &oracle_core::member_read::MemberContext,
+        request: oracle_operations::ingress::SharedControlRequest,
+        cancel: &CancellationToken,
+    ) -> Result<oracle_operations::ingress::PublishedRequest> {
+        use oracle_operations::ingress::{PrivateAction, PublishedRequest};
+        if cancel.is_cancelled() {
+            return Err(Error::new(ErrorCode::Cancelled));
+        }
+        let shared = self
+            .shared_cards
+            .get()
+            .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+        let record = shared
+            .journal
+            .resolve_control(&member.guild, &request.custom_id)
+            .await?;
+        let action = record.verify_control(
+            &member.guild,
+            &member.channel,
+            &request.message_id,
+            &request.application_id,
+            &request.author_id,
+            &request.custom_id,
+        )?;
+        let entries = self
+            .modules
+            .member_catalog(member, &member.guild)
+            .await?
+            .entries;
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.module == record.module)
+            .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+        let reconciler = self
+            .command_sync
+            .get()
+            .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+        let bindings = reconciler.bindings(&member.guild).await?;
+        let binding = bindings
+            .into_iter()
+            .find(|binding| {
+                binding.owner == entry.module
+                    && binding.id.is_some()
+                    && binding.definition["name"].as_str()
+                        == Some(entry.commands.namespace.as_str())
+                    && binding.route.as_ref().is_some_and(|route| {
+                        route.session == entry.session
+                            && route.generation == entry.generation
+                            && route.epoch == entry.epoch
+                    })
+            })
+            .ok_or_else(|| Error::new(ErrorCode::ModuleUnavailable))?;
+        let route = entry
+            .commands
+            .routes
+            .iter()
+            .find(|route| {
+                matches!(
+                    route.presentation,
+                    Some(ModulePresentation::PrivateCardV2 { .. })
+                )
+            })
+            .ok_or_else(|| Error::new(ErrorCode::ForbiddenPermission))?;
+        Ok(PublishedRequest {
+            interaction_id: Some(request.interaction_id),
+            private_action: Some(PrivateAction {
+                operation: action.operation,
+                input: action.input,
+            }),
+            expected_binding: Some(format!(
+                "{}/{}/{}/{}",
+                entry.module, entry.session, entry.generation, entry.epoch
+            )),
+            member_only: false,
+            command_id: binding.id.ok_or_else(|| Error::new(ErrorCode::Integrity))?,
+            command_name: entry.commands.namespace.clone(),
+            route: route.name.clone(),
+            options: serde_json::Map::new(),
+        })
+    }
     async fn published_uses_member_identity(
         &self,
         context: &PolicyContext,

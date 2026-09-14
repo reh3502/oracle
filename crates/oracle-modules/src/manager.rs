@@ -24,6 +24,9 @@ mod configuration;
 pub use configuration::{
     ConfigurationPlan, ConfigurationPolicy, ConfigurationReceipt, ConfigurationStatus,
 };
+#[path = "shared_cards.rs"]
+mod shared_cards;
+pub use shared_cards::{SharedCardDispatch, SharedCardService};
 #[path = "events.rs"]
 mod events;
 pub use events::{
@@ -75,6 +78,7 @@ pub struct ModuleManager {
     member_gate: oracle_core::member_read::MemberReadGate,
     registry_signal: Arc<crate::registry::RegistrySignal>,
     event_services: RwLock<Option<events::EventServices>>,
+    shared_card_service: RwLock<Option<Arc<dyn SharedCardService>>>,
     event_queues: std::sync::Mutex<BTreeMap<(ModuleId, GuildId), events::EventQueue>>,
     event_tasks: tasks::HostTasks,
     configuration_services: RwLock<Option<configuration::ConfigurationServices>>,
@@ -176,6 +180,25 @@ impl Drop for RetainStopping<'_> {
 struct Router(Weak<ModuleManager>);
 #[async_trait]
 impl ContractRouter for Router {
+    async fn shared_card(
+        &self,
+        module: &ModuleId,
+        session: &str,
+        generation: u64,
+        authority: Authority,
+        intent: Option<Value>,
+        key: &str,
+    ) -> Result<Value> {
+        let manager = self.0.upgrade().ok_or_else(unavailable)?;
+        let service = manager.shared_card_service(module, session, generation, &authority)?;
+        let value = match intent {
+            Some(intent) => service.enqueue(module, &authority.guild, intent).await?,
+            None => service.status(module, &authority.guild, key).await?,
+        };
+        manager.shared_card_service(module, session, generation, &authority)?;
+        shared_cards::validate_status(&value)?;
+        Ok(value)
+    }
     async fn host_health(
         &self,
         module: &ModuleId,
@@ -335,6 +358,7 @@ impl ModuleManager {
             member_gate: core.member_read_gate(),
             runtime_settings: RwLock::new(BTreeMap::new()),
             event_services: RwLock::new(None),
+            shared_card_service: RwLock::new(None),
             event_queues: std::sync::Mutex::new(BTreeMap::new()),
             event_tasks: tasks::HostTasks::new(),
             configuration_services: RwLock::new(None),
