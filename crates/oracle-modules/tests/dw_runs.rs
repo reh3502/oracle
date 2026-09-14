@@ -370,11 +370,11 @@ async fn qualify_ui(
             .as_array()
             .unwrap()
             .iter()
-            .any(|button| button["label"] == "Next")
+            .any(|button| button["label"] == "Next Toons")
         {
             break;
         }
-        page = ui(manager, guild, binding, "910", control(&page, "Next")).await;
+        page = ui(manager, guild, binding, "910", control(&page, "Next Toons")).await;
     }
     assert!(reachable.len() > 25);
     let all = before["eligibility"]["toons"].as_object().unwrap();
@@ -385,9 +385,16 @@ async fn qualify_ui(
         .to_owned();
     assert_ne!(first_toon, last_toon);
     let mut set_last = control(&page, "Add or edit Toon");
+    assert_eq!(set_last["page"], 1);
+    let page_label = page["reply"]["buttons"][0]["prompt"]["select"]["label"].clone();
     set_last["toon"] = json!(last_toon);
     set_last["count"] = json!("6");
     page = ui(manager, guild, binding, "910", set_last).await;
+    assert_eq!(control(&page, "Add or edit Toon")["page"], 1);
+    assert_eq!(
+        page["reply"]["buttons"][0]["prompt"]["select"]["label"],
+        page_label
+    );
     let host = ui(
         manager,
         guild,

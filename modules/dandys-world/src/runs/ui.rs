@@ -465,9 +465,10 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
             let page =
                 usize::from(input.page.unwrap_or(0)).min(available.len().saturating_sub(1) / 25);
             description.push_str(&format!(
-                "Page {} of {}. Open Add or edit Toon to choose a Toon and its count together. Your other choices stay saved.",
+                "Page {} of {} · {} Toons total. Open Add or edit Toon to choose a Toon and its count. To see the other Toons, close the form and use Next Toons or Previous Toons below. Your choices stay saved.",
                 page + 1,
-                available.len().div_ceil(25)
+                available.len().div_ceil(25),
+                available.len()
             ));
             let options: Vec<_> = available
                 .iter()
@@ -485,7 +486,8 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                     1,
                     None,
                 );
-                add["prompt"]["select"] = json!({"option":"toon","label":"Toon","choices":options});
+                add["input"]["page"] = json!(page);
+                add["prompt"]["select"] = json!({"option":"toon","label":format!("Toon · page {} of {}",page+1,available.len().div_ceil(25)),"choices":options});
                 buttons.push(add);
             }
             for (toon, count) in run.allocations.iter().flat_map(|a| a.iter()) {
@@ -496,9 +498,9 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 choices.push(json!({"label":text(&toon_name(run,toon),80),"description":format!("{count} required · edit or remove"),"operation":"run_ui","input":choice}));
             }
             for (label, next) in [
-                ("Previous", page.checked_sub(1)),
+                ("Previous Toons", page.checked_sub(1)),
                 (
-                    "Next",
+                    "Next Toons",
                     (page + 1 < available.len().div_ceil(25)).then_some(page + 1),
                 ),
             ] {
@@ -541,7 +543,7 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 .copied()
                 .unwrap_or(0);
             fields.push(field("Current count", format!("{count} places")));
-            buttons.push(prompt(
+            let mut edit = prompt(
                 run,
                 "Set count",
                 "set_count",
@@ -549,10 +551,13 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 "Number of places (1–8)",
                 1,
                 Some(("toon", toon)),
-            ));
+            );
+            edit["input"]["page"] = json!(input.page.unwrap_or(0));
+            buttons.push(edit);
             if count > 0 {
                 let mut remove = base(run, "remove_toon");
                 remove["toon"] = json!(toon);
+                remove["page"] = json!(input.page.unwrap_or(0));
                 buttons.push(button("Remove Toon", remove));
                 if run.state == RunState::Draft {
                     let mut own = base(run, "set_host");

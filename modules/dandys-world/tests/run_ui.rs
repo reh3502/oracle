@@ -78,10 +78,28 @@ fn organized_paged_counts_host_review_and_post_keep_durable_rows() {
             .len(),
         15
     );
-    apply_input(
-        &mut stored,
-        json!({"action":"set_count","id":"abcd2345","toon":"toon30","count":"6"}),
+    assert_eq!(
+        second["buttons"][0]["prompt"]["select"]["label"],
+        "Toon · page 2 of 2"
     );
+    let mut add = second["buttons"][0]["input"].clone();
+    assert_eq!(add["page"], 1);
+    add["toon"] = json!("toon30");
+    add["count"] = json!("6");
+    apply_input(&mut stored, add);
+    let mut edit_page = Input::show(&stored.run.id, View::Toon);
+    edit_page.page = Some(1);
+    edit_page.toon = Some("toon30".into());
+    let edit = ui::render(&stored, &owner(), &edit_page, None);
+    for label in ["Set count", "Remove Toon"] {
+        let button = edit["buttons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|button| button["label"] == label)
+            .unwrap();
+        assert_eq!(button["input"]["page"], 1);
+    }
     apply_input(
         &mut stored,
         json!({"action":"set_host","id":"abcd2345","toon":"toon30"}),
