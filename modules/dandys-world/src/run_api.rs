@@ -400,7 +400,7 @@ pub async fn invoke(
     let notice = if publication_notice.is_some() {
         publication_notice.as_deref()
     } else if operation.starts_with("run_create_") {
-        Some("Your draft is saved. Existing setup is resumed without changing its mode or name.")
+        Some("Your draft is saved. Continue setup below.")
     } else if stored.publication.is_some() {
         Some("Saved. The public card may still be catching up.")
     } else {

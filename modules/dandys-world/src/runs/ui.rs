@@ -558,7 +558,9 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 buttons.push(view_button(run, "View players", "players"));
                 buttons.push(view_button(run, "Back", "summary"));
             } else {
-                description.push_str(if view == View::Switch {
+                description.push_str(if run.mode == RunMode::Casual {
+                    "Choose any playable Toon, or leave the choice empty. There are no individual Toon limits."
+                } else if view == View::Switch {
                     "Your current place stays saved if the new Toon is full."
                 } else {
                     "Choose your own Toon. This choice belongs only to you."
