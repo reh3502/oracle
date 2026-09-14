@@ -471,6 +471,15 @@ impl Module for DwModule {
         to: u32,
         documents: Vec<ModuleDocument>,
     ) -> Result<Vec<DocumentWrite>> {
+        if operation == "migrate_run_schedule" && from == 3 && to == 4 {
+            return documents
+                .into_iter()
+                .map(|document| {
+                    dandys_world_core::runs::storage::migrate_v3_document(document)
+                        .map_err(|error| RpcError::Remote(error.to_string()))
+                })
+                .collect();
+        }
         // Version one had no module document collections. Never reinterpret unexpected data.
         if operation == "migrate_run_cards" && from == 2 && to == 3 {
             return documents

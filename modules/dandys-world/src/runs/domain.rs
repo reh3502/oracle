@@ -98,6 +98,29 @@ pub struct Confirmation {
     pub revision: u64,
 }
 
+/// One absolute start instant; clients localize it when rendering Discord timestamps.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunSchedule {
+    pub starts_at: i64,
+    pub duration_minutes: u16,
+    pub timezone: Option<String>,
+}
+impl RunSchedule {
+    pub fn validate(&self) -> Result<(), Error> {
+        if !(0..=253_402_300_799).contains(&self.starts_at)
+            || !(1..=1440).contains(&self.duration_minutes)
+            || self
+                .timezone
+                .as_ref()
+                .is_some_and(|zone| zone.parse::<chrono_tz::Tz>().is_err())
+        {
+            return Err(Error::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
@@ -110,6 +133,8 @@ pub struct Run {
     /// Casual runs have no quota map, including an empty map.
     pub allocations: Option<BTreeMap<String, u8>>,
     pub host_toon: Option<String>,
+    #[serde(default)]
+    pub schedule: Option<RunSchedule>,
     pub assignments: BTreeMap<String, Assignment>,
     pub eligibility: EligibilitySnapshot,
     pub created_at: u64,
@@ -161,6 +186,9 @@ pub enum Command {
     Rename {
         name: String,
     },
+    SetSchedule {
+        schedule: RunSchedule,
+    },
     Lock,
     Reopen,
     Complete,
@@ -194,6 +222,7 @@ impl<'de> Deserialize<'de> for Command {
             "set_allocation" => &["action", "toon", "count"],
             "remove_allocation" | "set_host_toon" => &["action", "toon"],
             "rename" => &["action", "name"],
+            "set_schedule" => &["action", "schedule"],
             "cancel" => &["action", "confirmation"],
             "remove" => &["action", "member_id", "confirmation"],
             "publish" | "leave" | "lock" | "reopen" | "complete" => &["action"],
@@ -250,6 +279,10 @@ pub enum Error {
     NotJoined,
     #[error("capacity cannot be reduced below existing occupancy")]
     BelowOccupancy,
+    #[error("set the run start time and estimated duration before posting")]
+    ScheduleRequired,
+    #[error("choose a start time in the future")]
+    StartInPast,
     #[error("private confirmation is required")]
     ConfirmationRequired,
     #[error("the run or actor changed; review a fresh private confirmation")]
@@ -300,6 +333,7 @@ impl Run {
             state: RunState::Draft,
             allocations: (mode == RunMode::Organized).then(BTreeMap::new),
             host_toon: None,
+            schedule: None,
             assignments: BTreeMap::new(),
             eligibility,
             created_at: now,
@@ -321,6 +355,9 @@ impl Run {
 
     pub fn validate(&self) -> Result<(), Error> {
         self.eligibility.validate()?;
+        if let Some(schedule) = &self.schedule {
+            schedule.validate()?;
+        }
         if normalize_run_id(&self.id)? != self.id
             || !valid_member_id(&self.guild_id)
             || !valid_member_id(&self.owner_id)
@@ -559,6 +596,10 @@ pub fn apply(
                     if run.state != RunState::Draft {
                         return Err(Error::InvalidTransition);
                     }
+                    let schedule = run.schedule.as_ref().ok_or(Error::ScheduleRequired)?;
+                    if schedule.starts_at <= (now / 1000) as i64 {
+                        return Err(Error::StartInPast);
+                    }
                     current.require_fresh(now)?;
                     // Check the approved source now, while retaining the reviewed names/evidence.
                     if let Some(allocations) = &run.allocations {
@@ -626,6 +667,16 @@ pub fn apply(
                     }
                     next.validate_selection(Some(toon))?;
                     next.host_toon = Some(toon.clone());
+                }
+                Command::SetSchedule { schedule } => {
+                    if run.state.is_terminal() {
+                        return Err(Error::Closed);
+                    }
+                    schedule.validate()?;
+                    if schedule.starts_at <= (now / 1000) as i64 {
+                        return Err(Error::StartInPast);
+                    }
+                    next.schedule = Some(schedule.clone());
                 }
                 Command::Rename { name } => {
                     if run.state.is_terminal() {

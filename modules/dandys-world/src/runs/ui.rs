@@ -14,6 +14,7 @@ pub enum Action {
     RemoveToon,
     SetHost,
     Rename,
+    SetSchedule,
     Post,
     Repost,
     PrepareAll,
@@ -56,6 +57,9 @@ pub struct Input {
     pub toon: Option<String>,
     pub count: Option<String>,
     pub name: Option<String>,
+    pub starts_at: Option<String>,
+    pub timezone: Option<String>,
+    pub duration: Option<String>,
     pub member: Option<String>,
     pub expected_revision: Option<u64>,
     pub confirmation_interaction: Option<String>,
@@ -71,6 +75,9 @@ impl Input {
             toon: None,
             count: None,
             name: None,
+            starts_at: None,
+            timezone: None,
+            duration: None,
             member: None,
             expected_revision: None,
             confirmation_interaction: None,
@@ -138,7 +145,7 @@ impl Input {
                 member_id: self.member.clone().ok_or(Error::InvalidInput)?,
                 confirmation: dummy(),
             },
-            Action::View | Action::Repost => return Err(Error::InvalidInput),
+            Action::View | Action::Repost | Action::SetSchedule => return Err(Error::InvalidInput),
         })
     }
     pub fn guarded(&self) -> bool {
@@ -223,14 +230,77 @@ fn shell(
     run: &Run,
     title: &str,
     description: String,
-    fields: Vec<Value>,
+    mut fields: Vec<Value>,
     buttons: Vec<Value>,
     choices: Vec<Value>,
 ) -> Value {
+    if !fields.iter().any(|field| field["name"] == "Starts") {
+        fields.extend(schedule_fields(run));
+    }
     json!({"card":{"title":format!("{} · {}",title,text(&run.name,160)),"description":description,"fields":fields,"footer":format!("Run {} · Saved setup survives expired controls",run.id)},"buttons":buttons,"choices":choices,"select_placeholder":"Choose a Toon…"})
 }
+fn schedule_fields(run: &Run) -> Vec<Value> {
+    match &run.schedule {
+        Some(schedule) => {
+            let duration = schedule.duration_minutes;
+            let duration = match (duration / 60, duration % 60) {
+                (0, minutes) => format!("{minutes} min"),
+                (hours, 0) => format!("{hours} h"),
+                (hours, minutes) => format!("{hours} h {minutes} min"),
+            };
+            vec![
+                field(
+                    "Starts",
+                    format!("<t:{}:F>\n<t:{}:R>", schedule.starts_at, schedule.starts_at),
+                ),
+                field("Estimated duration", duration),
+            ]
+        }
+        None => vec![
+            field("Starts", "Not set".into()),
+            field("Estimated duration", "Not set".into()),
+        ],
+    }
+}
+fn schedule_button(run: &Run) -> Value {
+    let mut button = prompt(
+        run,
+        "Set date & duration",
+        "set_schedule",
+        "starts_at",
+        "Run start date and time",
+        100,
+        None,
+    );
+    button["prompt"]["placeholder"] =
+        json!("YYYY-MM-DD HH:MM (24-hour) or paste a Hammertime timestamp");
+    let mut zone = json!({"option":"timezone","label":"Time zone","max_length":100,"placeholder":"e.g. America/New_York, Europe/London, UTC"});
+    let mut duration = json!({"option":"duration","label":"Estimated duration","max_length":40,"placeholder":"e.g. 90m or 1h 30m"});
+    if let Some(schedule) = &run.schedule {
+        let input_zone = schedule
+            .timezone
+            .as_deref()
+            .unwrap_or("UTC")
+            .parse::<chrono_tz::Tz>()
+            .unwrap_or(chrono_tz::UTC);
+        if schedule.starts_at % 60 != 0 {
+            button["prompt"]["value"] = json!(format!("<t:{}:F>", schedule.starts_at));
+        } else if let Some(start) = chrono::DateTime::from_timestamp(schedule.starts_at, 0) {
+            button["prompt"]["value"] = json!(
+                start
+                    .with_timezone(&input_zone)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            );
+        }
+        zone["value"] = json!(schedule.timezone.as_deref().unwrap_or("UTC"));
+        duration["value"] = json!(format!("{}m", schedule.duration_minutes));
+    }
+    button["prompt"]["additional_fields"] = json!([zone, duration]);
+    button
+}
 fn setup_fields(run: &Run) -> Vec<Value> {
-    let mut fields = Vec::new();
+    let mut fields = schedule_fields(run);
     if let Some(allocations) = &run.allocations {
         for (toon, count) in allocations {
             fields.push(field(
@@ -325,6 +395,7 @@ pub fn public_projection(run: &Run) -> (Value, Vec<PublicAction>) {
                 .join("\n"),
         ));
     }
+    public_fields.extend(schedule_fields(run));
     card["fields"] = json!(public_fields);
     let mut actions = Vec::new();
     if !run.state.is_terminal() {
@@ -520,10 +591,16 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
             fields = setup_fields(run);
             description.push_str("Not posted yet. Review your setup, then Post run. The host joins automatically. This is a planning roster; game access is not verified.");
             if run.state == RunState::Draft {
-                if run.mode == RunMode::Casual
-                    || run.host_toon.as_ref().is_some_and(|t| {
-                        run.allocations.as_ref().is_some_and(|a| a.contains_key(t))
-                    })
+                buttons.push(schedule_button(run));
+                if run.schedule.is_none() {
+                    description
+                        .push_str(" Set the date, time and estimated duration before posting.");
+                }
+                if run.schedule.is_some()
+                    && (run.mode == RunMode::Casual
+                        || run.host_toon.as_ref().is_some_and(|t| {
+                            run.allocations.as_ref().is_some_and(|a| a.contains_key(t))
+                        }))
                 {
                     buttons.push(button("Post run", base(run, "post")));
                 }
@@ -647,6 +724,7 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 "Management controls are private. Every action checks your current permission.",
             );
             fields = players(run, actor);
+            fields.extend(schedule_fields(run));
             match run.state {
                 RunState::Open => buttons.push(button("Lock signups", base(run, "lock"))),
                 RunState::Locked => {
@@ -660,6 +738,7 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                     buttons.push(view_button(run, "Edit requirements", "toons"));
                 }
                 buttons.push(view_button(run, "Remove a signup", "remove"));
+                buttons.push(schedule_button(run));
                 buttons.push(prompt(
                     run, "Rename", "rename", "name", "Run name", 80, None,
                 ));
@@ -785,6 +864,8 @@ pub fn confirm(
 pub fn human_error(error: &super::storage::Error) -> String {
     use super::storage::Error as S;
     match error {
+        S::Rule(Error::ScheduleRequired)=>"Set the run date, time and estimated duration, then review and post.".into(),
+        S::Rule(Error::StartInPast)=>"That start time is in the past. Choose a future date and time.".into(),
         S::Rule(Error::Full)=>"That place filled before you joined. Choose another Toon or check again later. Your previous signup is unchanged.".into(),
         S::Rule(Error::AlreadyJoined)=>"You're already signed up. Choose Switch Toon to change your choice.".into(),
         S::Rule(Error::Closed)=>"This run is closed to that action. Open its details to see the current status.".into(),

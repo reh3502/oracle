@@ -334,6 +334,16 @@ async fn qualify_ui(
     assert_eq!(draft["allocations"][&last_toon], 6);
     assert_eq!(draft["host_toon"], last_toon);
     assert_eq!(draft["state"], "draft");
+    let mut schedule = control(&review, "Set date & duration");
+    schedule["starts_at"] = json!("2099-01-01 20:00");
+    schedule["timezone"] = json!("America/New_York");
+    schedule["duration"] = json!("1h 30m");
+    let review = ui(manager, guild, binding, "910", schedule).await;
+    assert!(
+        review["reply"]["card"]["fields"]
+            .to_string()
+            .contains("<t:")
+    );
     ui(manager, guild, binding, "910", control(&review, "Post run")).await;
     let posted = saved_run(manager, guild, binding, "910", &id).await;
     assert_eq!(posted["state"], "open");
@@ -416,6 +426,11 @@ async fn qualify_ui(
     .unwrap();
     let casual_id = casual["result"]["run_id"].as_str().unwrap();
     assert!(!casual["reply"].to_string().contains("set_count"));
+    let mut schedule = control(&casual, "Set date & duration");
+    schedule["starts_at"] = json!("<t:4070908800:F>");
+    schedule["timezone"] = json!("UTC");
+    schedule["duration"] = json!("90m");
+    let casual = ui(manager, guild, binding, "920", schedule).await;
     ui(manager, guild, binding, "920", control(&casual, "Post run")).await;
     // Casual public Join opens personal controls with an explicit no-Toon path.
     for user in ["921", "922"] {
@@ -738,7 +753,7 @@ async fn qualify(postgres: bool) {
             .await
             .unwrap()
             .data_version,
-        3
+        4
     );
     let bound = binding(&manager, &guild).await;
     assert!(
@@ -860,6 +875,7 @@ async fn qualify(postgres: bool) {
             .await
             .is_err()
     );
+    change(&manager, &guild, &bound, "900", id, json!({"action":"set_schedule","schedule":{"starts_at":4070908800i64,"duration_minutes":90,"timezone":"UTC"}})).await;
     change(
         &manager,
         &guild,
@@ -1198,7 +1214,7 @@ async fn qualify(postgres: bool) {
         .document_batch(
             &module,
             &guild,
-            3,
+            4,
             &[
                 DocumentWrite {
                     collection: "runs".into(),

@@ -72,3 +72,5 @@ python3 modules/dandys-world/tests/qualify_postgres.py --pg-bin /absolute/path/t
 ```
 
 Optional `--module-binary` and `--catalog` paths also exercise native host migration, process recovery, maintenance, and existing wiki routes. The runner creates and stops its own Unix-socket-only cluster. It never uses an existing database. Supply `--pg-share` when the PostgreSQL installation requires an explicit shared-data directory.
+
+Run scheduling: use **Set date & duration** during setup or in Manage. Enter `YYYY-MM-DD HH:MM` in 24-hour format with an IANA time zone such as `America/New_York` or `Europe/London`, or paste a Discord/Hammertime timestamp. Estimated duration accepts minutes or hours, such as `90m` or `1h 30m` (1 minute to 24 hours). Review displays the absolute start and relative time using Discord timestamps, which each client localizes. A new run needs a future start and duration before posting. Hosts and configured moderators can edit the schedule; existing signups remain. Upgrading preserves existing runs and leaves their previously unknown schedules unset.

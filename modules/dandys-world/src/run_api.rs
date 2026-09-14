@@ -168,6 +168,38 @@ pub async fn invoke(
         }
         let mut command = if options.action == Action::Repost {
             None
+        } else if options.action == Action::SetSchedule {
+            let parsed = (|| {
+                let start = dandys_world_core::runs::schedule::parse_start(
+                    options.starts_at.as_deref().unwrap_or(""),
+                    options.timezone.as_deref(),
+                )?;
+                let duration = dandys_world_core::runs::schedule::parse_duration(
+                    options.duration.as_deref().unwrap_or(""),
+                )?;
+                Ok::<_, dandys_world_core::runs::schedule::ScheduleError>((start, duration))
+            })();
+            let (start, duration) = match parsed {
+                Ok(value) => value,
+                Err(error) => {
+                    let view =
+                        if stored.run.state == dandys_world_core::runs::domain::RunState::Draft {
+                            View::Review
+                        } else {
+                            View::Manage
+                        };
+                    return encode(
+                        json!({"reply":ui::render(&stored,&actor,&UiInput::show(&options.id,view),Some(&error.to_string()))}),
+                    );
+                }
+            };
+            Some(Command::SetSchedule {
+                schedule: dandys_world_core::runs::domain::RunSchedule {
+                    starts_at: start.starts_at,
+                    duration_minutes: duration,
+                    timezone: start.timezone,
+                },
+            })
         } else {
             Some(
                 options
@@ -246,7 +278,7 @@ pub async fn invoke(
                 let view = match options.action {
                     Action::SetCount | Action::RemoveToon => View::Toons,
                     Action::SetHost => View::Review,
-                    Action::Rename
+                    Action::Rename | Action::SetSchedule
                         if stored.run.state == dandys_world_core::runs::domain::RunState::Draft =>
                     {
                         View::Review

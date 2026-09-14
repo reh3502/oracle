@@ -12,7 +12,7 @@ use std::{
     io::Read,
 };
 
-pub const DATA_VERSION: u32 = 3;
+pub const DATA_VERSION: u32 = 4;
 pub const MAX_AGGREGATE_BYTES: usize = 40 * 1024;
 pub const DAY: u64 = 86_400_000;
 const MAX_BYTES: usize = 32 * 1024;
@@ -83,8 +83,11 @@ pub struct StoredRun {
 }
 impl StoredRun {
     fn validate(&self, guild: &str, id: &str) -> Result<()> {
+        self.validate_version(guild, id, DATA_VERSION)
+    }
+    fn validate_version(&self, guild: &str, id: &str, version: u32) -> Result<()> {
         self.run.validate().map_err(|_| Error::Corrupt)?;
-        if self.schema_version != DATA_VERSION || self.run.guild_id != guild || self.run.id != id {
+        if self.schema_version != version || self.run.guild_id != guild || self.run.id != id {
             return Err(Error::Corrupt);
         }
         if let Some(intent) = &self.publication
@@ -1217,10 +1220,10 @@ pub fn migrate_v2_document(document: ModuleDocument) -> Result<DocumentWrite> {
                 value["publication"]["actions"] =
                     serde_json::to_value(actions).map_err(|_| Error::Corrupt)?;
             }
-            value["schema_version"] = serde_json::json!(DATA_VERSION);
+            value["schema_version"] = serde_json::json!(3);
             let stored: StoredRun =
                 serde_json::from_value(value.clone()).map_err(|_| Error::Corrupt)?;
-            stored.validate(&run.guild_id, &document.key)?;
+            stored.validate_version(&run.guild_id, &document.key, 3)?;
             if serde_json::to_vec(&value)
                 .map_err(|_| Error::Corrupt)?
                 .len()
@@ -1233,7 +1236,7 @@ pub fn migrate_v2_document(document: ModuleDocument) -> Result<DocumentWrite> {
             if value["version"] != 2 {
                 return Err(Error::Corrupt);
             }
-            value["version"] = serde_json::json!(DATA_VERSION);
+            value["version"] = serde_json::json!(3);
         }
         "run_index" | "run_receipts" => (),
         _ => return Err(Error::Corrupt),
@@ -1300,4 +1303,44 @@ impl<D: Documents> RunService<D> {
         }
         Err(Error::Busy)
     }
+}
+
+/// Preserve existing runs without inventing a date, and refresh their public schedule fields.
+pub fn migrate_v3_document(document: ModuleDocument) -> Result<DocumentWrite> {
+    let mut value = document.value;
+    match document.collection.as_str() {
+        "runs" => {
+            let mut stored: StoredRun =
+                serde_json::from_value(value).map_err(|_| Error::Corrupt)?;
+            stored.validate_version(&stored.run.guild_id, &document.key, 3)?;
+            stored.schema_version = DATA_VERSION;
+            if let Some(intent) = &mut stored.publication {
+                stored.run.desired_card_revision = stored
+                    .run
+                    .desired_card_revision
+                    .checked_add(1)
+                    .ok_or(Error::Corrupt)?;
+                let (card, actions) = super::ui::public_projection(&stored.run);
+                intent.desired_revision = stored.run.desired_card_revision;
+                intent.card = card;
+                intent.actions = actions;
+            }
+            stored.validate(&stored.run.guild_id, &document.key)?;
+            value = serde_json::to_value(stored).map_err(|_| Error::Corrupt)?;
+        }
+        "run_index" if document.key == "maintenance" => {
+            if value["version"] != 3 {
+                return Err(Error::Corrupt);
+            }
+            value["version"] = serde_json::json!(DATA_VERSION);
+        }
+        "run_index" | "run_receipts" => (),
+        _ => return Err(Error::Corrupt),
+    }
+    Ok(DocumentWrite {
+        collection: document.collection,
+        key: document.key,
+        expected_revision: Some(document.revision),
+        value: Some(value),
+    })
 }

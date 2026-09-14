@@ -22,7 +22,13 @@ fn catalog() -> EligibilitySnapshot {
     }
 }
 fn new(mode: RunMode) -> Run {
-    Run::new("ABCD2345".into(), &actor("1"), mode, None, catalog(), 2_000).unwrap()
+    let mut run = Run::new("ABCD2345".into(), &actor("1"), mode, None, catalog(), 2_000).unwrap();
+    run.schedule = Some(RunSchedule {
+        starts_at: 4_070_908_800,
+        duration_minutes: 90,
+        timezone: Some("UTC".into()),
+    });
+    run
 }
 fn step(run: &Run, who: &Actor, command: Command) -> Result<(Run, Outcome), Error> {
     apply(run, who, &command, &catalog(), run.updated_at + 1)

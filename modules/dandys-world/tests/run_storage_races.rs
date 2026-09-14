@@ -117,7 +117,7 @@ impl Documents for Db {
         }
         let result = self
             .storage
-            .document_batch(&self.module, &self.guild, 3, &writes)
+            .document_batch(&self.module, &self.guild, storage::DATA_VERSION, &writes)
             .await
             .map(|_| ())
             .map_err(map_error);
@@ -139,7 +139,7 @@ async fn initialize(config: DatabaseConfig) -> Db {
         .unwrap();
     let digest = "a".repeat(64);
     db.storage
-        .begin_migration(&db.module, &db.guild, 0, 3, &digest)
+        .begin_migration(&db.module, &db.guild, 0, storage::DATA_VERSION, &digest)
         .await
         .unwrap();
     db.storage
@@ -213,7 +213,7 @@ async fn setup(service: &RunService<Db>, owner: &Actor, mode: RunMode) -> String
         .await
         .unwrap();
     }
-    change(service, owner, &id, Command::Publish).await.unwrap();
+    publish(service, owner, &id).await.unwrap();
     id
 }
 async fn prepare(
@@ -593,9 +593,7 @@ async fn all_mode_confirmation(db: &Db) {
         assert!(casual.run.allocations.is_none());
         assert!(casual.run.host_toon.is_none());
         assert_eq!(casual.run.capacity(), 8);
-        change(&service, &owner, &id, Command::Publish)
-            .await
-            .unwrap();
+        publish(&service, &owner, &id).await.unwrap();
         change(
             &service,
             &owner,
@@ -706,4 +704,21 @@ async fn postgres_run_management_races_are_linearizable_and_confirmations_bound(
         url: std::env::var("DW_TEST_POSTGRES_URL").expect("fresh isolated database required"),
     })
     .await;
+}
+
+async fn publish(service: &RunService<Db>, owner: &Actor, id: &str) -> storage::Result<Response> {
+    change(
+        service,
+        owner,
+        id,
+        Command::SetSchedule {
+            schedule: dandys_world_core::runs::domain::RunSchedule {
+                starts_at: 4_070_908_800,
+                duration_minutes: 90,
+                timezone: Some("UTC".into()),
+            },
+        },
+    )
+    .await?;
+    change(service, owner, id, Command::Publish).await
 }

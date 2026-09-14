@@ -359,8 +359,8 @@ fn manifest_exposes_only_typed_member_routes_and_private_health() {
     assert_eq!(m.manifest_version, 3);
     assert_eq!(m.protocol_minor_min, 2);
     assert!(m.runtime.unwrap().data_directory_required);
-    assert_eq!(m.data_version, 3);
-    assert_eq!(m.readable_data_versions, vec![3]);
+    assert_eq!(m.data_version, 4);
+    assert_eq!(m.readable_data_versions, vec![4]);
     assert!(m.operations.iter().all(|o| o.ai.is_none()
         && (o.audience != oracle_contracts::ModuleAudience::MemberRead
             || o.capabilities.is_empty())));

@@ -23,11 +23,17 @@ fn draft(mode: RunMode) -> StoredRun {
         fresh_until: 100000,
         disputed: false,
     };
+    let mut run = Run::new("abcd2345".into(), &owner(), mode, None, eligibility, 2000).unwrap();
+    run.schedule = Some(RunSchedule {
+        starts_at: 4_070_908_800,
+        duration_minutes: 90,
+        timezone: Some("UTC".into()),
+    });
     StoredRun {
-        schema_version: 3,
+        schema_version: 4,
         moderator_audit: vec![],
         publication: None,
-        run: Run::new("abcd2345".into(), &owner(), mode, None, eligibility, 2000).unwrap(),
+        run,
     }
 }
 fn apply_input(stored: &mut StoredRun, value: serde_json::Value) {

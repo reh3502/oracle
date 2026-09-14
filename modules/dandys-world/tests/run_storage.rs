@@ -92,7 +92,7 @@ impl Documents for Db {
     }
     async fn batch(&self, w: Vec<DocumentWrite>) -> storage::Result<()> {
         self.store
-            .document_batch(&self.module, &self.guild, 3, &w)
+            .document_batch(&self.module, &self.guild, storage::DATA_VERSION, &w)
             .await
             .map_err(map_error)?;
         if self.lose_ack.swap(false, Ordering::SeqCst) {
@@ -122,7 +122,7 @@ async fn initialize(config: DatabaseConfig) -> Arc<Storage> {
         .await
         .unwrap();
     store
-        .begin_migration(&module, &guild, 1, 3, &digest)
+        .begin_migration(&module, &guild, 1, storage::DATA_VERSION, &digest)
         .await
         .unwrap();
     let page = store.migration_page(&module, &guild, 100).await.unwrap();
@@ -137,7 +137,7 @@ async fn initialize(config: DatabaseConfig) -> Arc<Storage> {
             .await
             .unwrap()
             .data_version,
-        3
+        storage::DATA_VERSION
     );
     store
 }
@@ -280,9 +280,7 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
     cross.guild_id = "456".into();
     assert!(service.view(&cross, &id).await.is_err());
     assert_eq!(before, service.view(&owner, &id).await.unwrap());
-    change(&service, &owner, &id, Command::Publish)
-        .await
-        .unwrap();
+    publish(&service, &owner, &id).await.unwrap();
     let published = service.view(&owner, &id).await.unwrap();
     assert_eq!(published.run.assignments.len(), 1);
     assert_eq!(published.run.mode, RunMode::Organized);
@@ -463,9 +461,7 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
         .await
         .unwrap();
     let casual = create(&service, &owner, RunMode::Casual).await;
-    change(&service, &owner, &casual, Command::Publish)
-        .await
-        .unwrap();
+    publish(&service, &owner, &casual).await.unwrap();
     for user in 300..307 {
         change(
             &service,
@@ -829,7 +825,7 @@ async fn creation_and_publication_limits_are_checked_in_the_atomic_batch() {
                 },
             )
             .unwrap();
-            change(&s, &owner, &id, Command::Publish).await
+            publish(&s, &owner, &id).await
         });
     }
     let mut count = 0;
@@ -1028,9 +1024,7 @@ async fn wizard_rows_resume_revision_projection_and_explicit_repost_are_atomic()
     )
     .await
     .unwrap();
-    change(&service, &owner, &id, Command::Publish)
-        .await
-        .unwrap();
+    publish(&service, &owner, &id).await.unwrap();
     let published = service.view(&owner, &id).await.unwrap();
     let projection = published.publication.as_ref().unwrap();
     assert_eq!(projection.repost_generation, 0);
@@ -1119,6 +1113,12 @@ fn v2_projection_migration_retains_full_source_audit_and_receipts() {
         NOW,
     )
     .unwrap();
+    let mut run = run;
+    run.schedule = Some(dandys_world_core::runs::domain::RunSchedule {
+        starts_at: 4_070_908_800,
+        duration_minutes: 90,
+        timezone: Some("UTC".into()),
+    });
     let (run, _) = apply(&run, &owner, &Command::Publish, &run.eligibility, NOW).unwrap();
     let audit: Vec<_> = (0..80)
         .map(|_| storage::AuditEntry {
@@ -1157,4 +1157,21 @@ fn v2_projection_migration_retains_full_source_audit_and_receipts() {
     })
     .unwrap();
     assert_eq!(copied.value, Some(receipt));
+}
+
+async fn publish(service: &RunService<Db>, owner: &Actor, id: &str) -> storage::Result<Response> {
+    change(
+        service,
+        owner,
+        id,
+        Command::SetSchedule {
+            schedule: dandys_world_core::runs::domain::RunSchedule {
+                starts_at: 4_070_908_800,
+                duration_minutes: 90,
+                timezone: Some("UTC".into()),
+            },
+        },
+    )
+    .await?;
+    change(service, owner, id, Command::Publish).await
 }
