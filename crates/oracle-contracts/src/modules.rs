@@ -223,6 +223,100 @@ pub struct ModuleCommands {
     pub namespace: String,
     pub description: String,
     pub routes: Vec<ModuleCommandRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<ModuleCommandAlias>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModuleCommandAlias {
+    Subcommands {
+        name: String,
+        description: String,
+        routes: Vec<ModuleCommandRoute>,
+    },
+    Direct {
+        name: String,
+        description: String,
+        route: ModuleCommandRoute,
+    },
+}
+impl ModuleCommands {
+    /// Complete published top-level groups. A filtered catalog can omit its primary.
+    pub fn groups(&self) -> impl Iterator<Item = (&str, &str, &[ModuleCommandRoute], bool)> {
+        std::iter::once((
+            self.namespace.as_str(),
+            self.description.as_str(),
+            self.routes.as_slice(),
+            false,
+        ))
+        .filter(|(_, _, routes, _)| !routes.is_empty())
+        .chain(self.aliases.iter().map(|alias| match alias {
+            ModuleCommandAlias::Subcommands {
+                name,
+                description,
+                routes,
+            } => (
+                name.as_str(),
+                description.as_str(),
+                routes.as_slice(),
+                false,
+            ),
+            ModuleCommandAlias::Direct {
+                name,
+                description,
+                route,
+            } => (
+                name.as_str(),
+                description.as_str(),
+                std::slice::from_ref(route),
+                true,
+            ),
+        }))
+    }
+    pub fn all_routes(&self) -> impl Iterator<Item = &ModuleCommandRoute> {
+        self.groups().flat_map(|(_, _, routes, _)| routes.iter())
+    }
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.groups().any(|(candidate, _, _, _)| candidate == name)
+    }
+    /// Direct slash commands have no synthetic subcommand: their route is empty.
+    pub fn resolve_route(&self, name: &str, route: &str) -> Option<&ModuleCommandRoute> {
+        let (_, _, routes, direct) = self
+            .groups()
+            .find(|(candidate, _, _, _)| *candidate == name)?;
+        if direct {
+            route.is_empty().then(|| &routes[0])
+        } else {
+            routes.iter().find(|r| r.name == route)
+        }
+    }
+    pub fn retain_routes(&mut self, mut keep: impl FnMut(&ModuleCommandRoute) -> bool) {
+        self.routes.retain(&mut keep);
+        self.aliases.retain_mut(|alias| match alias {
+            ModuleCommandAlias::Subcommands { routes, .. } => {
+                routes.retain(&mut keep);
+                !routes.is_empty()
+            }
+            ModuleCommandAlias::Direct { route, .. } => keep(route),
+        });
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleCommandsV2 {
+    namespace: String,
+    description: String,
+    routes: Vec<ModuleCommandRoute>,
+}
+impl From<ModuleCommandsV2> for ModuleCommands {
+    fn from(v: ModuleCommandsV2) -> Self {
+        Self {
+            namespace: v.namespace,
+            description: v.description,
+            routes: v.routes,
+            aliases: Vec::new(),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -341,6 +435,7 @@ pub enum ModuleCommandOptionType {
 pub enum ModulePresentation {
     PlainTextV1 { pointer: String },
     CardV1 { pointer: String },
+    PrivateCardV2 { pointer: String },
 }
 
 mod legacy;
@@ -375,7 +470,7 @@ struct ModuleManifestV2 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<GuildEventKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commands: Option<ModuleCommands>,
+    pub commands: Option<ModuleCommandsV2>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<ModuleRuntimeRequirements>,
 }
@@ -503,7 +598,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
                         capabilities: o.capabilities,
                     })
                     .collect(),
-                commands: v.commands,
+                commands: v.commands.map(Into::into),
                 runtime: v.runtime,
             },
             Wire::V3(v) => Self {

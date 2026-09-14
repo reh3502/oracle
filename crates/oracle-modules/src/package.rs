@@ -473,8 +473,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     }
     let uses_cards = manifest.commands.as_ref().is_some_and(|commands| {
         commands
-            .routes
-            .iter()
+            .all_routes()
             .any(|route| matches!(route.presentation, Some(ModulePresentation::CardV1 { .. })))
     });
     if uses_cards
@@ -484,7 +483,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
         return Err(err(ErrorCode::Compatibility));
     }
     let uses_images = manifest.commands.as_ref().is_some_and(|commands| {
-        commands.routes.iter().any(|route| {
+        commands.all_routes().any(|route| {
             matches!(route.presentation, Some(ModulePresentation::CardV1 { .. }))
                 && manifest.operations.iter().any(|op| {
                     op.name == route.operation
@@ -627,10 +626,34 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
             || commands.routes.is_empty()
             || commands.routes.len() > 25
             || !unique(commands.routes.iter().map(|r| r.name.as_str()))
+            || commands.aliases.len() > 4
+            || (manifest.manifest_version < 3 && !commands.aliases.is_empty())
+            || !unique(commands.groups().map(|(name, _, _, _)| name))
         {
             return Err(err(ErrorCode::InvalidInput));
         }
-        for route in &commands.routes {
+        for (name, description_text, routes, direct) in commands.groups() {
+            if !slug(name, 20)
+                || name == "oracle"
+                || !description(description_text)
+                || routes.is_empty()
+                || routes.len() > 25
+                || !unique(routes.iter().map(|route| route.name.as_str()))
+                || (name != commands.namespace
+                    && routes.iter().any(|route| {
+                        !matches!(route.input, Some(ModuleCommandInput::Typed { .. }))
+                    }))
+                || (direct && routes.len() != 1)
+            {
+                return Err(err(ErrorCode::InvalidInput));
+            }
+        }
+        // Empty alias groups are omitted from filtered catalogs, but never valid
+        // in an installed manifest.
+        if commands.aliases.iter().any(|alias| matches!(alias, oracle_core::ModuleCommandAlias::Subcommands {routes, ..} if routes.is_empty())) {
+            return Err(err(ErrorCode::InvalidInput));
+        }
+        for route in commands.all_routes() {
             let operation = manifest
                 .operations
                 .iter()
@@ -671,6 +694,16 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                     }
                     Some(ModulePresentation::CardV1 { pointer }) => {
                         validate_card_presentation(pointer, &operation.output_schema)?
+                    }
+                    Some(ModulePresentation::PrivateCardV2 { pointer }) => {
+                        if manifest.manifest_version != 3
+                            || operation.audience != ModuleAudience::MemberMutation
+                            || pointer != "/reply"
+                            || operation.output_schema["type"] != "object"
+                            || operation.output_schema["properties"]["reply"]["type"] != "object"
+                        {
+                            return Err(err(ErrorCode::InvalidInput));
+                        }
                     }
                     None => {}
                 }
@@ -1435,6 +1468,73 @@ mod tests {
                     {"name":"details","description":"Include details","required":false,"type":"boolean"}]},
                 "presentation":{"kind":"plain_text_v1","pointer":"/reply"}}]}
         })).unwrap()
+    }
+    #[test]
+    fn aliases_are_strict_v3_typed_bounded_and_operation_checked() {
+        use oracle_core::ModuleCommandAlias;
+        let mut manifest = member_manifest();
+        let route = manifest.commands.as_ref().unwrap().routes[0].clone();
+        manifest.commands.as_mut().unwrap().aliases = vec![
+            ModuleCommandAlias::Subcommands {
+                name: "hostrun".into(),
+                description: "Host a run".into(),
+                routes: vec![route.clone()],
+            },
+            ModuleCommandAlias::Direct {
+                name: "signup".into(),
+                description: "Join a run".into(),
+                route,
+            },
+        ];
+        assert!(validate_manifest(&manifest).is_err());
+        // Even an explicitly empty aliases field must not extend a v2 wire shape.
+        let mut legacy = serde_json::to_value(member_manifest()).unwrap();
+        legacy["commands"]["aliases"] = json!([]);
+        assert!(serde_json::from_value::<ModuleManifest>(legacy).is_err());
+        manifest.manifest_version = 3;
+        manifest.protocol_minor_min = 2;
+        manifest.host_api = "^1.4".into();
+        validate_manifest(&manifest).unwrap();
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ModuleManifest>(wire.clone()).unwrap(),
+            manifest
+        );
+        for (pointer, value) in [
+            ("/commands/aliases/0/name", json!("oracle")),
+            ("/commands/aliases/1/name", json!("dw")),
+            ("/commands/aliases/1/name", json!("hostrun")),
+            ("/commands/aliases/0/routes", json!([])),
+            ("/commands/aliases/1/route/operation", json!("hostrun")),
+            (
+                "/commands/aliases/1/route/input",
+                json!({"kind":"json","required":true}),
+            ),
+            (
+                "/commands/aliases/1/route/input/options/0/max_length",
+                json!(101),
+            ),
+        ] {
+            let mut bad = wire.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_manifest(&serde_json::from_value(bad).unwrap()).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut too_many = manifest.clone();
+        let aliases = &mut too_many.commands.as_mut().unwrap().aliases;
+        for i in 0..3 {
+            let mut alias = aliases[0].clone();
+            if let ModuleCommandAlias::Subcommands { name, .. } = &mut alias {
+                *name = format!("alias-{i}");
+            }
+            aliases.push(alias);
+        }
+        assert!(validate_manifest(&too_many).is_err());
+        let mut unknown = wire;
+        unknown["commands"]["aliases"][0]["nested"] = json!({});
+        assert!(serde_json::from_value::<ModuleManifest>(unknown).is_err());
     }
     #[test]
     fn member_mutation_requires_v3_and_scoped_declared_callbacks() {

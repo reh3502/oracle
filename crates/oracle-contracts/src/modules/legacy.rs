@@ -109,6 +109,7 @@ impl From<ModuleManifestV1> for ModuleManifest {
                 })
                 .collect(),
             commands: v.commands.map(|c| ModuleCommands {
+                aliases: Vec::new(),
                 namespace: c.namespace,
                 description: c.description,
                 routes: c
