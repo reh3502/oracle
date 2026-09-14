@@ -744,7 +744,7 @@ async fn prepare(
 ) -> Result<(u64, Vec<DesiredCommand>)> {
     let snapshot = host
         .modules
-        .catalog_snapshot(&oracle_core::PolicyContext::LocalOperator, guild)
+        .publication_catalog_snapshot(&oracle_core::PolicyContext::LocalOperator, guild)
         .await?;
     let mut desired = compile_catalog(&snapshot.entries)?;
     let bootstrap = oracle_discord::bootstrap_commands::desired()?;

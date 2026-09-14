@@ -13,6 +13,7 @@ struct State {
     commands: Vec<PublishedCommand>,
     writes: usize,
     lost_ack: bool,
+    lost_delete_after: Option<usize>,
     mismatch: bool,
     cancel: Option<CancellationToken>,
     revoke_before_write: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -120,6 +121,12 @@ impl CommandBackend for Backend {
             let mut state = self.0.lock().unwrap();
             state.writes += 1;
             state.commands.retain(|c| c.id != id);
+            if state.lost_delete_after == Some(state.writes) {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+                return Err(Error::new(ErrorCode::UnknownOutcome));
+            }
             Ok(())
         })
     }
@@ -878,4 +885,70 @@ async fn restart_rolls_back_confirmed_partial_group_before_accepting_another_pla
         1
     );
     store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_deletion_restores_aliases_with_confirmed_new_ids() {
+    let (_root, store, backend, guild) = setup().await;
+    let reconciler = CommandReconciler::new(store.clone(), backend.clone());
+    let old = [desired("dw"), desired("hostrun"), desired("signup")];
+    reconciler
+        .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+        .await
+        .unwrap();
+    let previous = reconciler.bindings(&guild).await.unwrap();
+    let interrupted = CancellationToken::new();
+    backend.0.lock().unwrap().lost_delete_after = Some(6);
+    backend.0.lock().unwrap().cancel = Some(interrupted.clone());
+    assert_eq!(
+        reconciler
+            .reconcile(&guild, &[], &interrupted, now() + 60)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::UnknownOutcome
+    );
+    let row = store
+        .workflow_get(&guild, WorkflowKind::CommandGroup, "publication")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut journal = row.value;
+    journal["expires_at"] = json!(now() - 1);
+    store
+        .workflow_put(
+            &guild,
+            WorkflowKind::CommandGroup,
+            "publication",
+            Some(row.revision),
+            &journal,
+        )
+        .await
+        .unwrap();
+    backend.0.lock().unwrap().cancel = None;
+    let restarted = CommandReconciler::new(store.clone(), backend.clone());
+    assert_eq!(
+        restarted
+            .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::RecoveryRequired
+    );
+    assert_eq!(
+        restarted
+            .reconcile(&guild, &old, &CancellationToken::new(), now() + 60)
+            .await
+            .unwrap()
+            .unchanged,
+        3
+    );
+    let restored = restarted.bindings(&guild).await.unwrap();
+    for (before, after) in previous.iter().zip(&restored) {
+        assert_ne!(before.id, after.id);
+        assert_eq!(before.owner, after.owner);
+        assert_eq!(before.definition, after.definition);
+        assert_eq!(before.route, after.route);
+    }
+    assert_eq!(backend.0.lock().unwrap().commands.len(), 3);
 }

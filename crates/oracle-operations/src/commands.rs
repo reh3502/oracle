@@ -459,18 +459,46 @@ impl CommandReconciler {
         }
         let previous = self.previous_plan(guild, &group).await?;
         let current = self.records(guild).await?;
-        // A lost create acknowledgement never proves ownership. Do not adopt a
-        // matching name, retry it, or release any affected owner's group.
-        if current.values().any(|(_, b)| b.pending.is_some()) {
-            return Err(error(ErrorCode::RecoveryRequired));
+        let observed = self.observed(guild).await?;
+        guard.dispatch(|| Ok(()))?;
+        for (key, (row_revision, binding)) in &current {
+            if let Some(pending) = &binding.pending {
+                let actual = observed.get(key);
+                let complete = match pending {
+                    PendingCommand::Create => false,
+                    PendingCommand::Edit => actual.is_some_and(|a| {
+                        Some(&a.id) == binding.id.as_ref()
+                            && Some(&a.definition) == binding.target.as_ref()
+                    }),
+                    PendingCommand::Delete => !observed
+                        .values()
+                        .any(|a| Some(&a.id) == binding.id.as_ref()),
+                };
+                if !complete {
+                    return Err(error(ErrorCode::RecoveryRequired));
+                }
+                let mut recovered = binding.clone();
+                if matches!(pending, PendingCommand::Delete) {
+                    recovered.deleted = true;
+                    recovered.id = None;
+                } else {
+                    recovered.definition = recovered
+                        .target
+                        .take()
+                        .ok_or_else(|| error(ErrorCode::Integrity))?;
+                }
+                recovered.pending = None;
+                recovered.target = None;
+                recovered.route = None;
+                self.save(guild, key, Some(*row_revision), &recovered)
+                    .await?;
+            }
         }
         for old in &previous {
-            let key = command_key(&old.definition)?;
             if current
-                .get(&key)
-                .is_none_or(|(_, now)| now.deleted || now.id != old.id || now.owner != old.owner)
+                .get(&command_key(&old.definition)?)
+                .is_none_or(|(_, now)| now.owner != old.owner)
             {
-                // Discord cannot recreate a deleted command with its former ID.
                 return Err(error(ErrorCode::RecoveryRequired));
             }
         }
@@ -490,9 +518,16 @@ impl CommandReconciler {
         self.apply_plan(guild, &wanted, guard).await?;
         let restored = self.records(guild).await?;
         for old in &previous {
+            // Confirmed deletions can only be compensated by creating a new ID.
+            // apply_plan requires an absent name and verifies the create receipt;
+            // it never adopts a same-name command after an uncertain create.
             if restored
                 .get(&command_key(&old.definition)?)
-                .is_none_or(|(_, now)| now != old)
+                .is_none_or(|(_, now)| {
+                    let mut expected = old.clone();
+                    expected.id = now.id.clone();
+                    now.id.is_none() || now != &expected
+                })
             {
                 return Err(error(ErrorCode::RecoveryRequired));
             }

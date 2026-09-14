@@ -756,6 +756,16 @@ impl ModuleManager {
                 entries: self.catalog_current(guild),
             }))
     }
+    /// Publication waits for lifecycle transitions so an upgrade's temporary
+    /// registry gap cannot be interpreted as a request to delete commands.
+    pub async fn publication_catalog_snapshot(
+        &self,
+        actor: &PolicyContext,
+        guild: &GuildId,
+    ) -> Result<ModuleCatalogSnapshot> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.catalog_snapshot(actor, guild).await
+    }
     pub async fn ai_catalog_snapshot(
         &self,
         actor: &PolicyContext,
