@@ -893,6 +893,7 @@ pub fn human_error(error: &super::storage::Error) -> String {
         S::Rule(Error::BelowOccupancy)=>"Players already occupy those places. Remove or move their signups before reducing that count.".into(),
         S::Rule(Error::InvalidInput)=>"Check the entry: counts must be a single number from 1 to 8, and the name must be 1–80 characters.".into(),
         S::Busy|S::Conflict=>"Someone else updated the run. Try again; your saved signup has not been replaced.".into(),
+        S::OwnerPublishedLimit{limit}=>format!("Not posted: you already have {limit} active runs, which is the per-host limit. Complete or cancel one of your open or locked runs, then press Post run here again. This draft is saved; you do not need to create another."),
         S::Limit=>"The run limit has been reached. Finish an active run, wait for older records to expire, or ask a moderator for help.".into(),
         S::NotFound=>"That run is no longer available. Use /dw runs to find an open run or /hostrun to start setup.".into(),
         S::Interaction=>"These controls are too old. Use /dw run with the run ID, or /hostrun to resume your draft.".into(),

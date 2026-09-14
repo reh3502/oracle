@@ -36,6 +36,8 @@ pub enum Error {
     Corrupt,
     #[error("this guild has reached a run or receipt limit")]
     Limit,
+    #[error("this host already has {limit} active runs")]
+    OwnerPublishedLimit { limit: usize },
     #[error("interaction identity is expired or inconsistent")]
     Interaction,
 }
@@ -933,13 +935,18 @@ impl<D: Documents> RunService<D> {
             return Err(Error::Corrupt);
         }
         if old.state == RunState::Draft && new.state == RunState::Open {
+            if live
+                .values()
+                .filter(|e| e.state != RunState::Draft && e.owner == new.owner_id)
+                .count()
+                >= self.limits.published_per_owner
+            {
+                return Err(Error::OwnerPublishedLimit {
+                    limit: self.limits.published_per_owner,
+                });
+            }
             if live.values().filter(|e| e.state != RunState::Draft).count()
                 >= self.limits.published_per_guild
-                || live
-                    .values()
-                    .filter(|e| e.state != RunState::Draft && e.owner == new.owner_id)
-                    .count()
-                    >= self.limits.published_per_owner
             {
                 return Err(Error::Limit);
             }

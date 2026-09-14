@@ -1234,3 +1234,46 @@ async fn publish(service: &RunService<Db>, owner: &Actor, id: &str) -> storage::
     .await?;
     change(service, owner, id, Command::Publish).await
 }
+
+#[tokio::test]
+async fn blocked_casual_post_keeps_one_draft_and_reports_the_owner_limit() {
+    let root = std::env::temp_dir().join(format!("dw-casual-post-limit-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let db = Db::new(store.clone());
+    let service = RunService::with_limits(
+        db.clone(),
+        storage::Limits {
+            published_per_owner: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let owner = actor("600");
+    for _ in 0..2 {
+        let id = create(&service, &owner, RunMode::Casual).await;
+        publish(&service, &owner, &id).await.unwrap();
+    }
+    let id = create(&service, &owner, RunMode::Casual).await;
+    for _ in 0..2 {
+        let error = publish(&service, &owner, &id).await.unwrap_err();
+        assert!(matches!(
+            error,
+            storage::Error::OwnerPublishedLimit { limit: 2 }
+        ));
+        let notice = dandys_world_core::runs::ui::human_error(&error);
+        assert!(notice.contains("Not posted: you already have 2 active runs"));
+        assert!(notice.contains("This draft is saved"));
+        let saved = service.view(&owner, &id).await.unwrap();
+        assert_eq!(saved.run.state, RunState::Draft);
+        assert!(saved.publication.is_none());
+        assert!(saved.run.assignments.is_empty());
+    }
+    let live = db.get("run_index", "live").await.unwrap().unwrap();
+    assert_eq!(live.value.as_object().unwrap().len(), 3);
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
