@@ -138,6 +138,26 @@ fn merge(target: &mut Value, patch: &Value) {
         }
     }
 }
+/// Configuration changes revoke both older invocations and those admitted while
+/// the module is applying the update. Drop also covers rejected/cancelled hooks.
+struct MutationConfigurationFence {
+    gate: oracle_core::member_mutation::MemberMutationGate,
+    guild: GuildId,
+}
+impl MutationConfigurationFence {
+    fn new(gate: oracle_core::member_mutation::MemberMutationGate, guild: &GuildId) -> Self {
+        gate.invalidate_guild(guild);
+        Self {
+            gate,
+            guild: guild.clone(),
+        }
+    }
+}
+impl Drop for MutationConfigurationFence {
+    fn drop(&mut self) {
+        self.gate.invalidate_guild(&self.guild);
+    }
+}
 impl ModuleManager {
     /// Install once from the trusted composition root. Existing constructors keep
     /// configuration unavailable until both durable storage and policy exist.
@@ -420,6 +440,8 @@ impl ModuleManager {
         mut saved: Saved,
         service_restore: bool,
     ) -> Result<ConfigurationReceipt> {
+        let _member_fence = (generation.installed.package.manifest.manifest_version == 3)
+            .then(|| MutationConfigurationFence::new(self.core.member_mutation_gate(), guild));
         if !generation
             .installed
             .package
@@ -915,5 +937,26 @@ impl ModuleManager {
             destination.error = Some(ErrorCode::Conflict);
         }
         Ok((configuration, destination))
+    }
+}
+
+#[cfg(test)]
+mod mutation_configuration_tests {
+    use super::*;
+    #[test]
+    fn update_fences_preexisting_and_mid_update_authority_even_on_drop() {
+        let gate = oracle_core::member_mutation::MemberMutationGate::default();
+        let guild: GuildId = "123".parse().unwrap();
+        let module: ModuleId = "test.mutation".parse().unwrap();
+        gate.configure(guild.clone(), module.clone(), Some(Default::default()))
+            .unwrap();
+        let old = gate.worker(&guild, &module).unwrap();
+        let fence = MutationConfigurationFence::new(gate.clone(), &guild);
+        assert!(old.check().is_err());
+        let during = gate.worker(&guild, &module).unwrap();
+        assert!(during.check().is_ok());
+        drop(fence);
+        assert!(during.check().is_err());
+        assert!(gate.worker(&guild, &module).unwrap().check().is_ok());
     }
 }
