@@ -7,7 +7,8 @@ use oracle_core::{
 };
 use oracle_modules::{
     ConfigurationPolicy, DispatchPermit, ModuleCatalogEntry, ModuleManager, NotificationCheck,
-    NotificationRequest, NotificationTransport, runtime_settings::ModuleRuntimeSettings,
+    NotificationRequest, NotificationTransport, SharedCardService,
+    runtime_settings::ModuleRuntimeSettings,
 };
 use oracle_storage::{DatabaseConfig, Storage};
 use serde_json::{Value, json};
@@ -18,7 +19,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -91,7 +92,45 @@ impl NotificationTransport for NoSend {
         _: &dyn NotificationCheck,
         _: CancellationToken,
     ) -> Result<Value> {
-        panic!("Stage 6 must never send a Discord message")
+        panic!("native run qualification must never send a Discord message")
+    }
+}
+/// Record the host callback boundary without simulating Discord delivery. Every
+/// enqueued value must already be present in the real module document store.
+struct RecordedCards {
+    storage: Arc<Storage>,
+    intents: Mutex<BTreeMap<(ModuleId, GuildId, String), Value>>,
+    enqueues: AtomicU64,
+}
+#[async_trait::async_trait]
+impl SharedCardService for RecordedCards {
+    async fn enqueue(&self, module: &ModuleId, guild: &GuildId, intent: Value) -> Result<Value> {
+        let key = intent["key"].as_str().unwrap().to_owned();
+        let saved = self
+            .storage
+            .document_get(module, guild, "runs", &key)
+            .await?
+            .unwrap();
+        assert_eq!(saved.value["publication"], intent);
+        assert_eq!(
+            intent["desired_revision"],
+            saved.value["run"]["desired_card_revision"]
+        );
+        let status = json!({"state":"pending","desired_revision":intent["desired_revision"],"confirmed_revision":null});
+        self.intents
+            .lock()
+            .unwrap()
+            .insert((module.clone(), guild.clone(), key), intent);
+        self.enqueues.fetch_add(1, Ordering::Relaxed);
+        Ok(status)
+    }
+    async fn status(&self, module: &ModuleId, guild: &GuildId, key: &str) -> Result<Value> {
+        let intents = self.intents.lock().unwrap();
+        let revision = intents
+            .get(&(module.clone(), guild.clone(), key.into()))
+            .map(|intent| intent["desired_revision"].clone())
+            .unwrap_or(json!(0));
+        Ok(json!({"state":"pending","desired_revision":revision,"confirmed_revision":null}))
     }
 }
 fn snapshot(directory: &Path, value: &Value) {
@@ -151,6 +190,359 @@ async fn binding(manager: &ModuleManager, guild: &GuildId) -> ModuleCatalogEntry
         .unwrap()
         .remove(0)
 }
+fn control(reply: &Value, label: &str) -> Value {
+    reply["reply"]["buttons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|button| button["label"] == label)
+        .unwrap_or_else(|| panic!("missing {label} control in {reply}"))["input"]
+        .clone()
+}
+async fn ui(
+    manager: &ModuleManager,
+    guild: &GuildId,
+    binding: &ModuleCatalogEntry,
+    user: &str,
+    input: Value,
+) -> Value {
+    call(
+        manager,
+        guild,
+        binding,
+        user,
+        &interaction(),
+        "run_ui",
+        input,
+    )
+    .await
+    .unwrap()
+}
+async fn saved_run(
+    manager: &ModuleManager,
+    guild: &GuildId,
+    binding: &ModuleCatalogEntry,
+    user: &str,
+    id: &str,
+) -> Value {
+    call(
+        manager,
+        guild,
+        binding,
+        user,
+        &interaction(),
+        "run_view",
+        json!({"id":id}),
+    )
+    .await
+    .unwrap()["run"]
+        .clone()
+}
+/// Drive the actual module's private controls with ordinary members and the
+/// complete supplied wiki catalog. Discord delivery is qualified separately.
+async fn qualify_ui(
+    manager: &ModuleManager,
+    guild: &GuildId,
+    binding: &ModuleCatalogEntry,
+) -> Vec<(String, Value)> {
+    let mut page = call(
+        manager,
+        guild,
+        binding,
+        "910",
+        &interaction(),
+        "run_create_organized",
+        json!({"name":"Casual"}),
+    )
+    .await
+    .unwrap();
+    let id = page["result"]["run_id"].as_str().unwrap().to_owned();
+    assert_eq!(page["reply"]["choices"].as_array().unwrap().len(), 25);
+    let first_choice = page["reply"]["choices"][0]["input"].clone();
+    let first_toon = first_choice["toon"].as_str().unwrap().to_owned();
+    let toon_card = ui(manager, guild, binding, "910", first_choice).await;
+    // Opening and abandoning a count modal must not alter the saved draft.
+    let count_input = control(&toon_card, "Set count");
+    let before = saved_run(manager, guild, binding, "910", &id).await;
+    page = call(
+        manager,
+        guild,
+        binding,
+        "910",
+        &interaction(),
+        "run_create_casual",
+        json!({"name":"Replacement name"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page["result"]["run_id"], id);
+    assert_eq!(saved_run(manager, guild, binding, "910", &id).await, before);
+    assert_eq!(before["mode"], "organized");
+    assert_eq!(before["name"], "Casual");
+    let mut set_first = count_input;
+    set_first["count"] = json!("2");
+    page = ui(manager, guild, binding, "910", set_first).await;
+    let mut reachable = BTreeSet::new();
+    loop {
+        let choices = page["reply"]["choices"].as_array().unwrap();
+        assert!(choices.len() <= 25);
+        for choice in choices {
+            assert!(reachable.insert(choice["input"]["toon"].as_str().unwrap().to_owned()));
+        }
+        if !page["reply"]["buttons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|button| button["label"] == "Next")
+        {
+            break;
+        }
+        page = ui(manager, guild, binding, "910", control(&page, "Next")).await;
+    }
+    assert!(reachable.len() > 25);
+    let all = before["eligibility"]["toons"].as_object().unwrap();
+    assert_eq!(reachable, all.keys().cloned().collect());
+    let last_choice = page["reply"]["choices"][0]["input"].clone();
+    let last_toon = last_choice["toon"].as_str().unwrap().to_owned();
+    assert_ne!(first_toon, last_toon);
+    let toon_card = ui(manager, guild, binding, "910", last_choice).await;
+    let mut set_last = control(&toon_card, "Set count");
+    set_last["count"] = json!("6");
+    page = ui(manager, guild, binding, "910", set_last).await;
+    let host = ui(
+        manager,
+        guild,
+        binding,
+        "910",
+        control(&page, "Choose my Toon"),
+    )
+    .await;
+    let choice = host["reply"]["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|choice| choice["input"]["toon"] == last_toon)
+        .unwrap()["input"]
+        .clone();
+    let review = ui(manager, guild, binding, "910", choice).await;
+    let draft = saved_run(manager, guild, binding, "910", &id).await;
+    assert_eq!(draft["allocations"][&first_toon], 2);
+    assert_eq!(draft["allocations"][&last_toon], 6);
+    assert_eq!(draft["host_toon"], last_toon);
+    assert_eq!(draft["state"], "draft");
+    ui(manager, guild, binding, "910", control(&review, "Post run")).await;
+    let posted = saved_run(manager, guild, binding, "910", &id).await;
+    assert_eq!(posted["state"], "open");
+    assert_eq!(posted["assignments"].as_object().unwrap().len(), 1);
+    assert_eq!(posted["assignments"]["910"]["toon"], last_toon);
+    // Each member independently opens the same public Join action and receives
+    // their own current personal selector; no owner-held control is required.
+    for user in ["911", "912"] {
+        let join = ui(
+            manager,
+            guild,
+            binding,
+            user,
+            json!({"action":"view","view":"join","id":id}),
+        )
+        .await;
+        let choice = join["reply"]["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|choice| choice["input"]["toon"] == first_toon)
+            .unwrap()["input"]
+            .clone();
+        ui(manager, guild, binding, user, choice).await;
+    }
+    let joined = saved_run(manager, guild, binding, "910", &id).await;
+    assert_eq!(joined["assignments"].as_object().unwrap().len(), 3);
+    for user in ["911", "912"] {
+        assert_eq!(joined["assignments"][user]["toon"], first_toon);
+    }
+    ui(
+        manager,
+        guild,
+        binding,
+        "911",
+        json!({"action":"switch","id":id,"toon":last_toon}),
+    )
+    .await;
+    ui(
+        manager,
+        guild,
+        binding,
+        "912",
+        json!({"action":"leave","id":id}),
+    )
+    .await;
+    let changed = saved_run(manager, guild, binding, "910", &id).await;
+    assert_eq!(changed["assignments"]["911"]["toon"], last_toon);
+    assert!(changed["assignments"]["912"].is_null());
+    ui(
+        manager,
+        guild,
+        binding,
+        "910",
+        json!({"action":"lock","id":id,"expected_revision":changed["desired_card_revision"]}),
+    )
+    .await;
+    let locked = saved_run(manager, guild, binding, "910", &id).await;
+    assert_eq!(locked["state"], "locked");
+    ui(
+        manager,
+        guild,
+        binding,
+        "912",
+        json!({"action":"join","id":id,"toon":first_toon}),
+    )
+    .await;
+    assert_eq!(saved_run(manager, guild, binding, "910", &id).await, locked);
+
+    let casual = call(
+        manager,
+        guild,
+        binding,
+        "920",
+        &interaction(),
+        "run_create_casual",
+        json!({"name":"Organized"}),
+    )
+    .await
+    .unwrap();
+    let casual_id = casual["result"]["run_id"].as_str().unwrap();
+    assert!(!casual["reply"].to_string().contains("set_count"));
+    ui(manager, guild, binding, "920", control(&casual, "Post run")).await;
+    // Casual public Join opens personal controls with an explicit no-Toon path.
+    for user in ["921", "922"] {
+        let join = ui(
+            manager,
+            guild,
+            binding,
+            user,
+            json!({"action":"view","view":"join","id":casual_id}),
+        )
+        .await;
+        ui(
+            manager,
+            guild,
+            binding,
+            user,
+            control(&join, "Join without a Toon"),
+        )
+        .await;
+    }
+    let no_toons = saved_run(manager, guild, binding, "920", casual_id).await;
+    assert_eq!(no_toons["mode"], "casual");
+    assert_eq!(no_toons["name"], "Organized");
+    assert!(no_toons["allocations"].is_null());
+    assert_eq!(no_toons["assignments"].as_object().unwrap().len(), 3);
+    for user in ["920", "921", "922"] {
+        assert!(no_toons["assignments"][user]["toon"].is_null());
+    }
+    for user in ["921", "922"] {
+        ui(
+            manager,
+            guild,
+            binding,
+            user,
+            json!({"action":"switch","id":casual_id,"toon":first_toon}),
+        )
+        .await;
+    }
+    let repeated = saved_run(manager, guild, binding, "920", casual_id).await;
+    for user in ["921", "922"] {
+        assert_eq!(repeated["assignments"][user]["toon"], first_toon);
+    }
+    assert!(repeated["allocations"].is_null());
+    for user in ["923", "924", "925", "926", "927"] {
+        ui(
+            manager,
+            guild,
+            binding,
+            user,
+            json!({"action":"join","id":casual_id}),
+        )
+        .await;
+    }
+    let full = saved_run(manager, guild, binding, "920", casual_id).await;
+    assert_eq!(full["assignments"].as_object().unwrap().len(), 8);
+    let full_card = ui(
+        manager,
+        guild,
+        binding,
+        "928",
+        json!({"action":"view","view":"join","id":casual_id}),
+    )
+    .await;
+    assert!(
+        full_card["reply"]["card"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("full")
+    );
+    assert!(full_card["reply"]["choices"].as_array().unwrap().is_empty());
+    ui(
+        manager,
+        guild,
+        binding,
+        "928",
+        json!({"action":"join","id":casual_id}),
+    )
+    .await;
+    assert_eq!(
+        saved_run(manager, guild, binding, "920", casual_id).await,
+        full
+    );
+
+    let cancelled = call(
+        manager,
+        guild,
+        binding,
+        "930",
+        &interaction(),
+        "run_create_casual",
+        json!({}),
+    )
+    .await
+    .unwrap();
+    let cancel_id = cancelled["result"]["run_id"].as_str().unwrap();
+    let confirm = ui(
+        manager,
+        guild,
+        binding,
+        "930",
+        control(&cancelled, "Cancel setup"),
+    )
+    .await;
+    assert_eq!(
+        saved_run(manager, guild, binding, "930", cancel_id).await["state"],
+        "draft"
+    );
+    ui(
+        manager,
+        guild,
+        binding,
+        "930",
+        control(&confirm, "Cancel run"),
+    )
+    .await;
+    assert_eq!(
+        saved_run(manager, guild, binding, "930", cancel_id).await["state"],
+        "cancelled"
+    );
+    ui(
+        manager,
+        guild,
+        binding,
+        "910",
+        json!({"action":"complete","id":id,"expected_revision":locked["desired_card_revision"]}),
+    )
+    .await;
+    let completed = saved_run(manager, guild, binding, "910", &id).await;
+    assert_eq!(completed["state"], "completed");
+    vec![("910".into(), completed), ("920".into(), full)]
+}
 fn activation(module: &ModuleId, guild: &GuildId) -> DesiredActivation {
     DesiredActivation {
         module: module.clone(),
@@ -160,6 +552,7 @@ fn activation(module: &ModuleId, guild: &GuildId) -> DesiredActivation {
             "storage.own".into(),
             "config.own".into(),
             "events.guild".into(),
+            "shared_cards.publish".into(),
         ],
         bindings: BTreeMap::new(),
     }
@@ -268,6 +661,12 @@ async fn qualify(postgres: bool) {
         ],
     ));
     let manager = ModuleManager::new(storage.clone(), core, temp.0.join("artifacts")).unwrap();
+    let cards = Arc::new(RecordedCards {
+        storage: storage.clone(),
+        intents: Mutex::new(BTreeMap::new()),
+        enqueues: AtomicU64::new(0),
+    });
+    manager.set_shared_card_service(cards.clone()).unwrap();
     manager
         .set_configuration_services(storage.clone(), Arc::new(Policy))
         .unwrap();
@@ -335,7 +734,7 @@ async fn qualify(postgres: bool) {
             .await
             .unwrap()
             .data_version,
-        2
+        3
     );
     let bound = binding(&manager, &guild).await;
     assert!(
@@ -478,19 +877,23 @@ async fn qualify(postgres: bool) {
     )
     .await
     .unwrap();
-    assert_eq!(
-        joined,
-        call(
-            &manager,
-            &guild,
-            &bound,
-            "901",
-            &join_id,
-            "run_signup",
-            json!({"id":id})
-        )
-        .await
-        .unwrap()
+    assert_eq!(joined["result"]["run_id"], id);
+    let replayed_join = call(
+        &manager,
+        &guild,
+        &bound,
+        "901",
+        &join_id,
+        "run_signup",
+        json!({"id":id}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        replayed_join["reply"]["card"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("already in this run")
     );
     let saved = call(
         &manager,
@@ -511,6 +914,34 @@ async fn qualify(postgres: bool) {
         saved["publication"]["desired_revision"],
         saved["run"]["desired_card_revision"]
     );
+    let ui_runs = qualify_ui(&manager, &guild, &bound).await;
+    for (_, run) in &ui_runs {
+        let id = run["id"].as_str().unwrap();
+        let source = manager
+            .shared_card_source(&guild, &module, id)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.intent,
+            cards.intents.lock().unwrap()[&(module.clone(), guild.clone(), id.into())]
+        );
+        if run["state"] == "completed" {
+            assert!(source.intent["actions"].as_array().unwrap().is_empty());
+        } else {
+            assert_eq!(source.intent["actions"].as_array().unwrap().len(), 3);
+        }
+        let dispatch = manager
+            .shared_card_dispatch(
+                &guild,
+                &module,
+                &source.session,
+                source.generation,
+                source.epoch,
+            )
+            .await
+            .unwrap();
+        dispatch.dispatch(|| ()).unwrap();
+    }
     manager
         .configure_member_reads(
             &PolicyContext::LocalOperator,
@@ -578,8 +1009,36 @@ async fn qualify(postgres: bool) {
     manager.load(&installed.digest).await.unwrap();
     let rebound = binding(&manager, &guild).await;
     assert_ne!(bound.generation, rebound.generation);
+    assert!(
+        manager
+            .shared_card_dispatch(
+                &guild,
+                &module,
+                &bound.session,
+                bound.generation,
+                bound.epoch
+            )
+            .await
+            .is_err()
+    );
+    for (owner, expected) in &ui_runs {
+        let id = expected["id"].as_str().unwrap();
+        assert_eq!(
+            saved_run(&manager, &guild, &rebound, owner, id).await,
+            *expected
+        );
+        let recovered = ui(
+            &manager,
+            &guild,
+            &rebound,
+            owner,
+            json!({"action":"view","id":id}),
+        )
+        .await;
+        assert!(recovered["reply"]["card"]["title"].is_string());
+    }
     assert_eq!(
-        created,
+        created["result"],
         call(
             &manager,
             &guild,
@@ -590,7 +1049,7 @@ async fn qualify(postgres: bool) {
             json!({"name":"Native run"})
         )
         .await
-        .unwrap()
+        .unwrap()["result"]
     );
     assert_eq!(
         saved,
@@ -712,6 +1171,7 @@ async fn qualify(postgres: bool) {
     // authenticated host Maintenance delivery rather than calling cleanup directly.
     // Clone the existing pinned snapshot so no wiki refresh is needed for this fixture.
     let mut draft = saved.clone();
+    draft.as_object_mut().unwrap().remove("reply");
     let expired_id = "23456789";
     draft["publication"] = Value::Null;
     draft["run"]["id"] = json!(expired_id);
@@ -734,7 +1194,7 @@ async fn qualify(postgres: bool) {
         .document_batch(
             &module,
             &guild,
-            2,
+            3,
             &[
                 DocumentWrite {
                     collection: "runs".into(),
@@ -791,6 +1251,7 @@ async fn qualify(postgres: bool) {
         held.policy.check().is_err(),
         "configuration changes fence earlier mutation authorization"
     );
+    let enqueues_before_maintenance = cards.enqueues.load(Ordering::Relaxed);
     assert_eq!(
         manager
             .deliver_event(
@@ -825,6 +1286,13 @@ async fn qualify(postgres: bool) {
     })
     .await
     .expect("Maintenance must clean old draft despite stale wiki");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while cards.enqueues.load(Ordering::Relaxed) <= enqueues_before_maintenance {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Maintenance must retry durable publication intents without a wiki snapshot");
     let final_run = storage
         .document_get(&module, &guild, "runs", id)
         .await

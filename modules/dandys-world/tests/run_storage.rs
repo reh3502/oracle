@@ -92,7 +92,7 @@ impl Documents for Db {
     }
     async fn batch(&self, w: Vec<DocumentWrite>) -> storage::Result<()> {
         self.store
-            .document_batch(&self.module, &self.guild, 2, &w)
+            .document_batch(&self.module, &self.guild, 3, &w)
             .await
             .map_err(map_error)?;
         if self.lose_ack.swap(false, Ordering::SeqCst) {
@@ -122,7 +122,7 @@ async fn initialize(config: DatabaseConfig) -> Arc<Storage> {
         .await
         .unwrap();
     store
-        .begin_migration(&module, &guild, 1, 2, &digest)
+        .begin_migration(&module, &guild, 1, 3, &digest)
         .await
         .unwrap();
     let page = store.migration_page(&module, &guild, 100).await.unwrap();
@@ -137,7 +137,7 @@ async fn initialize(config: DatabaseConfig) -> Arc<Storage> {
             .await
             .unwrap()
             .data_version,
-        2
+        3
     );
     store
 }
@@ -177,6 +177,7 @@ async fn change(
                 run_id: id.into(),
                 command,
                 confirmation: None,
+                expected_revision: None,
             },
             &catalog(),
             NOW,
@@ -212,6 +213,7 @@ async fn confirmed(
                 run_id: id.into(),
                 command,
                 confirmation: Some(confirmation),
+                expected_revision: None,
             },
             &catalog(),
             NOW,
@@ -344,6 +346,7 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
             toon: Some("poppy".into()),
         },
         confirmation: None,
+        expected_revision: None,
     };
     assert!(matches!(
         service
@@ -362,6 +365,7 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
         run_id: id.clone(),
         command: Command::Leave,
         confirmation: None,
+        expected_revision: None,
     };
     let left = service
         .execute(&winner, &leave_id, leave.clone(), &catalog(), NOW)
@@ -405,6 +409,7 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
                     toon: Some("poppy".into()),
                 },
                 confirmation: None,
+                expected_revision: None,
             },
             &stale,
             NOW,
@@ -649,6 +654,7 @@ async fn lowered_limits_preserve_reads_and_low_sequence_receipts_use_multiple_sh
                         name: format!("Run {tick}"),
                     },
                     confirmation: None,
+                    expected_revision: None,
                 },
                 &catalog(),
                 now,
@@ -898,6 +904,7 @@ async fn serialized_capacity_reserves_space_for_moderator_cancellation() {
                         name: format!("Edit {tick}"),
                     },
                     confirmation: None,
+                    expected_revision: None,
                 },
                 &large,
                 NOW,
@@ -915,7 +922,7 @@ async fn serialized_capacity_reserves_space_for_moderator_cancellation() {
     );
     let live = service.view(&owner, &id).await.unwrap();
     let live_bytes = serde_json::to_vec(&live).unwrap().len();
-    assert!(live_bytes <= 32 * 1024 - 512);
+    assert!(live_bytes <= 40 * 1024 - 512);
     confirmed(
         &service,
         &moderator,
@@ -930,7 +937,224 @@ async fn serialized_capacity_reserves_space_for_moderator_cancellation() {
     assert_eq!(terminal.run.state, RunState::Cancelled);
     assert_eq!(terminal.moderator_audit.len(), edits + 1);
     let bytes = serde_json::to_vec(&terminal).unwrap().len();
-    assert!(bytes > live_bytes && bytes <= 32 * 1024);
+    assert!(bytes > live_bytes && bytes <= 40 * 1024);
     store.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn wizard_rows_resume_revision_projection_and_explicit_repost_are_atomic() {
+    let root = std::env::temp_dir().join(format!("dw-wizard-{}", interaction(NOW)));
+    std::fs::create_dir(&root).unwrap();
+    let database = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let service = RunService::new(Db::new(database.clone()));
+    let owner = actor("7");
+    let id = create(&service, &owner, RunMode::Organized).await;
+    change(
+        &service,
+        &owner,
+        &id,
+        Command::SetAllocation {
+            toon: "pebble".into(),
+            count: 2,
+        },
+    )
+    .await
+    .unwrap();
+    change(
+        &service,
+        &owner,
+        &id,
+        Command::SetAllocation {
+            toon: "poppy".into(),
+            count: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let stored = service.view(&owner, &id).await.unwrap();
+    assert_eq!(stored.run.allocations.as_ref().unwrap().len(), 2);
+    assert_eq!(stored.run.capacity(), 5);
+    let stale = service
+        .execute(
+            &owner,
+            &interaction(NOW),
+            Request::Change {
+                run_id: id.clone(),
+                command: Command::SetAllocation {
+                    toon: "pebble".into(),
+                    count: 1,
+                },
+                confirmation: None,
+                expected_revision: Some(1),
+            },
+            &catalog(),
+            NOW,
+        )
+        .await;
+    assert!(matches!(
+        stale,
+        Err(storage::Error::Rule(Error::StaleRevision))
+    ));
+    let mut unavailable = catalog();
+    unavailable.disputed = true;
+    let resumed = service
+        .execute(
+            &owner,
+            &interaction(NOW),
+            Request::Create {
+                mode: RunMode::Casual,
+                name: Some("different".into()),
+            },
+            &unavailable,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(resumed,Response::Applied{result} if result.run_id==id && !result.outcome.changed)
+    );
+    assert_eq!(service.view(&owner, &id).await.unwrap(), stored);
+    change(
+        &service,
+        &owner,
+        &id,
+        Command::SetHostToon {
+            toon: "pebble".into(),
+        },
+    )
+    .await
+    .unwrap();
+    change(&service, &owner, &id, Command::Publish)
+        .await
+        .unwrap();
+    let published = service.view(&owner, &id).await.unwrap();
+    let projection = published.publication.as_ref().unwrap();
+    assert_eq!(projection.repost_generation, 0);
+    let (card, actions) = dandys_world_core::runs::ui::public_projection(&published.run);
+    assert_eq!(projection.card, card);
+    assert_eq!(projection.actions, actions);
+    assert_eq!(published.run.assignments.len(), 1);
+    assert!(
+        !service
+            .release_confirmed(&id, projection.desired_revision - 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        service
+            .release_confirmed(&id, projection.desired_revision)
+            .await
+            .unwrap()
+    );
+    assert!(service.pending_projections().await.unwrap().is_empty());
+    let request = Request::Repost {
+        run_id: id.clone(),
+        expected_revision: published.run.desired_card_revision,
+    };
+    let click = interaction(NOW);
+    let response = service
+        .execute(&owner, &click, request.clone(), &unavailable, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .execute(&owner, &click, request, &unavailable, NOW)
+            .await
+            .unwrap(),
+        response
+    );
+    let reposted = service.view(&owner, &id).await.unwrap();
+    assert_eq!(reposted.publication.as_ref().unwrap().repost_generation, 1);
+    assert_eq!(
+        reposted.run.desired_card_revision,
+        published.run.desired_card_revision + 1
+    );
+    assert!(
+        !service
+            .release_confirmed(&id, projection.desired_revision)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        service.pending_projections().await.unwrap(),
+        vec![id.clone()]
+    );
+    let denied = service
+        .execute(
+            &actor("8"),
+            &interaction(NOW),
+            Request::Repost {
+                run_id: id.clone(),
+                expected_revision: reposted.run.desired_card_revision,
+            },
+            &unavailable,
+            NOW,
+        )
+        .await;
+    assert!(matches!(
+        denied,
+        Err(storage::Error::Rule(Error::Forbidden))
+    ));
+    database.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn v2_projection_migration_retains_full_source_audit_and_receipts() {
+    let owner = actor("7");
+    let mut source = catalog();
+    source.toons = (0..80)
+        .map(|i| (format!("toon{i:02}"), format!("{i:02}{}", "🌟".repeat(76))))
+        .collect();
+    let run = Run::new(
+        "abcdefgh".into(),
+        &owner,
+        RunMode::Casual,
+        None,
+        source,
+        NOW,
+    )
+    .unwrap();
+    let (run, _) = apply(&run, &owner, &Command::Publish, &run.eligibility, NOW).unwrap();
+    let audit: Vec<_> = (0..80)
+        .map(|_| storage::AuditEntry {
+            actor_id: "8".into(),
+            action: "rename".into(),
+            at: NOW,
+            affected_member: None,
+        })
+        .collect();
+    let old = serde_json::json!({"schema_version":2,"run":run,"moderator_audit":audit,"publication":{"key":run.id,"desired_revision":run.desired_card_revision,"destination":"runs","created_at":NOW}});
+    let old_bytes = serde_json::to_vec(&old).unwrap().len();
+    assert!(
+        old_bytes > 28 * 1024 && old_bytes < 32 * 1024,
+        "{old_bytes}"
+    );
+    let write = storage::migrate_v2_document(ModuleDocument {
+        collection: "runs".into(),
+        key: run.id.clone(),
+        revision: 9,
+        value: old.clone(),
+    })
+    .unwrap();
+    let new = write.value.unwrap();
+    assert_eq!(write.expected_revision, Some(9));
+    assert_eq!(new["run"], old["run"]);
+    assert_eq!(new["moderator_audit"], old["moderator_audit"]);
+    assert_eq!(new["publication"]["repost_generation"], 0);
+    assert!(new["publication"]["card"].is_object());
+    assert!(serde_json::to_vec(&new).unwrap().len() < 40 * 1024);
+    let receipt = serde_json::json!({"opaque":"unchanged receipt hash and result"});
+    let copied = storage::migrate_v2_document(ModuleDocument {
+        collection: "run_receipts".into(),
+        key: "123".into(),
+        revision: 4,
+        value: receipt.clone(),
+    })
+    .unwrap();
+    assert_eq!(copied.value, Some(receipt));
 }

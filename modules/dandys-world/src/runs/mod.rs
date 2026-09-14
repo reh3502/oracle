@@ -2,3 +2,4 @@
 pub mod domain;
 pub mod eligibility;
 pub mod storage;
+pub mod ui;

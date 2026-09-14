@@ -1,7 +1,8 @@
-//! Private host-bound run operations. No Discord command or UI publication here.
+//! Authenticated run commands, private setup cards and durable publication requests.
 use dandys_world_core::runs::{
     domain::{Actor, Command, EligibilitySnapshot, RunMode},
     storage::{ConfirmationToken, Limits, Request, RunService},
+    ui::{self, Action, Input as UiInput, View},
 };
 use oracle_module_sdk::{CallContext, Result, RpcError};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -51,6 +52,7 @@ struct Change {
     id: String,
     command: Value,
     confirmation: Option<ConfirmationToken>,
+    expected_revision: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +110,9 @@ fn resolve(command: &mut Command, pinned: &EligibilitySnapshot) -> Result<()> {
                 *rows = resolve_rows(rows, pinned)?;
             }
         }
+        Command::SetAllocation { toon: label, .. }
+        | Command::RemoveAllocation { toon: label }
+        | Command::SetHostToon { toon: label } => *label = toon(label, pinned)?,
         Command::SetAllocations { allocations } => {
             *allocations = resolve_rows(allocations, pinned)?
         }
@@ -151,7 +156,124 @@ pub async fn invoke(
         manage_all_runs: context.member_permissions().contains("manage_all_runs"),
     };
     let interaction = member.interaction_id.clone();
-    let service = RunService::with_limits(context, limits).map_err(rule)?;
+    let service = RunService::with_limits(context.clone(), limits).map_err(rule)?;
+    if operation == "run_ui" {
+        let options: UiInput = decode(input)?;
+        let mut stored = service
+            .view(&actor, &options.id)
+            .await
+            .map_err(|error| rule(ui::human_error(&error)))?;
+        if options.action == Action::View {
+            return encode(json!({"reply":status_card(&context,&stored,&actor,&options).await}));
+        }
+        let mut command = if options.action == Action::Repost {
+            None
+        } else {
+            Some(
+                options
+                    .command()
+                    .map_err(|error| rule(ui::human_error(&error.into())))?,
+            )
+        };
+        if let Some(command) = &mut command {
+            resolve(command, &stored.run.eligibility)?;
+        }
+        let expected = if options.guarded() {
+            Some(options.expected_revision.ok_or_else(invalid)?)
+        } else {
+            None
+        };
+        if expected.is_some_and(|revision| revision != stored.run.desired_card_revision) {
+            return encode(
+                json!({"reply":ui::render(&stored,&actor,&UiInput::show(&options.id,View::Summary),Some("The run changed. Review the latest details and try again."))}),
+            );
+        }
+        let request = if options.action == Action::Repost {
+            let status = context.shared_card_status(&options.id).await?;
+            if status.state != oracle_module_sdk::SharedCardState::Missing {
+                return encode(
+                    json!({"reply":status_card(&context,&stored,&actor,&UiInput::show(&options.id,View::Summary)).await}),
+                );
+            }
+            Request::Repost {
+                run_id: options.id.clone(),
+                expected_revision: expected.ok_or_else(invalid)?,
+            }
+        } else if options.prepares() {
+            Request::Prepare {
+                run_id: options.id.clone(),
+                command: command.ok_or_else(invalid)?,
+            }
+        } else {
+            Request::Change {
+                run_id: options.id.clone(),
+                command: command.ok_or_else(invalid)?,
+                confirmation: options.confirmation().map_err(rule)?,
+                expected_revision: expected,
+            }
+        };
+        let marker = unavailable_catalog();
+        let result = service
+            .execute(
+                &actor,
+                &interaction,
+                request,
+                current.as_ref().unwrap_or(&marker),
+                now,
+            )
+            .await;
+        let publication_notice = if matches!(
+            &result,
+            Ok(dandys_world_core::runs::storage::Response::Applied { .. })
+        ) {
+            reconcile_one(&context, &service, &options.id).await
+        } else {
+            None
+        };
+        stored = service
+            .view(&actor, &options.id)
+            .await
+            .map_err(|error| rule(ui::human_error(&error)))?;
+        return match result {
+            Ok(dandys_world_core::runs::storage::Response::Confirm {
+                confirmation,
+                revision,
+                ..
+            }) => {
+                encode(json!({"reply":ui::confirm(&stored,&actor,&options,&confirmation,revision)}))
+            }
+            Ok(result) => {
+                let view = match options.action {
+                    Action::SetCount | Action::RemoveToon => View::Toons,
+                    Action::SetHost => View::Review,
+                    Action::Rename
+                        if stored.run.state == dandys_world_core::runs::domain::RunState::Draft =>
+                    {
+                        View::Review
+                    }
+                    Action::Lock | Action::Reopen => View::Manage,
+                    _ => View::Summary,
+                };
+                let mut next = UiInput::show(&options.id, view);
+                next.page = options.page;
+                let notice = if let Some(notice) = publication_notice.as_deref() {
+                    notice
+                } else if options.action == Action::Post {
+                    "Run saved. Still checking the post."
+                } else if stored.publication.is_some() {
+                    "Your change is saved. The public card may still be catching up."
+                } else {
+                    "Saved."
+                };
+                encode(
+                    json!({"result":result,"reply":ui::render(&stored,&actor,&next,Some(notice))}),
+                )
+            }
+            Err(error) => encode(
+                json!({"reply":ui::render(&stored,&actor,&UiInput::show(&options.id,View::Summary),Some(&ui::human_error(&error)))}),
+            ),
+        };
+    }
     let request = match operation {
         "run_create_organized" | "run_create_casual" => {
             let options: Create = decode(input)?;
@@ -166,12 +288,36 @@ pub async fn invoke(
         }
         "run_view" => {
             let options: Id = decode(input)?;
-            return encode(service.view(&actor, &options.id).await.map_err(rule)?);
+            let stored = service
+                .view(&actor, &options.id)
+                .await
+                .map_err(|error| rule(ui::human_error(&error)))?;
+            let mut output = encode(&stored)?;
+            output["reply"] = status_card(
+                &context,
+                &stored,
+                &actor,
+                &UiInput::show(&options.id, View::Summary),
+            )
+            .await;
+            return Ok(output);
         }
-        "run_list" => {
+        "run_list" | "run_list_page" => {
             let options: List = decode(input)?;
+            let runs = service
+                .list(&actor, options.after.as_deref())
+                .await
+                .map_err(rule)?;
+            let choices:Vec<_>=runs.iter().map(|stored|json!({"label":stored.run.name,"description":format!("{} · {} / {} places",stored.run.id,stored.run.assignments.len(),stored.run.capacity()),"operation":"run_ui","input":{"action":"view","id":stored.run.id}})).collect();
+            let buttons = if runs.len() == 25 {
+                vec![
+                    json!({"label":"Next runs","operation":"run_list_page","input":{"after":runs.last().unwrap().run.id}}),
+                ]
+            } else {
+                vec![]
+            };
             return encode(
-                json!({"runs":service.list(&actor,options.after.as_deref()).await.map_err(rule)?}),
+                json!({"runs":runs,"reply":{"card":{"title":"Open runs","description":if choices.is_empty(){"No open runs yet. Use /hostrun organized or /hostrun casual to start one."}else{"Choose a run to open your private signup controls."},"fields":[],"footer":"Run IDs can also be used with /signup"},"choices":choices,"buttons":buttons,"select_placeholder":"Choose a run…"}}),
             );
         }
         "run_prepare" => {
@@ -187,14 +333,27 @@ pub async fn invoke(
                 run_id: options.id,
                 command: command(options.command)?,
                 confirmation: options.confirmation,
+                expected_revision: options.expected_revision,
             }
         }
         "run_signup" => {
             let options: Signup = decode(input)?;
+            let stored = service
+                .view(&actor, &options.id)
+                .await
+                .map_err(|error| rule(ui::human_error(&error)))?;
+            if (options.toon.is_none() && stored.run.mode == RunMode::Organized)
+                || stored.run.assignments.contains_key(&actor.user_id)
+            {
+                return encode(
+                    json!({"reply":ui::render(&stored,&actor,&UiInput::show(&options.id,View::Join),None)}),
+                );
+            }
             Request::Change {
                 run_id: options.id,
                 command: Command::Join { toon: options.toon },
                 confirmation: None,
+                expected_revision: None,
             }
         }
         "run_leave" => {
@@ -203,6 +362,7 @@ pub async fn invoke(
                 run_id: options.id,
                 command: Command::Leave,
                 confirmation: None,
+                expected_revision: None,
             }
         }
         _ => return Err(invalid()),
@@ -221,21 +381,120 @@ pub async fn invoke(
             .eligibility;
         resolve(command, &pinned)?;
     }
-    // This deliberately invalid marker cannot authorize creation/publication or be
-    // stored in a run. It lets the service replay an existing receipt first.
-    let unavailable = EligibilitySnapshot {
+    let unavailable = unavailable_catalog();
+    let current = current.as_ref().unwrap_or(&unavailable);
+    let result = service
+        .execute(&actor, &interaction, request, current, now)
+        .await
+        .map_err(|error| rule(ui::human_error(&error)))?;
+    let id = match &result {
+        dandys_world_core::runs::storage::Response::Applied { result } => &result.run_id,
+        dandys_world_core::runs::storage::Response::Confirm { run_id, .. } => run_id,
+    };
+    let publication_notice = if matches!(operation, "run_change" | "run_leave" | "run_signup") {
+        reconcile_one(&context, &service, id).await
+    } else {
+        None
+    };
+    let stored = service.view(&actor, id).await.map_err(rule)?;
+    let notice = if publication_notice.is_some() {
+        publication_notice.as_deref()
+    } else if operation.starts_with("run_create_") {
+        Some("Your draft is saved. Existing setup is resumed without changing its mode or name.")
+    } else if stored.publication.is_some() {
+        Some("Saved. The public card may still be catching up.")
+    } else {
+        None
+    };
+    let mut output = encode(result.clone())?;
+    output["reply"] = ui::render(&stored, &actor, &UiInput::show(id, View::Summary), notice);
+    Ok(output)
+}
+fn unavailable_catalog() -> EligibilitySnapshot {
+    EligibilitySnapshot {
         source_hash: String::new(),
         source_revisions: Default::default(),
         toons: Default::default(),
         observed_at: 0,
         fresh_until: 0,
         disputed: true,
+    }
+}
+
+pub async fn reconcile_one(
+    context: &CallContext,
+    service: &RunService<CallContext>,
+    id: &str,
+) -> Option<String> {
+    let projection = service.projection(id).await.ok()?;
+    if projection["intent"].is_null() {
+        return None;
+    }
+    let revision = projection["expected_revision"].as_u64()?;
+    let status =
+        match context.shared_card_enqueue(id, revision).await {
+            Ok(status) => status,
+            Err(_) => return Some(
+                "Your run is saved. Still checking the public post; use /dw run to check again."
+                    .into(),
+            ),
+        };
+    if status.state == oracle_module_sdk::SharedCardState::Confirmed
+        && let Some(confirmed) = status.confirmed_revision
+        && confirmed
+            >= projection["intent"]["desired_revision"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+    {
+        let _ = service.release_confirmed(id, confirmed).await;
+        return Some("Saved. The public card is up to date.".into());
+    }
+    Some(match status.state {
+        oracle_module_sdk::SharedCardState::Missing=>"Your run is saved, but its public message was deleted. Ask the host to repost it.",
+        oracle_module_sdk::SharedCardState::Rejected=>"Your run is saved, but the bot cannot post in the configured channel. Ask a moderator to check its permissions.",
+        oracle_module_sdk::SharedCardState::RecoveryRequired=>"Your run is saved. The public post needs a moderator to check delivery before it can be retried.",
+        _=>"Your run is saved. Still checking the public post.",
+    }.into())
+}
+
+async fn status_card(
+    context: &CallContext,
+    stored: &dandys_world_core::runs::storage::StoredRun,
+    actor: &Actor,
+    input: &UiInput,
+) -> Value {
+    use oracle_module_sdk::SharedCardState;
+    if stored.publication.is_none() {
+        return ui::render(stored, actor, input, None);
+    }
+    let status = context.shared_card_status(&stored.run.id).await.ok();
+    let message = match status.as_ref().map(|s| &s.state) {
+        Some(SharedCardState::Confirmed)
+            if status
+                .as_ref()
+                .and_then(|s| s.confirmed_revision)
+                .is_some_and(|r| r >= stored.run.desired_card_revision) =>
+        {
+            "The public card is up to date."
+        }
+        Some(SharedCardState::Missing) => {
+            "The public card is missing. The host or a moderator can explicitly repost it."
+        }
+        Some(SharedCardState::RecoveryRequired) => {
+            "The saved run is safe. The host is checking an uncertain post; do not post another copy."
+        }
+        Some(SharedCardState::Rejected) => {
+            "The run is saved. Public posting needs an operator to check the runs destination or permissions."
+        }
+        _ => "The run is saved. Still checking the public post.",
     };
-    let current = current.as_ref().unwrap_or(&unavailable);
-    encode(
-        service
-            .execute(&actor, &interaction, request, current, now)
-            .await
-            .map_err(rule)?,
-    )
+    let mut reply = ui::render(stored, actor, input, Some(message));
+    if !stored.run.state.is_terminal()
+        && (actor.user_id == stored.run.owner_id || actor.manage_all_runs)
+        && status.is_some_and(|s| s.state == SharedCardState::Missing)
+        && let Some(buttons) = reply["buttons"].as_array_mut()
+    {
+        buttons.push(json!({"label":"Repost missing card","operation":"run_ui","input":{"action":"repost","id":stored.run.id,"expected_revision":stored.run.desired_card_revision}}));
+    }
+    reply
 }

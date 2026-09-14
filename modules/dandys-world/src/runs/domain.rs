@@ -148,6 +148,16 @@ pub enum Command {
     SetAllocations {
         allocations: BTreeMap<String, u8>,
     },
+    SetAllocation {
+        toon: String,
+        count: u8,
+    },
+    RemoveAllocation {
+        toon: String,
+    },
+    SetHostToon {
+        toon: String,
+    },
     Rename {
         name: String,
     },
@@ -181,6 +191,8 @@ impl<'de> Deserialize<'de> for Command {
             "set_mode" => &["action", "mode", "confirmation"],
             "join" | "switch" => &["action", "toon"],
             "set_allocations" => &["action", "allocations"],
+            "set_allocation" => &["action", "toon", "count"],
+            "remove_allocation" | "set_host_toon" => &["action", "toon"],
             "rename" => &["action", "name"],
             "cancel" => &["action", "confirmation"],
             "remove" => &["action", "member_id", "confirmation"],
@@ -242,6 +254,8 @@ pub enum Error {
     ConfirmationRequired,
     #[error("the run or actor changed; review a fresh private confirmation")]
     StaleConfirmation,
+    #[error("the run changed; review its latest details before trying again")]
+    StaleRevision,
 }
 
 pub fn normalize_run_id(value: &str) -> Result<String, Error> {
@@ -581,6 +595,37 @@ pub fn apply(
                     }
                     next.validate_allocations(allocations)?;
                     next.allocations = Some(allocations.clone());
+                }
+                Command::SetAllocation { toon, count } => {
+                    if run.state.is_terminal() {
+                        return Err(Error::Closed);
+                    }
+                    let mut rows = run.allocations.clone().ok_or(Error::InvalidInput)?;
+                    rows.insert(toon.clone(), *count);
+                    next.validate_allocations(&rows)?;
+                    next.allocations = Some(rows);
+                }
+                Command::RemoveAllocation { toon } => {
+                    if run.state.is_terminal() {
+                        return Err(Error::Closed);
+                    }
+                    let mut rows = run.allocations.clone().ok_or(Error::InvalidInput)?;
+                    rows.remove(toon);
+                    next.validate_allocations(&rows)?;
+                    next.allocations = Some(rows);
+                    if run.state == RunState::Draft && run.host_toon.as_ref() == Some(toon) {
+                        next.host_toon = None;
+                    }
+                }
+                Command::SetHostToon { toon } => {
+                    if run.state != RunState::Draft {
+                        return Err(Error::InvalidTransition);
+                    }
+                    if run.mode != RunMode::Organized {
+                        return Err(Error::InvalidInput);
+                    }
+                    next.validate_selection(Some(toon))?;
+                    next.host_toon = Some(toon.clone());
                 }
                 Command::Rename { name } => {
                     if run.state.is_terminal() {

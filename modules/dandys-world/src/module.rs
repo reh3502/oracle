@@ -107,6 +107,7 @@ impl LoadedCatalog {
 }
 #[derive(Default)]
 struct DwModule {
+    publication_cursor: RwLock<BTreeMap<GuildId, String>>,
     run_configuration_lock: tokio::sync::RwLock<()>,
     configuration: RwLock<BTreeMap<GuildId, EffectiveConfiguration>>,
     // Metadata and query index are published and retained together.
@@ -384,6 +385,7 @@ impl Module for DwModule {
     }
     async fn deactivate(&self, guild: &GuildId, _epoch: u64) -> Result<()> {
         self.configuration.write().unwrap().remove(guild);
+        self.publication_cursor.write().unwrap().remove(guild);
         Ok(())
     }
     async fn prepare_configuration(
@@ -430,8 +432,32 @@ impl Module for DwModule {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| RpcError::Remote("System clock is unavailable".into()))?
             .as_millis() as u64;
+        let service = RunService::new(context.clone());
+        if let Ok(pending) = service.pending_projections().await {
+            let cursor = self
+                .publication_cursor
+                .read()
+                .unwrap()
+                .get(context.guild())
+                .cloned()
+                .unwrap_or_default();
+            let ordered: Vec<_> = pending
+                .iter()
+                .filter(|id| *id > &cursor)
+                .chain(pending.iter().filter(|id| *id <= &cursor))
+                .take(16)
+                .cloned()
+                .collect();
+            for id in ordered {
+                let _ = run_api::reconcile_one(&context, &service, &id).await;
+                self.publication_cursor
+                    .write()
+                    .unwrap()
+                    .insert(context.guild().clone(), id);
+            }
+        }
         serde_json::to_value(
-            RunService::new(context)
+            service
                 .cleanup(now, 32)
                 .await
                 .map_err(|e| RpcError::Remote(e.to_string()))?,
@@ -446,6 +472,15 @@ impl Module for DwModule {
         documents: Vec<ModuleDocument>,
     ) -> Result<Vec<DocumentWrite>> {
         // Version one had no module document collections. Never reinterpret unexpected data.
+        if operation == "migrate_run_cards" && from == 2 && to == 3 {
+            return documents
+                .into_iter()
+                .map(|document| {
+                    dandys_world_core::runs::storage::migrate_v2_document(document)
+                        .map_err(|error| RpcError::Remote(error.to_string()))
+                })
+                .collect();
+        }
         if operation != "migrate_runs" || from != 1 || to != 2 || !documents.is_empty() {
             return Err(RpcError::Remote(
                 "Unsupported Dandy's World migration".into(),

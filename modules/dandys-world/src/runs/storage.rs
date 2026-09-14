@@ -12,7 +12,8 @@ use std::{
     io::Read,
 };
 
-pub const DATA_VERSION: u32 = 2;
+pub const DATA_VERSION: u32 = 3;
+pub const MAX_AGGREGATE_BYTES: usize = 40 * 1024;
 pub const DAY: u64 = 86_400_000;
 const MAX_BYTES: usize = 32 * 1024;
 const MAX_RECEIPTS: usize = 1_000;
@@ -53,8 +54,12 @@ pub trait Documents: Send + Sync {
 pub struct PublicationIntent {
     pub key: String,
     pub desired_revision: u64,
+    #[serde(default)]
+    pub repost_generation: u32,
     pub destination: String,
     pub created_at: u64,
+    pub card: Value,
+    pub actions: Vec<super::ui::PublicAction>,
 }
 
 /// Bounded management history, removed with the aggregate at terminal expiry.
@@ -142,6 +147,13 @@ pub enum Request {
         run_id: String,
         command: Command,
         confirmation: Option<ConfirmationToken>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<u64>,
+    },
+    /// Internal adapter only: a fresh host status must establish Missing first.
+    Repost {
+        run_id: String,
+        expected_revision: u64,
     },
     Prepare {
         run_id: String,
@@ -236,7 +248,9 @@ impl<'a, D: Documents> Transaction<'a, D> {
         {
             // Reserve a final moderator audit entry, terminal timestamp and
             // publication metadata so even a full live aggregate can close.
-            MAX_BYTES - 512
+            MAX_AGGREGATE_BYTES - 512
+        } else if collection == "runs" {
+            MAX_AGGREGATE_BYTES
         } else {
             MAX_BYTES
         };
@@ -478,10 +492,19 @@ impl<D: Documents> RunService<D> {
                 run_id,
                 command,
                 confirmation,
+                expected_revision,
             } => Request::Change {
                 run_id: domain::normalize_run_id(&run_id)?,
                 command: normalize_command(&command),
                 confirmation,
+                expected_revision,
+            },
+            Request::Repost {
+                run_id,
+                expected_revision,
+            } => Request::Repost {
+                run_id: domain::normalize_run_id(&run_id)?,
+                expected_revision,
             },
             Request::Prepare { run_id, command } => Request::Prepare {
                 run_id: domain::normalize_run_id(&run_id)?,
@@ -592,68 +615,146 @@ impl<D: Documents> RunService<D> {
         meta.version = DATA_VERSION;
         let expires_at = now.checked_add(DAY).ok_or(Error::Interaction)?;
         let payload = match request {
+            Request::Repost {
+                run_id,
+                expected_revision,
+            } => {
+                let mut stored = self.load_run(&mut tx, run_id).await?;
+                if actor.user_id != stored.run.owner_id && !actor.manage_all_runs {
+                    return Err(domain::Error::Forbidden.into());
+                }
+                if stored.run.state.is_terminal() || stored.run.state == RunState::Draft {
+                    return Err(domain::Error::Closed.into());
+                }
+                if stored.run.desired_card_revision != *expected_revision {
+                    return Err(domain::Error::StaleRevision.into());
+                }
+                if now < stored.run.updated_at {
+                    return Err(domain::Error::InvalidInput.into());
+                }
+                let intent = stored.publication.as_mut().ok_or(Error::Corrupt)?;
+                intent.repost_generation = intent
+                    .repost_generation
+                    .checked_add(1)
+                    .ok_or(Error::Limit)?;
+                stored.run.desired_card_revision = stored
+                    .run
+                    .desired_card_revision
+                    .checked_add(1)
+                    .ok_or(Error::Limit)?;
+                stored.run.updated_at = now;
+                if actor.user_id == stored.run.owner_id {
+                    stored.run.last_owner_edit_at = now;
+                } else {
+                    if stored.moderator_audit.len() >= 127 {
+                        return Err(Error::Limit);
+                    }
+                    stored.moderator_audit.push(AuditEntry {
+                        actor_id: actor.user_id.clone(),
+                        action: "repost".into(),
+                        at: now,
+                        affected_member: None,
+                    });
+                }
+                intent.desired_revision = stored.run.desired_card_revision;
+                let (card, actions) = super::ui::public_projection(&stored.run);
+                intent.card = card;
+                intent.actions = actions;
+                meta.pending.insert(run_id.clone());
+                tx.put("runs", run_id, &stored).await?;
+                ReceiptPayload::Outcome {
+                    result: Ok(MutationResult {
+                        run_id: run_id.clone(),
+                        outcome: Outcome {
+                            changed: true,
+                            state: stored.run.state,
+                            card_revision: stored.run.desired_card_revision,
+                        },
+                    }),
+                }
+            }
             Request::Create { mode, name } => {
                 let mut live: Live = tx.get("run_index", "live").await?.unwrap_or_default();
-                if live.values().filter(|e| e.state == RunState::Draft).count()
-                    >= self.limits.drafts_per_guild
-                    || live
-                        .values()
-                        .filter(|e| e.state == RunState::Draft && e.owner == actor.user_id)
-                        .count()
-                        >= self.limits.drafts_per_owner
-                    || meta.terminal_count + live.len() >= self.limits.retained_terminal
-                    || meta.tombstone_count >= self.limits.tombstones
+                if let Some((id, _)) = live
+                    .iter()
+                    .find(|(_, e)| e.state == RunState::Draft && e.owner == actor.user_id)
                 {
-                    return Err(Error::Limit);
-                }
-                let mut choice = None;
-                for _ in 0..5 {
-                    let id = new_id()?;
-                    let existing: Option<StoredRun> = tx.get("runs", &id).await?;
-                    let tomb_key = tombstone_bucket(&id);
-                    let tombstones: BTreeMap<String, u64> =
-                        tx.get("run_index", &tomb_key).await?.unwrap_or_default();
-                    if existing.is_none() && !tombstones.contains_key(&id) {
-                        // CAS even an unchanged shard prevents concurrent GC/create ABA.
-                        tx.put("run_index", &tomb_key, &tombstones).await?;
-                        choice = Some(id);
-                        break;
+                    let stored = self.load_run(&mut tx, id).await?;
+                    if stored.run.state != RunState::Draft || stored.run.owner_id != actor.user_id {
+                        return Err(Error::Corrupt);
                     }
-                }
-                let id = choice.ok_or(Error::Busy)?;
-                match Run::new(id.clone(), actor, *mode, name.clone(), current.clone(), now) {
-                    Ok(run) => {
-                        live.insert(
-                            id.clone(),
-                            LiveEntry {
-                                owner: run.owner_id.clone(),
-                                state: run.state,
-                                last_owner_edit_at: run.last_owner_edit_at,
-                            },
-                        );
-                        let result = MutationResult {
+                    ReceiptPayload::Outcome {
+                        result: Ok(MutationResult {
                             run_id: id.clone(),
                             outcome: Outcome {
-                                changed: true,
-                                state: run.state,
-                                card_revision: run.desired_card_revision,
+                                changed: false,
+                                state: RunState::Draft,
+                                card_revision: stored.run.desired_card_revision,
                             },
-                        };
-                        tx.put(
-                            "runs",
-                            &id,
-                            &StoredRun {
-                                schema_version: DATA_VERSION,
-                                run,
-                                publication: None,
-                                moderator_audit: Vec::new(),
-                            },
-                        )
-                        .await?;
-                        tx.put("run_index", "live", &live).await?;
-                        ReceiptPayload::Outcome { result: Ok(result) }
+                        }),
                     }
-                    Err(error) => ReceiptPayload::Outcome { result: Err(error) },
+                } else {
+                    if live.values().filter(|e| e.state == RunState::Draft).count()
+                        >= self.limits.drafts_per_guild
+                        || live
+                            .values()
+                            .filter(|e| e.state == RunState::Draft && e.owner == actor.user_id)
+                            .count()
+                            >= self.limits.drafts_per_owner
+                        || meta.terminal_count + live.len() >= self.limits.retained_terminal
+                        || meta.tombstone_count >= self.limits.tombstones
+                    {
+                        return Err(Error::Limit);
+                    }
+                    let mut choice = None;
+                    for _ in 0..5 {
+                        let id = new_id()?;
+                        let existing: Option<StoredRun> = tx.get("runs", &id).await?;
+                        let tomb_key = tombstone_bucket(&id);
+                        let tombstones: BTreeMap<String, u64> =
+                            tx.get("run_index", &tomb_key).await?.unwrap_or_default();
+                        if existing.is_none() && !tombstones.contains_key(&id) {
+                            // CAS even an unchanged shard prevents concurrent GC/create ABA.
+                            tx.put("run_index", &tomb_key, &tombstones).await?;
+                            choice = Some(id);
+                            break;
+                        }
+                    }
+                    let id = choice.ok_or(Error::Busy)?;
+                    match Run::new(id.clone(), actor, *mode, name.clone(), current.clone(), now) {
+                        Ok(run) => {
+                            live.insert(
+                                id.clone(),
+                                LiveEntry {
+                                    owner: run.owner_id.clone(),
+                                    state: run.state,
+                                    last_owner_edit_at: run.last_owner_edit_at,
+                                },
+                            );
+                            let result = MutationResult {
+                                run_id: id.clone(),
+                                outcome: Outcome {
+                                    changed: true,
+                                    state: run.state,
+                                    card_revision: run.desired_card_revision,
+                                },
+                            };
+                            tx.put(
+                                "runs",
+                                &id,
+                                &StoredRun {
+                                    schema_version: DATA_VERSION,
+                                    run,
+                                    publication: None,
+                                    moderator_audit: Vec::new(),
+                                },
+                            )
+                            .await?;
+                            tx.put("run_index", "live", &live).await?;
+                            ReceiptPayload::Outcome { result: Ok(result) }
+                        }
+                        Err(error) => ReceiptPayload::Outcome { result: Err(error) },
+                    }
                 }
             }
             Request::Prepare { run_id, command } => {
@@ -678,8 +779,14 @@ impl<D: Documents> RunService<D> {
                 run_id,
                 command,
                 confirmation,
+                expected_revision,
             } => {
                 let mut stored = self.load_run(&mut tx, run_id).await?;
+                if expected_revision
+                    .is_some_and(|revision| revision != stored.run.desired_card_revision)
+                {
+                    return Err(domain::Error::StaleRevision.into());
+                }
                 let mut command = command.clone();
                 if requires_confirmation(&stored.run, &command) {
                     let token = confirmation
@@ -767,11 +874,18 @@ impl<D: Documents> RunService<D> {
                             {
                                 let created_at =
                                     stored.publication.as_ref().map_or(now, |p| p.created_at);
+                                let (card, actions) = super::ui::public_projection(&run);
                                 stored.publication = Some(PublicationIntent {
                                     key: run.id.clone(),
                                     desired_revision: run.desired_card_revision,
+                                    repost_generation: stored
+                                        .publication
+                                        .as_ref()
+                                        .map_or(0, |p| p.repost_generation),
                                     destination: "runs".into(),
                                     created_at,
+                                    card,
+                                    actions,
                                 });
                                 meta.pending.insert(run.id.clone());
                             }
@@ -1015,10 +1129,7 @@ impl<D: Documents> RunService<D> {
                     continue;
                 }
                 let run = self.load_run(&mut tx, &id).await?;
-                if !run.run.state.is_terminal()
-                    || run.publication.is_some()
-                    || run.run.terminal_at.is_none()
-                {
+                if !run.run.state.is_terminal() || run.run.terminal_at.is_none() {
                     return Err(Error::Corrupt);
                 }
                 if now.saturating_sub(run.run.terminal_at.ok_or(Error::Corrupt)?) < 30 * DAY {
@@ -1084,5 +1195,109 @@ fn callback_error(error: oracle_module_sdk::RpcError) -> Error {
     match error {
         oracle_module_sdk::RpcError::Remote(code) if code == "Conflict" => Error::Conflict,
         _ => Error::Unavailable,
+    }
+}
+
+/// Upgrade immutable v2 run documents to include their exact public projection.
+/// Other stored indexes/receipts/tombstones retain their data and identity.
+pub fn migrate_v2_document(document: ModuleDocument) -> Result<DocumentWrite> {
+    let mut value = document.value;
+    match document.collection.as_str() {
+        "runs" => {
+            if value["schema_version"] != 2 {
+                return Err(Error::Corrupt);
+            }
+            let run: Run =
+                serde_json::from_value(value["run"].clone()).map_err(|_| Error::Corrupt)?;
+            run.validate().map_err(|_| Error::Corrupt)?;
+            if !value["publication"].is_null() {
+                let (card, actions) = super::ui::public_projection(&run);
+                value["publication"]["repost_generation"] = serde_json::json!(0);
+                value["publication"]["card"] = card;
+                value["publication"]["actions"] =
+                    serde_json::to_value(actions).map_err(|_| Error::Corrupt)?;
+            }
+            value["schema_version"] = serde_json::json!(DATA_VERSION);
+            let stored: StoredRun =
+                serde_json::from_value(value.clone()).map_err(|_| Error::Corrupt)?;
+            stored.validate(&run.guild_id, &document.key)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| Error::Corrupt)?
+                .len()
+                > MAX_AGGREGATE_BYTES
+            {
+                return Err(Error::Limit);
+            }
+        }
+        "run_index" if document.key == "maintenance" => {
+            if value["version"] != 2 {
+                return Err(Error::Corrupt);
+            }
+            value["version"] = serde_json::json!(DATA_VERSION);
+        }
+        "run_index" | "run_receipts" => (),
+        _ => return Err(Error::Corrupt),
+    }
+    Ok(DocumentWrite {
+        collection: document.collection,
+        key: document.key,
+        expected_revision: Some(document.revision),
+        value: Some(value),
+    })
+}
+impl<D: Documents> RunService<D> {
+    pub async fn pending_projections(&self) -> Result<Vec<String>> {
+        let mut tx = Transaction::new(&self.docs);
+        let meta: Maintenance = tx
+            .get("run_index", "maintenance")
+            .await?
+            .unwrap_or_default();
+        if meta.pending.len() > 700 {
+            return Err(Error::Corrupt);
+        }
+        Ok(meta.pending.into_iter().collect())
+    }
+    pub async fn projection(&self, id: &str) -> Result<Value> {
+        let id = domain::normalize_run_id(id)?;
+        let document = self.docs.get("runs", &id).await?.ok_or(Error::NotFound)?;
+        let stored: StoredRun =
+            serde_json::from_value(document.value).map_err(|_| Error::Corrupt)?;
+        stored.validate(self.docs.guild(), &id)?;
+        Ok(
+            serde_json::json!({"id":id,"expected_revision":document.revision,"terminal":stored.run.state.is_terminal(),"intent":stored.publication}),
+        )
+    }
+}
+
+impl<D: Documents> RunService<D> {
+    /// Called only after a scoped host status callback confirms this desired revision.
+    /// Retains the intent; later mutations requeue it. No member route exposes this.
+    pub async fn release_confirmed(&self, id: &str, confirmed_revision: u64) -> Result<bool> {
+        for _ in 0..3 {
+            let mut tx = Transaction::new(&self.docs);
+            let stored = self.load_run(&mut tx, id).await?;
+            let Some(intent) = &stored.publication else {
+                return Ok(false);
+            };
+            if intent.desired_revision > confirmed_revision {
+                return Ok(false);
+            }
+            let mut meta: Maintenance = tx
+                .get("run_index", "maintenance")
+                .await?
+                .ok_or(Error::Corrupt)?;
+            if !meta.pending.remove(id) {
+                return Ok(false);
+            }
+            // Include the run's exact read in the CAS so an edit cannot lose its pending flag.
+            tx.put("runs", id, &stored).await?;
+            tx.put("run_index", "maintenance", &meta).await?;
+            match tx.commit().await {
+                Ok(()) => return Ok(true),
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Busy)
     }
 }

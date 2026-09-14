@@ -117,7 +117,7 @@ impl Documents for Db {
         }
         let result = self
             .storage
-            .document_batch(&self.module, &self.guild, 2, &writes)
+            .document_batch(&self.module, &self.guild, 3, &writes)
             .await
             .map(|_| ())
             .map_err(map_error);
@@ -139,7 +139,7 @@ async fn initialize(config: DatabaseConfig) -> Db {
         .unwrap();
     let digest = "a".repeat(64);
     db.storage
-        .begin_migration(&db.module, &db.guild, 0, 2, &digest)
+        .begin_migration(&db.module, &db.guild, 0, 3, &digest)
         .await
         .unwrap();
     db.storage
@@ -175,6 +175,7 @@ async fn change(
             run_id: id.into(),
             command,
             confirmation: None,
+            expected_revision: None,
         },
         NOW,
     )
@@ -241,6 +242,7 @@ fn request(id: &str, command: Command) -> Request {
         run_id: id.into(),
         command,
         confirmation: None,
+        expected_revision: None,
     }
 }
 fn rule(result: storage::Result<Response>, expected: Error) {
@@ -337,6 +339,7 @@ async fn lifecycle_races(db: &Db) {
             run_id: id.clone(),
             command,
             confirmation: Some(token),
+            expected_revision: None,
         };
         let join = request(
             &id,
@@ -456,6 +459,7 @@ async fn confirmation_bindings(db: &Db) {
                     run_id,
                     command,
                     confirmation: Some(token.clone()),
+                    expected_revision: None,
                 },
                 NOW,
             )
@@ -482,6 +486,7 @@ async fn confirmation_bindings(db: &Db) {
                 run_id: id.clone(),
                 command: remove.clone(),
                 confirmation: Some(token),
+                expected_revision: None,
             },
             NOW,
         )
@@ -497,6 +502,7 @@ async fn confirmation_bindings(db: &Db) {
                 run_id: id.clone(),
                 command: remove.clone(),
                 confirmation: Some(token),
+                expected_revision: None,
             },
             NOW + 5 * 60_000,
         )
@@ -508,6 +514,7 @@ async fn confirmation_bindings(db: &Db) {
         run_id: id.clone(),
         command: remove.clone(),
         confirmation: Some(token),
+        expected_revision: None,
     };
     let invocation = interaction(NOW);
     let result = service
@@ -575,6 +582,7 @@ async fn all_mode_confirmation(db: &Db) {
                 run_id: id.clone(),
                 command,
                 confirmation: Some(token),
+                expected_revision: None,
             },
             NOW,
         )
@@ -632,6 +640,7 @@ async fn exact_cancelled_draft_retention(db: &Db) {
             run_id: id.clone(),
             command,
             confirmation: Some(token),
+            expected_revision: None,
         },
         terminal_at,
     )
