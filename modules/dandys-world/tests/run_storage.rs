@@ -3,7 +3,9 @@ use dandys_world_core::runs::{
     domain::*,
     storage::{self, DAY, Documents, Request, Response, RunService},
 };
-use oracle_core::{DocumentWrite, ErrorCode, GuildId, ModuleDocument, ModuleId, ModuleRepository};
+use oracle_core::{
+    DocumentWrite, ErrorCode, GuildId, ModuleDocument, ModuleId, ModuleRepository, Repository,
+};
 use oracle_storage::{DatabaseConfig, PgTools, Storage};
 use std::{
     collections::BTreeMap,
@@ -553,7 +555,29 @@ async fn qualify(config: DatabaseConfig, restore: DatabaseConfig, root: &std::pa
             .is_err()
     );
     assert_eq!(service.view(&owner, &id).await.unwrap(), newer);
+    // Damaged backup bytes must fail before creating a destination. Recover
+    // from the retained verified copy, never by bypassing integrity checks.
+    let database_file = backup.join(match &restore {
+        DatabaseConfig::Sqlite { .. } => "database.sqlite",
+        DatabaseConfig::Postgres { .. } => "database.dump",
+    });
+    let verified_bytes = std::fs::read(&database_file).unwrap();
+    let mut damaged = verified_bytes.clone();
+    damaged[0] ^= 1;
+    std::fs::write(&database_file, damaged).unwrap();
+    assert!(matches!(
+        Storage::restore(restore.clone(), &backup, &tools).await,
+        Err(error) if error.code == ErrorCode::Integrity
+    ));
+    assert_eq!(service.view(&owner, &id).await.unwrap(), newer);
+    std::fs::write(&database_file, verified_bytes).unwrap();
     let restored = Arc::new(Storage::restore(restore, &backup, &tools).await.unwrap());
+    let restored_status = restored.status(None).await.unwrap();
+    assert!(restored_status.guilds.iter().all(|guild| guild.paused));
+    assert_ne!(
+        restored_status.deployment,
+        store.status(None).await.unwrap().deployment
+    );
     assert_eq!(
         RunService::new(Db::new(restored.clone()))
             .view(&owner, &id)

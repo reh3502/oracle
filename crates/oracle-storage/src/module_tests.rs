@@ -603,7 +603,7 @@ pub(super) async fn workflow_upgrade(
             }
             sqlx::raw_sql(sql).execute(&mut *tx).await.map_err(db)?;
             sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES($1,$2)")
-                .bind(version as i64)
+                .bind(version)
                 .bind(checksum(sql.as_bytes()))
                 .execute(&mut *tx)
                 .await
