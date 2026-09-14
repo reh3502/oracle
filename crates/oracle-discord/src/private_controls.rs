@@ -154,12 +154,12 @@ fn split(id: &str) -> Result<(&str, &str)> {
 fn request(
     s: &Session,
     a: Action,
-    input: Option<(&str, Option<&str>)>,
+    input: Option<(&str, Option<&str>, &HashMap<String, String>)>,
     interaction_id: &str,
 ) -> Result<PublishedRequest> {
     let mut values = a.input;
     match (a.prompt, input) {
-        (Some(p), Some((v, selected)))
+        (Some(p), Some((v, selected, fields)))
             if !v.trim().is_empty() && v.encode_utf16().count() <= usize::from(p.max_length) =>
         {
             match (&p.select, selected) {
@@ -168,6 +168,20 @@ fn request(
                 }
                 (None, None) => {}
                 _ => return Err(Error::InvalidInteraction),
+            }
+            if fields.len() != p.additional_fields.len() {
+                return Err(Error::InvalidInteraction);
+            }
+            for (index, field) in p.additional_fields.iter().enumerate() {
+                let value = fields
+                    .get(&format!("extra{index}"))
+                    .ok_or(Error::InvalidInteraction)?;
+                if value.trim().is_empty()
+                    || value.encode_utf16().count() > usize::from(field.max_length)
+                {
+                    return Err(Error::InvalidInteraction);
+                }
+                values.insert(field.option.clone(), Value::String(value.trim().into()));
             }
             values.insert(p.option, Value::String(v.trim().into()));
         }
@@ -189,7 +203,7 @@ impl DiscordBootstrap {
         &self,
         s: Session,
         a: Action,
-        input: Option<(&str, Option<&str>)>,
+        input: Option<(&str, Option<&str>, &HashMap<String, String>)>,
         member: MemberContext,
         interaction_id: &str,
         application: u64,
@@ -286,10 +300,13 @@ impl DiscordBootstrap {
             let mut child = s.clone();
             child.actions = HashMap::from([("input".into(), a.clone())]);
             let id = self.cards.1.insert(child)?;
-            let input = discord::CreateInputText::new(discord::InputTextStyle::Short, "value")
+            let mut input = discord::CreateInputText::new(discord::InputTextStyle::Short, "value")
                 .placeholder(p.placeholder.clone())
                 .max_length(p.max_length)
                 .required(true);
+            if let Some(value) = &p.value {
+                input = input.value(value.clone());
+            }
             let mut components = Vec::new();
             if let Some(select) = &p.select {
                 let options = select
@@ -315,6 +332,21 @@ impl DiscordBootstrap {
             components.push(discord::CreateModalComponent::Label(
                 discord::CreateLabel::input_text(p.label.clone(), input),
             ));
+            for (index, field) in p.additional_fields.iter().enumerate() {
+                let mut input = discord::CreateInputText::new(
+                    discord::InputTextStyle::Short,
+                    format!("extra{index}"),
+                )
+                .placeholder(field.placeholder.clone())
+                .max_length(field.max_length)
+                .required(true);
+                if let Some(value) = &field.value {
+                    input = input.value(value.clone());
+                }
+                components.push(discord::CreateModalComponent::Label(
+                    discord::CreateLabel::input_text(field.label.clone(), input),
+                ));
+            }
             return api(i.create_response(
                 http,
                 discord::CreateInteractionResponse::Modal(
@@ -367,6 +399,7 @@ impl DiscordBootstrap {
             let (s, a) = self.cards.1.get(id, key, &member)?;
             let mut text = None;
             let mut selected = None;
+            let mut fields = HashMap::new();
             for component in &i.data.components {
                 let discord::ModalComponent::Label(label) = component else {
                     return Err(Error::InvalidInteraction);
@@ -376,6 +409,16 @@ impl DiscordBootstrap {
                         if input.custom_id.as_str() == "value" && text.is_none() =>
                     {
                         text = Some(input.value.to_string())
+                    }
+                    discord::LabelComponent::InputText(input)
+                        if input.custom_id.as_str().starts_with("extra") =>
+                    {
+                        if fields
+                            .insert(input.custom_id.to_string(), input.value.to_string())
+                            .is_some()
+                        {
+                            return Err(Error::InvalidInteraction);
+                        }
                     }
                     discord::LabelComponent::SelectMenu(select)
                         if select.custom_id.as_str() == "selection"
@@ -392,10 +435,10 @@ impl DiscordBootstrap {
             request(
                 &s,
                 a.clone(),
-                Some((&text, selected.as_deref())),
+                Some((&text, selected.as_deref(), &fields)),
                 &i.id.to_string(),
             )?;
-            Ok((member, s, a, (text, selected)))
+            Ok((member, s, a, (text, selected, fields)))
         })();
         let (member, s, a, input) =
             match resolved {
@@ -423,7 +466,7 @@ impl DiscordBootstrap {
             .run_private(
                 s,
                 a,
-                Some((&input.0, input.1.as_deref())),
+                Some((&input.0, input.1.as_deref(), &input.2)),
                 member,
                 &i.id.to_string(),
                 i.application_id.get(),
@@ -492,6 +535,8 @@ mod tests {
                         .unwrap()
                         .clone(),
                     prompt: Some(oracle_core::PrivateCardPrompt {
+                        value: None,
+                        additional_fields: vec![],
                         option: "count".into(),
                         label: "Places".into(),
                         max_length: 1,
@@ -509,7 +554,7 @@ mod tests {
         let id = cards.insert(session()).unwrap();
         for interaction in ["111", "222"] {
             let (s, a) = cards.get(&id, "b0", &member()).unwrap();
-            let request = request(&s, a, Some(("2", None)), interaction).unwrap();
+            let request = request(&s, a, Some(("2", None, &HashMap::new())), interaction).unwrap();
             assert_eq!(request.interaction_id.as_deref(), Some(interaction));
             let action = request.private_action.unwrap();
             assert_eq!(action.input["toon"], "toon:astro");
@@ -533,12 +578,17 @@ mod tests {
             }],
         });
         for selected in [None, Some("toon:astro"), Some(""), Some("actor_id")] {
-            assert!(request(&s, a.clone(), Some(("2", selected)), "111").is_err());
+            assert!(request(&s, a.clone(), Some(("2", selected, &HashMap::new())), "111").is_err());
         }
-        let accepted = request(&s, a.clone(), Some(("2", Some("toon:pebble"))), "111")
-            .unwrap()
-            .private_action
-            .unwrap();
+        let accepted = request(
+            &s,
+            a.clone(),
+            Some(("2", Some("toon:pebble"), &HashMap::new())),
+            "111",
+        )
+        .unwrap()
+        .private_action
+        .unwrap();
         assert_eq!(accepted.input["toon"], "toon:pebble");
         assert_eq!(accepted.input["count"], "2");
         assert_eq!(accepted.input["expected_revision"], 7);
@@ -547,7 +597,7 @@ mod tests {
             request(
                 &s,
                 s.actions["b0"].clone(),
-                Some(("2", Some("toon:pebble"))),
+                Some(("2", Some("toon:pebble"), &HashMap::new())),
                 "111"
             )
             .is_err()
@@ -588,10 +638,55 @@ mod tests {
         let cards = PrivateCards::default();
         let id = cards.insert(session()).unwrap();
         let (s, a) = cards.get(&id, "b0", &member()).unwrap();
+        let fields = HashMap::new();
         for value in [None, Some(""), Some("12"), Some("😀")] {
-            assert!(request(&s, a.clone(), value.map(|v| (v, None)), "111").is_err());
+            assert!(request(&s, a.clone(), value.map(|v| (v, None, &fields)), "111").is_err());
         }
         assert!(cards.get(&id, "b0", &member()).is_ok());
         assert_eq!(s.actions["b0"].input.get("count"), None);
+    }
+    #[test]
+    fn schedule_form_requires_exact_fields_and_preserves_pinned_revision() {
+        let s = session();
+        let mut a = s.actions["b0"].clone();
+        let p = a.prompt.as_mut().unwrap();
+        p.option = "starts_at".into();
+        p.max_length = 100;
+        p.additional_fields = serde_json::from_value(serde_json::json!([
+            {"option":"timezone","label":"Time zone","max_length":100},
+            {"option":"duration","label":"Duration","max_length":40}
+        ]))
+        .unwrap();
+        let fields = HashMap::from([
+            ("extra0".into(), "America/New_York".into()),
+            ("extra1".into(), "90m".into()),
+        ]);
+        let saved = request(
+            &s,
+            a.clone(),
+            Some(("2099-01-01 20:00", None, &fields)),
+            "111",
+        )
+        .unwrap()
+        .private_action
+        .unwrap()
+        .input;
+        assert_eq!(saved["timezone"], "America/New_York");
+        assert_eq!(saved["duration"], "90m");
+        assert_eq!(saved["expected_revision"], 7);
+        for bad in [
+            HashMap::new(),
+            HashMap::from([
+                ("extra0".into(), "UTC".into()),
+                ("actor_id".into(), "999".into()),
+            ]),
+            HashMap::from([
+                ("extra0".into(), "UTC".into()),
+                ("extra1".into(), "x".repeat(41)),
+            ]),
+        ] {
+            assert!(request(&s, a.clone(), Some(("2099-01-01 20:00", None, &bad)), "111").is_err());
+        }
+        assert!(!a.input.contains_key("duration"));
     }
 }

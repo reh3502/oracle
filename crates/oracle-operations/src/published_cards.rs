@@ -89,15 +89,33 @@ fn checked(s: &str, max: usize, empty: bool) -> Result<()> {
 /// Preserve sentences and numbers; neutralize only markup, mentions and link-like
 /// tokens. Invisible separators inserted here cannot be supplied by a module.
 fn rich(s: &str, max: usize, empty: bool) -> Result<String> {
-    sanitize(s, max, empty, true)
+    sanitize(s, max, empty, true, false)
 }
 fn label(s: &str, max: usize, empty: bool) -> Result<String> {
-    sanitize(s, max, empty, false)
+    sanitize(s, max, empty, false, false)
 }
-fn sanitize(s: &str, max: usize, empty: bool, markdown: bool) -> Result<String> {
+fn discord_timestamp(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix("<t:").and_then(|s| s.strip_suffix('>')) else {
+        return false;
+    };
+    let mut parts = inner.split(':');
+    let seconds = parts.next().unwrap_or("");
+    let style = parts.next();
+    !seconds.is_empty()
+        && seconds.len() <= 12
+        && seconds.bytes().all(|b| b.is_ascii_digit())
+        && seconds.parse::<u64>().is_ok_and(|n| n <= 253_402_300_799)
+        && style.is_none_or(|s| matches!(s, "t" | "T" | "d" | "D" | "f" | "F" | "R"))
+        && parts.next().is_none()
+}
+fn sanitize(s: &str, max: usize, empty: bool, markdown: bool, timestamps: bool) -> Result<String> {
     checked(s, max, empty)?;
     let mut out = String::new();
     for token in s.split_inclusive(char::is_whitespace) {
+        if timestamps && discord_timestamp(token.trim_end()) {
+            out.push_str(token);
+            continue;
+        }
         let domain_like = token
             .split('.')
             .collect::<Vec<_>>()
@@ -540,7 +558,7 @@ pub fn render_private_card(result: &Value) -> Result<PrivateCardPresentation> {
     let mut fields = Vec::new();
     for f in &controls.card.fields {
         let name = rich(&f.name, 256, false)?;
-        let value = rich(&f.value, 1024, !f.members.is_empty())?;
+        let value = sanitize(&f.value, 1024, !f.members.is_empty(), true, true)?;
         total += len(&name) + len(&value);
         fields.push(json!({"name":name,"value":value,"inline":f.inline}));
     }
@@ -565,10 +583,35 @@ pub fn render_private_card(result: &Value) -> Result<PrivateCardPresentation> {
                 &b.operation,
                 &Map::from_iter([(p.option.clone(), json!("value"))]),
             )?;
+            if p.additional_fields.len() > 3 {
+                return Err(invalid());
+            }
+            if let Some(value) = &p.value {
+                checked(value, usize::from(p.max_length), false)?;
+            }
+            let mut field_names = std::collections::HashSet::from([p.option.clone()]);
+            for field in &mut p.additional_fields {
+                field.label = label(&field.label, 45, false)?;
+                field.placeholder = label(&field.placeholder, 100, true)?;
+                if !name(&field.option)
+                    || !(1..=200).contains(&field.max_length)
+                    || b.input.contains_key(&field.option)
+                    || !field_names.insert(field.option.clone())
+                {
+                    return Err(invalid());
+                }
+                if let Some(value) = &field.value {
+                    checked(value, usize::from(field.max_length), false)?;
+                }
+                private_action(
+                    &b.operation,
+                    &Map::from_iter([(field.option.clone(), json!("value"))]),
+                )?;
+            }
             if let Some(select) = &mut p.select {
                 select.label = label(&select.label, 45, false)?;
                 if !name(&select.option)
-                    || select.option == p.option
+                    || field_names.contains(&select.option)
                     || b.input.contains_key(&select.option)
                     || !(1..=25).contains(&select.choices.len())
                 {
@@ -671,6 +714,52 @@ mod private_tests {
             assert!(render_private_card(&bad).is_err());
         }
         v["reply"]["buttons"][0]["prompt"]["option"] = json!("actor_id");
+        assert!(render_private_card(&v).is_err());
+    }
+    #[test]
+    fn schedule_fields_preserve_only_valid_discord_timestamps() {
+        let mut v = card();
+        v["reply"]["card"]["fields"] =
+            json!([{"name":"Starts","value":"<t:4070908800:F>\n<t:4070908800:R>","inline":false}]);
+        let embed = render_private_card(&v).unwrap().embed;
+        assert_eq!(
+            embed["fields"][0]["value"],
+            "<t:4070908800:F>\n<t:4070908800:R>"
+        );
+        for bad in [
+            "<@123>",
+            "<t:1:X>",
+            "<t:1:F:extra>",
+            "<t:999999999999:F>",
+            "<t:-1:F>",
+        ] {
+            v["reply"]["card"]["fields"][0]["value"] = json!(bad);
+            assert!(
+                !render_private_card(&v).unwrap().embed["fields"][0]["value"]
+                    .as_str()
+                    .unwrap()
+                    .contains('<')
+            );
+        }
+    }
+    #[test]
+    fn additional_modal_fields_are_bounded_and_cannot_override_authority() {
+        let mut v = card();
+        let field = json!({"option":"duration","label":"Duration","max_length":40,"value":"90m"});
+        v["reply"]["buttons"][0]["prompt"]["additional_fields"] = json!([field.clone()]);
+        assert!(render_private_card(&v).is_ok());
+        for key in ["count", "id", "actor_id", "guild_id", "expected_revision"] {
+            let mut bad = v.clone();
+            bad["reply"]["buttons"][0]["prompt"]["additional_fields"][0]["option"] = json!(key);
+            assert!(render_private_card(&bad).is_err(), "{key}");
+        }
+        for size in [2, 4] {
+            let mut bad = v.clone();
+            bad["reply"]["buttons"][0]["prompt"]["additional_fields"] =
+                json!(vec![field.clone(); size]);
+            assert!(render_private_card(&bad).is_err());
+        }
+        v["reply"]["buttons"][0]["prompt"]["additional_fields"][0]["value"] = json!("x".repeat(41));
         assert!(render_private_card(&v).is_err());
     }
     #[test]

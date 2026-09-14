@@ -440,7 +440,7 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
     if !host.matches(&semver::Version::new(
         1,
         match manifest.manifest_version {
-            3 => 4,
+            3 => 5,
             2 => 3,
             _ => 0,
         },

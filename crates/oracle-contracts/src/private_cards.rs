@@ -70,6 +70,21 @@ pub struct PrivateCardPrompt {
     pub placeholder: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select: Option<PrivateCardPromptSelect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_fields: Vec<PrivateCardPromptField>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateCardPromptField {
+    pub option: String,
+    pub label: String,
+    pub max_length: u16,
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
