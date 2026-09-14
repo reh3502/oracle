@@ -1,17 +1,27 @@
 //! Separate Oracle SDK executable; its only data input is the operator's snapshot directory.
 mod presentation;
 mod refresh_runtime;
+mod run_api;
 use async_trait::async_trait;
+use dandys_world_core::runs::{
+    domain::EligibilitySnapshot,
+    eligibility,
+    storage::{Limits, RunService},
+};
 use dandys_world_core::{
     query::{QueryEngine, QueryRequest},
     snapshot::{Snapshot, Store},
 };
-use oracle_contracts::ModuleManifest;
+use oracle_contracts::{
+    DocumentWrite, EffectiveConfiguration, GuildEvent, GuildEventKind, GuildId, ModuleDocument,
+    ModuleManifest,
+};
 use oracle_module_sdk::{
-    CallContext, Mode, Module, Result, RpcError, RuntimeConfiguration, TaskScope,
+    CallContext, GuildContext, Mode, Module, Result, RpcError, RuntimeConfiguration, TaskScope,
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -19,8 +29,23 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RunConfiguration {
+    limits: Limits,
+}
+fn run_configuration(values: Value) -> Result<RunConfiguration> {
+    let config: RunConfiguration = serde_json::from_value(values)
+        .map_err(|_| RpcError::Remote("Invalid run configuration".into()))?;
+    config
+        .limits
+        .validate()
+        .map_err(|_| RpcError::Remote("Run limits may only lower the supported ceilings".into()))?;
+    Ok(config)
+}
 struct LoadedCatalog {
     id: String,
+    eligibility: Option<EligibilitySnapshot>,
     engine: QueryEngine,
     entity_count: usize,
     source_count: usize,
@@ -30,7 +55,13 @@ struct LoadedCatalog {
 }
 impl LoadedCatalog {
     fn new(snapshot: Snapshot) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let eligibility = eligibility::from_catalog(&snapshot.id, &snapshot.data, now).ok();
         Self {
+            eligibility,
             quality: {
                 use dandys_world_core::model::EvidenceState;
                 let facts = snapshot.data.entities.iter().flat_map(|e| &e.facts);
@@ -76,6 +107,8 @@ impl LoadedCatalog {
 }
 #[derive(Default)]
 struct DwModule {
+    run_configuration_lock: tokio::sync::RwLock<()>,
+    configuration: RwLock<BTreeMap<GuildId, EffectiveConfiguration>>,
     // Metadata and query index are published and retained together.
     engine: Arc<RwLock<Option<Arc<LoadedCatalog>>>>,
     recovery: Arc<RwLock<&'static str>>,
@@ -132,7 +165,7 @@ impl DwModule {
             .read()
             .unwrap()
             .clone()
-            .ok_or_else(|| RpcError::Remote("Dandy's World snapshot is not loaded".into()))?;
+            .ok_or_else(|| RpcError::Remote("Wiki answers are unavailable; publish a validated snapshot. Existing runs remain available".into()))?;
         let mut response = engine
             .engine
             .execute(request.clone(), now)
@@ -232,19 +265,32 @@ impl Module for DwModule {
         global: TaskScope,
         runtime: RuntimeConfiguration,
     ) -> Result<()> {
-        if mode != Mode::Normal {
-            return Err(RpcError::Remote(
-                "Dandy's World does not provide migrations".into(),
-            ));
+        if mode == Mode::Migration {
+            return Ok(());
         }
-        let directory = runtime.data_directory.filter(|p| p.is_absolute()).ok_or_else(|| RpcError::Remote("Configure an absolute Dandy's World runtime data_directory containing a published snapshot".into()))?;
-        let outcome = Store::new(&directory).and_then(|s| s.load_recovering()).map_err(|_| RpcError::Remote("Cannot load Dandy's World snapshot; publish a validated catalog into its configured data directory".into()))?;
-        *self.engine.write().unwrap() = Some(Arc::new(LoadedCatalog::new(outcome.snapshot)));
-        *self.recovery.write().unwrap() = if outcome.recovered {
-            "Recovered previous snapshot"
-        } else {
-            "Ready"
-        };
+        let directory = runtime
+            .data_directory
+            .filter(|p| p.is_absolute() && p.is_dir())
+            .ok_or_else(|| {
+                RpcError::Remote(
+                    "Configure an existing absolute Dandy's World runtime data_directory".into(),
+                )
+            })?;
+        match Store::new(&directory).and_then(|s| s.load_recovering()) {
+            Ok(outcome) => {
+                *self.engine.write().unwrap() =
+                    Some(Arc::new(LoadedCatalog::new(outcome.snapshot)));
+                *self.recovery.write().unwrap() = if outcome.recovered {
+                    "Recovered previous snapshot"
+                } else {
+                    "Ready"
+                };
+            }
+            Err(_) => {
+                *self.engine.write().unwrap() = None;
+                *self.recovery.write().unwrap() = "Runs available; publish a validated wiki snapshot to restore wiki answers and new setup";
+            }
+        }
         self.disk_bytes.store(
             Store::new(&directory)
                 .and_then(|s| s.disk_usage())
@@ -298,8 +344,9 @@ impl Module for DwModule {
                         }
                         Ok(Ok(None)) => {}
                         _ => {
-                            *recovery.write().unwrap() =
-                                "Snapshot reload failed; retaining loaded snapshot";
+                            *recovery.write().unwrap() = if engine.read().unwrap().is_some() {
+                                "Snapshot reload failed; retaining loaded snapshot"
+                            }else{ "Runs available; publish a validated wiki snapshot to restore wiki answers and new setup" };
                         }
                     }
                 }
@@ -308,20 +355,107 @@ impl Module for DwModule {
             .map_err(|_| RpcError::Remote("Cannot start Dandy's World snapshot monitor".into()))?;
         Ok(())
     }
-    async fn invoke(&self, _context: CallContext, operation: &str, input: Value) -> Result<Value> {
+    async fn invoke(&self, context: CallContext, operation: &str, input: Value) -> Result<Value> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| RpcError::Remote("System clock is unavailable".into()))?
             .as_millis();
-        self.query(
-            operation,
-            input,
-            u64::try_from(now)
-                .map_err(|_| RpcError::Remote("System clock is out of range".into()))?,
+        let now = u64::try_from(now)
+            .map_err(|_| RpcError::Remote("System clock is out of range".into()))?;
+        if operation.starts_with("run_") {
+            let _configuration = self.run_configuration_lock.read().await;
+            let current = self
+                .engine
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|c| c.eligibility.clone());
+            let values = self
+                .configuration
+                .read()
+                .unwrap()
+                .get(context.guild())
+                .map(|c| c.values.clone())
+                .unwrap_or_else(|| json!({}));
+            let limits = run_configuration(values)?.limits;
+            return run_api::invoke(context, operation, input, current, limits, now).await;
+        }
+        self.query(operation, input, now)
+    }
+    async fn deactivate(&self, guild: &GuildId, _epoch: u64) -> Result<()> {
+        self.configuration.write().unwrap().remove(guild);
+        Ok(())
+    }
+    async fn prepare_configuration(
+        &self,
+        _context: GuildContext,
+        _revision: u64,
+        values: Value,
+    ) -> Result<()> {
+        run_configuration(values)?;
+        Ok(())
+    }
+    async fn apply_configuration(
+        &self,
+        context: GuildContext,
+        revision: u64,
+        values: Value,
+    ) -> Result<()> {
+        let _configuration = self.run_configuration_lock.write().await;
+        self.prepare_configuration(context.clone(), revision, values.clone())
+            .await?;
+        self.configuration.write().unwrap().insert(
+            context.guild.clone(),
+            EffectiveConfiguration { revision, values },
+        );
+        Ok(())
+    }
+    async fn effective_configuration(
+        &self,
+        context: GuildContext,
+    ) -> Result<Option<EffectiveConfiguration>> {
+        Ok(self
+            .configuration
+            .read()
+            .unwrap()
+            .get(&context.guild)
+            .cloned())
+    }
+    async fn event(&self, context: CallContext, event: GuildEvent) -> Result<Value> {
+        if event.kind != GuildEventKind::Maintenance || context.actor().is_some() {
+            return Err(RpcError::Remote("Unsupported run event".into()));
+        }
+        // Wall-clock maintenance is independent of snapshot availability and event timestamps.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RpcError::Remote("System clock is unavailable".into()))?
+            .as_millis() as u64;
+        serde_json::to_value(
+            RunService::new(context)
+                .cleanup(now, 32)
+                .await
+                .map_err(|e| RpcError::Remote(e.to_string()))?,
         )
+        .map_err(|_| RpcError::Remote("Invalid cleanup result".into()))
+    }
+    async fn migrate(
+        &self,
+        operation: &str,
+        from: u32,
+        to: u32,
+        documents: Vec<ModuleDocument>,
+    ) -> Result<Vec<DocumentWrite>> {
+        // Version one had no module document collections. Never reinterpret unexpected data.
+        if operation != "migrate_runs" || from != 1 || to != 2 || !documents.is_empty() {
+            return Err(RpcError::Remote(
+                "Unsupported Dandy's World migration".into(),
+            ));
+        }
+        Ok(vec![])
     }
     async fn shutdown(&self) -> Result<()> {
         self.engine.write().unwrap().take();
+        self.configuration.write().unwrap().clear();
         Ok(())
     }
 }

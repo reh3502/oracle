@@ -1,16 +1,20 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "id": "community.dandys-world",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "target": "x86_64-unknown-linux-gnu",
   "protocol_major": 1,
-  "protocol_minor_min": 1,
-  "host_api": "^1.3",
-  "data_version": 1,
+  "protocol_minor_min": 2,
+  "host_api": "^1.4",
+  "data_version": 2,
   "readable_data_versions": [
-    1
+    2
   ],
-  "capabilities": [],
+  "capabilities": [
+    "storage.own",
+    "config.own",
+    "events.guild"
+  ],
   "operations": [
     {
       "name": "search",
@@ -1668,6 +1672,480 @@
       },
       "timeout_ms": 5000,
       "capabilities": []
+    },
+    {
+      "name": "run_create_organized",
+      "description": "run create organized",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "run_create_casual",
+      "description": "run create casual",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "run_change",
+      "description": "run change",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "command": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "edit_draft",
+                  "set_mode",
+                  "publish",
+                  "join",
+                  "switch",
+                  "leave",
+                  "set_allocations",
+                  "rename",
+                  "lock",
+                  "reopen",
+                  "complete",
+                  "cancel",
+                  "remove"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "allocations": {
+                "type": "object",
+                "maxProperties": 8,
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 8
+                }
+              },
+              "host_toon": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "organized",
+                  "casual"
+                ]
+              },
+              "toon": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "member_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "additionalProperties": false
+          },
+          "confirmation": {
+            "type": "object",
+            "properties": {
+              "interaction_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20
+              },
+              "token": {
+                "type": "string",
+                "minLength": 32,
+                "maxLength": 32,
+                "pattern": "^[a-f0-9]{32}$"
+              }
+            },
+            "required": [
+              "interaction_id",
+              "token"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "command"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "run_prepare",
+      "description": "run prepare",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "command": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "edit_draft",
+                  "set_mode",
+                  "publish",
+                  "join",
+                  "switch",
+                  "leave",
+                  "set_allocations",
+                  "rename",
+                  "lock",
+                  "reopen",
+                  "complete",
+                  "cancel",
+                  "remove"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "allocations": {
+                "type": "object",
+                "maxProperties": 8,
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 8
+                }
+              },
+              "host_toon": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "organized",
+                  "casual"
+                ]
+              },
+              "toon": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "member_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "command"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "run_signup",
+      "description": "run signup",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "toon": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "run_leave",
+      "description": "run leave",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "run_view",
+      "description": "run view",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index"
+      ]
+    },
+    {
+      "name": "run_list",
+      "description": "run list",
+      "audience": "member_mutation",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "after": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 9000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index"
+      ]
+    },
+    {
+      "name": "maintenance",
+      "description": "Expire retained run state with fresh host worker authority",
+      "audience": "operator",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object"
+      },
+      "timeout_ms": 30000,
+      "capabilities": [
+        "storage.own"
+      ],
+      "callback_methods": [
+        "host.document_get",
+        "host.document_batch"
+      ],
+      "callback_collections": [
+        "runs",
+        "run_index",
+        "run_receipts"
+      ]
+    },
+    {
+      "name": "migrate_runs",
+      "description": "Initialize run data version two from the empty version one namespace",
+      "audience": "operator",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "array"
+      },
+      "timeout_ms": 30000,
+      "capabilities": []
     }
   ],
   "commands": {
@@ -1909,5 +2387,114 @@
   },
   "runtime": {
     "data_directory_required": true
+  },
+  "required_intents": [
+    "guilds"
+  ],
+  "member_permissions": [
+    "manage_all_runs"
+  ],
+  "subscriptions": [
+    "maintenance"
+  ],
+  "collections": [
+    {
+      "name": "runs",
+      "schema": {
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_index",
+      "schema": {
+        "anyOf": [
+          {
+            "type": "object"
+          },
+          {
+            "type": "array",
+            "maxItems": 700,
+            "items": {
+              "type": "string",
+              "minLength": 8,
+              "maxLength": 8,
+              "pattern": "^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{8}$"
+            },
+            "uniqueItems": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "run_receipts",
+      "schema": {
+        "type": "object"
+      }
+    }
+  ],
+  "migrations": [
+    {
+      "from": 1,
+      "to": 2,
+      "operation": "migrate_runs"
+    }
+  ],
+  "configuration": {
+    "schema_version": 1,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "properties": {
+            "drafts_per_owner": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "published_per_owner": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2
+            },
+            "drafts_per_guild": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20
+            },
+            "published_per_guild": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 50
+            },
+            "published_per_day": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20
+            },
+            "retained_terminal": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 700
+            },
+            "tombstones": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1024
+            },
+            "receipts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "presets": {}
   }
 }

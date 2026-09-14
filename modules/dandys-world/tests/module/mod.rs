@@ -158,11 +158,11 @@ impl Harness {
         assert_eq!(
             self.call(
                 "hello",
-                json!({"protocol_major":1,"protocol_minor":1,"session":"dw-test","generation":7})
+                json!({"protocol_major":1,"protocol_minor":2,"session":"dw-test","generation":7})
             )
             .await
             .unwrap()["protocol_minor"],
-            1
+            2
         );
     }
     async fn initialize(&self, runtime: Value) -> Result<Value> {
@@ -173,7 +173,7 @@ impl Harness {
         .await
     }
     async fn invoke(&self, operation: &str, input: Value) -> Result<Value> {
-        self.call("operation.invoke",json!({"invocation":"opaque-test","session":"dw-test","generation":7,"guild":"123","epoch":2,"operation":operation,"input":input})).await
+        self.call("operation.invoke",json!({"invocation":"opaque-test","session":"dw-test","generation":7,"guild":"123","epoch":2,"operation":operation,"input":input,"member":null})).await
     }
     async fn close(self) {
         self.call("shutdown", json!({})).await.unwrap();
@@ -183,7 +183,8 @@ impl Harness {
     }
 }
 #[tokio::test]
-async fn sdk_lifecycle_requires_snapshot_and_fences_queries_without_callbacks() {
+async fn sdk_lifecycle_keeps_runs_available_without_snapshot_and_fences_queries_without_callbacks()
+{
     let dir = Temp::new();
     let module = Arc::new(DwModule::default());
     let h = Harness::new(module.clone());
@@ -205,17 +206,18 @@ async fn sdk_lifecycle_requires_snapshot_and_fences_queries_without_callbacks() 
             .await
             .is_err()
     );
-    assert!(h.initialize(json!({"data_directory":dir.0})).await.is_err());
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    assert!(module.query("status", json!({}), NOW).is_err());
     let mut data = catalog();
     data.sources[0].validated_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    Store::new(&dir.0)
+    let published = Store::new(&dir.0)
         .unwrap()
         .publish_bytes(&serde_json::to_vec(&data).unwrap())
         .unwrap();
-    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    wait_for_snapshot(&module, &published.id).await;
     h.call("activate", json!({"guild":"123","epoch":2}))
         .await
         .unwrap();
@@ -354,15 +356,14 @@ async fn startup_recovers_previous_and_bad_reload_preserves_loaded_snapshot() {
 fn manifest_exposes_only_typed_member_routes_and_private_health() {
     let m = DwModule::default().manifest();
     assert_eq!(m.id.as_str(), "community.dandys-world");
-    assert_eq!(m.manifest_version, 2);
-    assert_eq!(m.protocol_minor_min, 1);
+    assert_eq!(m.manifest_version, 3);
+    assert_eq!(m.protocol_minor_min, 2);
     assert!(m.runtime.unwrap().data_directory_required);
-    assert!(m.capabilities.is_empty());
-    assert!(
-        m.operations
-            .iter()
-            .all(|o| o.capabilities.is_empty() && o.ai.is_none())
-    );
+    assert_eq!(m.data_version, 2);
+    assert_eq!(m.readable_data_versions, vec![2]);
+    assert!(m.operations.iter().all(|o| o.ai.is_none()
+        && (o.audience != oracle_contracts::ModuleAudience::MemberRead
+            || o.capabilities.is_empty())));
     let routes = m.commands.unwrap().routes;
     assert_eq!(routes.len(), 6);
     for route in routes {
@@ -1186,4 +1187,71 @@ fn image_card_keeps_file_source_separate_from_text_license() {
     response.image = None;
     let plain = presentation::render(&req, &response);
     assert!(serde_json::to_value(plain).unwrap().get("image").is_none());
+}
+
+#[test]
+fn run_wire_rejects_actor_and_revision_substitution() {
+    for value in [
+        json!({"action":"cancel","confirmation":{"actor_id":"900","revision":2}}),
+        json!({"action":"leave","actor":"900"}),
+        json!({"action":"publish","guild":"999"}),
+        json!({"action":"set_mode","mode":"casual","revision":2}),
+    ] {
+        assert!(run_api::command(value).is_err());
+    }
+    assert!(run_api::command(json!({"action":"cancel"})).is_ok());
+    assert!(run_api::command(json!({"action":"remove","member_id":"900"})).is_ok());
+    assert!(run_configuration(json!({})).is_ok());
+    assert!(run_configuration(json!({"limits":{"published_per_guild":0,"receipts":100}})).is_ok());
+    assert!(run_configuration(json!({"limits":{"published_per_guild":51}})).is_err());
+    assert!(run_configuration(json!({"manage_all_runs":["900"]})).is_err());
+}
+#[tokio::test]
+async fn empty_v1_migration_needs_no_snapshot_and_has_no_callbacks() {
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module);
+    h.hello().await;
+    h.call(
+        "initialize",
+        json!({"session":"dw-test","generation":7,"mode":"migration","runtime":{}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        h.call(
+            "migration.transform",
+            json!({"operation":"migrate_runs","from":1,"to":2,"documents":[]})
+        )
+        .await
+        .unwrap(),
+        json!([])
+    );
+    assert!(h.call("migration.transform",json!({"operation":"migrate_runs","from":1,"to":2,"documents":[{"collection":"runs","key":"23456789","revision":1,"value":{}}]})).await.is_err());
+    assert!(h.invoke("run_create_casual", json!({})).await.is_err());
+    h.close().await;
+}
+#[tokio::test]
+async fn run_ingress_requires_outer_actor_before_any_callback() {
+    let dir = Temp::new();
+    Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+        .unwrap();
+    let h = Harness::new(Arc::new(DwModule::default()));
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    h.call("activate", json!({"guild":"123","epoch":2}))
+        .await
+        .unwrap();
+    assert!(
+        h.invoke("run_create_casual", json!({"actor":{"user_id":"900"}}))
+            .await
+            .is_err()
+    );
+    assert!(
+        h.invoke("run_view", json!({"id":"23456789"}))
+            .await
+            .is_err()
+    );
+    h.close().await;
 }
