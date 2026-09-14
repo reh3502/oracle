@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
@@ -148,7 +149,8 @@ async fn call(
     op: &str,
     input: Value,
 ) -> Result<Value> {
-    manager
+    let started = Instant::now();
+    let result = manager
         .invoke_member_mutation_bound(
             &member(guild, user),
             id,
@@ -161,7 +163,22 @@ async fn call(
             binding.epoch,
         )
         .await
-        .map(|reply| reply.value)
+        .map(|reply| reply.value);
+    let elapsed_us = started.elapsed().as_micros();
+    if let Some(path) = std::env::var_os("DW_RUN_METRICS_FILE") {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"operation":op,"elapsed_us":elapsed_us,"success":result.is_ok()})
+        )
+        .unwrap();
+    }
+    result
 }
 async fn change(
     manager: &ModuleManager,
@@ -244,6 +261,8 @@ async fn qualify_ui(
     manager: &ModuleManager,
     guild: &GuildId,
     binding: &ModuleCatalogEntry,
+    data: &Path,
+    catalog: &Value,
 ) -> Vec<(String, Value)> {
     let mut page = call(
         manager,
@@ -282,6 +301,62 @@ async fn qualify_ui(
     let mut set_first = count_input;
     set_first["count"] = json!("2");
     page = ui(manager, guild, binding, "910", set_first).await;
+    // Publish a newly validated catalog while this native process and draft stay live.
+    // The actual snapshot monitor must adopt it; restarting would not test this boundary.
+    let pinned = saved_run(manager, guild, binding, "910", &id).await;
+    let mut refreshed = catalog.clone();
+    refreshed["coverage"]["warnings"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("Native qualification refresh observation"));
+    snapshot(data, &refreshed);
+    let refreshed_id = fs::read_to_string(data.join("active")).unwrap();
+    assert_ne!(pinned["eligibility"]["source_hash"], refreshed_id);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let health = manager
+                .invoke(
+                    &PolicyContext::LocalOperator,
+                    &binding.module,
+                    guild,
+                    "health",
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            if health["reply"]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&refreshed_id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("running snapshot monitor must adopt the new catalog");
+    let fresh = call(
+        manager,
+        guild,
+        binding,
+        "919",
+        &interaction(),
+        "run_create_casual",
+        json!({"name":"Refresh witness"}),
+    )
+    .await
+    .unwrap();
+    let fresh_id = fresh["result"]["run_id"].as_str().unwrap();
+    assert_eq!(
+        saved_run(manager, guild, binding, "919", fresh_id).await["eligibility"]["source_hash"],
+        refreshed_id
+    );
+    assert_eq!(
+        saved_run(manager, guild, binding, "910", &id).await,
+        pinned,
+        "catalog adoption must not rewrite an existing draft or its saved allocations"
+    );
     let mut reachable = BTreeSet::new();
     loop {
         let choices = page["reply"]["buttons"][0]["prompt"]["select"]["choices"]
@@ -934,7 +1009,7 @@ async fn qualify(postgres: bool) {
         saved["publication"]["desired_revision"],
         saved["run"]["desired_card_revision"]
     );
-    let ui_runs = qualify_ui(&manager, &guild, &bound).await;
+    let ui_runs = qualify_ui(&manager, &guild, &bound, &data, &catalog).await;
     for (_, run) in &ui_runs {
         let id = run["id"].as_str().unwrap();
         let source = manager
@@ -1003,6 +1078,71 @@ async fn qualify(postgres: bool) {
             )
             .await
             .is_err()
+    );
+    // Exercise the installed-manifest compatibility gate against real v4 documents.
+    // This deliberately uses the current executable: rejection must happen before
+    // launching an artifact that declares only the older namespace readable.
+    let old_dir = temp.0.join("older-package");
+    fs::create_dir(&old_dir).unwrap();
+    fs::write(old_dir.join("module"), &bytes).unwrap();
+    let mut older = package.clone();
+    older.manifest.version = "0.7.2".into();
+    older.manifest.data_version = 3;
+    older.manifest.readable_data_versions = vec![3];
+    older
+        .manifest
+        .migrations
+        .retain(|migration| migration.to <= 3);
+    fs::write(
+        old_dir.join("package.json"),
+        serde_json::to_vec(&older).unwrap(),
+    )
+    .unwrap();
+    let old = manager.install(&old_dir, true).await.unwrap();
+    let health_before = manager.health().await;
+    assert_eq!(
+        manager
+            .upgrade(&module, &old.digest, Duration::from_secs(3))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::DataVersionMismatch
+    );
+    assert_eq!(
+        manager.health().await[&module]["host"]["pid"],
+        health_before[&module]["host"]["pid"]
+    );
+    assert_eq!(binding(&manager, &guild).await.generation, bound.generation);
+    for (owner, expected) in &ui_runs {
+        assert_eq!(
+            saved_run(
+                &manager,
+                &guild,
+                &bound,
+                owner,
+                expected["id"].as_str().unwrap()
+            )
+            .await,
+            *expected
+        );
+    }
+    assert_eq!(
+        storage
+            .migration_status(&module, &guild)
+            .await
+            .unwrap()
+            .data_version,
+        4
+    );
+    assert!(
+        storage
+            .desired_modules()
+            .await
+            .unwrap()
+            .iter()
+            .any(|desired| desired.module == module
+                && desired.digest == installed.digest
+                && desired.loaded)
     );
     // Kill the actual module after acknowledged writes, then restart with stale
     // evidence. No graceful module shutdown participates in saving assignments.
@@ -1198,9 +1338,12 @@ async fn qualify(postgres: bool) {
     draft["run"]["owner_id"] = json!("903");
     draft["run"]["state"] = json!("draft");
     draft["run"]["assignments"] = json!({});
-    draft["run"]["created_at"] = json!(now() - 2 * DAY);
-    draft["run"]["updated_at"] = json!(now() - 2 * DAY);
-    draft["run"]["last_owner_edit_at"] = json!(now() - 2 * DAY);
+    // One instant: separate clock reads can make the last owner edit newer
+    // than updated_at, producing corrupt input instead of an expired draft.
+    let expired_at = now() - 2 * DAY;
+    draft["run"]["created_at"] = json!(expired_at);
+    draft["run"]["updated_at"] = json!(expired_at);
+    draft["run"]["last_owner_edit_at"] = json!(expired_at);
     draft["run"]["desired_card_revision"] = json!(1);
     let live = storage
         .document_get(&module, &guild, "run_index", "live")
@@ -1208,8 +1351,7 @@ async fn qualify(postgres: bool) {
         .unwrap()
         .unwrap();
     let mut live_value = live.value;
-    live_value[expired_id] =
-        json!({"owner":"903","state":"draft","last_owner_edit_at":now()-2*DAY});
+    live_value[expired_id] = json!({"owner":"903","state":"draft","last_owner_edit_at":expired_at});
     storage
         .document_batch(
             &module,
