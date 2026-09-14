@@ -197,6 +197,81 @@ fn request(
     });
     Ok(request)
 }
+// This marker is presentation data from our own ephemeral message, never an
+// action or a reusable member grant. The host resolves a new view-only request.
+fn owns_private_message(message: &Value, member: &MemberContext, bot: &str) -> bool {
+    if message["author"]["id"] != bot
+        || message["author"]["bot"] != true
+        || message["channel_id"] != member.channel.as_str()
+        || message
+            .get("guild_id")
+            .is_some_and(|v| !v.is_null() && v != member.guild.as_str())
+        || message["webhook_id"].as_str().is_some_and(|id| id != bot)
+        || message["flags"]
+            .as_u64()
+            .is_none_or(|flags| flags & 64 == 0)
+    {
+        return false;
+    }
+    true
+}
+fn modal_updates_parent(
+    message: Option<&Value>,
+    member: &MemberContext,
+    bot: &str,
+) -> Result<bool> {
+    match message {
+        Some(message) if owns_private_message(message, member, bot) => Ok(true),
+        None => Ok(false),
+        Some(_) => Err(Error::InvalidInteraction),
+    }
+}
+fn resume_run_id(message: &Value, member: &MemberContext, bot: &str) -> Result<String> {
+    if !owns_private_message(message, member, bot) {
+        return Err(Error::InvalidInteraction);
+    }
+    let embeds = message["embeds"]
+        .as_array()
+        .ok_or(Error::InvalidInteraction)?;
+    if embeds.len() != 1 {
+        return Err(Error::InvalidInteraction);
+    }
+    let footer = embeds[0]["footer"]["text"]
+        .as_str()
+        .ok_or(Error::InvalidInteraction)?;
+    let id = footer
+        .strip_prefix("Run ")
+        .and_then(|text| text.strip_suffix(" · Saved setup survives expired controls"))
+        .ok_or(Error::InvalidInteraction)?;
+    if id.len() != 8
+        || !id
+            .bytes()
+            .all(|b| b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains(&b))
+    {
+        return Err(Error::InvalidInteraction);
+    }
+    Ok(id.into())
+}
+fn resume_candidate(message: &discord::Message, member: &MemberContext) -> Result<Value> {
+    let value = serde_json::to_value(message).map_err(|_| Error::InvalidInteraction)?;
+    // Fast shape check before acknowledging. Exact bot identity is rechecked
+    // against the trusted reader before resolving any operation.
+    resume_run_id(&value, member, &message.author.id.to_string())?;
+    Ok(value)
+}
+fn validate_resume_request(request: &PublishedRequest, id: &str, interaction: &str) -> Result<()> {
+    let action = request
+        .private_action
+        .as_ref()
+        .ok_or(Error::InvalidInteraction)?;
+    if request.interaction_id.as_deref() != Some(interaction)
+        || action.operation != "run_ui"
+        || Value::Object(action.input.clone()) != json!({"action":"view","id":id,"view":"summary"})
+    {
+        return Err(Error::InvalidInteraction);
+    }
+    Ok(())
+}
 impl DiscordBootstrap {
     #[allow(clippy::too_many_arguments)] // Authenticated interaction and immutable control are separate authority inputs.
     async fn run_private(
@@ -216,6 +291,20 @@ impl DiscordBootstrap {
             .ok_or(Error::InvalidInteraction)?;
         let member = reader.refresh_member(&member).await?;
         s.fence.dispatch(&mut || Ok(()))?;
+        self.run_private_request(request, member, application, token)
+            .await
+    }
+    async fn run_private_request(
+        &self,
+        request: PublishedRequest,
+        member: MemberContext,
+        application: u64,
+        token: &str,
+    ) -> Result<()> {
+        let reader = self
+            .published_reader
+            .as_ref()
+            .ok_or(Error::InvalidInteraction)?;
         let actor = PolicyContext::Discord {
             user: member.user.clone(),
             guild: member.guild.clone(),
@@ -256,6 +345,41 @@ impl DiscordBootstrap {
             .await?;
         Ok(())
     }
+    async fn resume_private(
+        &self,
+        message: Value,
+        member: MemberContext,
+        interaction_id: &str,
+        application: u64,
+        token: &str,
+    ) -> Result<()> {
+        let reader = self
+            .published_reader
+            .as_ref()
+            .ok_or(Error::InvalidInteraction)?;
+        let bot = reader.bot_id().await?;
+        let id = resume_run_id(&message, &member, &bot.to_string())?;
+        let member = reader.refresh_member(&member).await?;
+        let actor = PolicyContext::Discord {
+            user: member.user.clone(),
+            guild: member.guild.clone(),
+            manage_guild: false,
+        };
+        let cancel = CancellationToken::new();
+        let _guard = cancel.clone().drop_guard();
+        let request = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.operations
+                .as_ref()
+                .ok_or(Error::InvalidInteraction)?
+                .resolve_run_resume(&actor, &member, &id, interaction_id, &cancel),
+        )
+        .await
+        .map_err(|_| Error::Transport)??;
+        validate_resume_request(&request, &id, interaction_id)?;
+        self.run_private_request(request, member, application, token)
+            .await
+    }
     pub(super) async fn handle_private_component(
         &self,
         i: &discord::ComponentInteraction,
@@ -281,10 +405,36 @@ impl DiscordBootstrap {
             let (s, a) = self.cards.1.get(id, key, &member)?;
             Ok((member, s, a))
         })();
-        let (member, s, a) =
-            match resolved {
-                Ok(v) => v,
-                Err(_) => return api(i.create_response(
+        let (member, s, a) = match resolved {
+            Ok(v) => v,
+            Err(_) => {
+                if let Ok(member) = super::interactive_cards::identity(
+                    i.guild_id,
+                    i.channel_id,
+                    &i.user,
+                    i.member.as_deref(),
+                ) && let Ok(message) = resume_candidate(&i.message, &member)
+                {
+                    api(i.create_response(http, discord::CreateInteractionResponse::Acknowledge))
+                        .await?;
+                    if self
+                        .resume_private(
+                            message,
+                            member,
+                            &i.id.to_string(),
+                            i.application_id.get(),
+                            i.token.as_str(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        api(i.edit_response(http,discord::EditInteractionResponse::new()
+                                .content("This run could not be reopened. Use /dw run with its run ID to check its current status.")
+                                .allowed_mentions(discord::CreateAllowedMentions::new()))).await?;
+                    }
+                    return Ok(());
+                }
+                return api(i.create_response(
                     http,
                     discord::CreateInteractionResponse::Message(
                         discord::CreateInteractionResponseMessage::new()
@@ -294,8 +444,9 @@ impl DiscordBootstrap {
                             .ephemeral(true),
                     ),
                 ))
-                .await,
-            };
+                .await;
+            }
+        };
         if let Some(p) = &a.prompt {
             let mut child = s.clone();
             child.actions = HashMap::from([("input".into(), a.clone())]);
@@ -440,10 +591,38 @@ impl DiscordBootstrap {
             )?;
             Ok((member, s, a, (text, selected, fields)))
         })();
-        let (member, s, a, input) =
-            match resolved {
-                Ok(v) => v,
-                Err(_) => return api(i.create_response(
+        let (member, s, a, input) = match resolved {
+            Ok(v) => v,
+            Err(_) => {
+                if let Some(original) = i.message.as_deref()
+                    && let Ok(member) = super::interactive_cards::identity(
+                        i.guild_id,
+                        i.channel_id,
+                        &i.user,
+                        i.member.as_deref(),
+                    )
+                    && let Ok(message) = resume_candidate(original, &member)
+                {
+                    api(i.create_response(http, discord::CreateInteractionResponse::Acknowledge))
+                        .await?;
+                    if self
+                        .resume_private(
+                            message,
+                            member,
+                            &i.id.to_string(),
+                            i.application_id.get(),
+                            i.token.as_str(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        api(i.edit_response(http,discord::EditInteractionResponse::new()
+                                .content("This form expired. Reopen /dw run with the run ID; your saved setup is retained.")
+                                .allowed_mentions(discord::CreateAllowedMentions::new()))).await?;
+                    }
+                    return Ok(());
+                }
+                return api(i.create_response(
                     http,
                     discord::CreateInteractionResponse::Message(
                         discord::CreateInteractionResponseMessage::new()
@@ -453,15 +632,30 @@ impl DiscordBootstrap {
                             .ephemeral(true),
                     ),
                 ))
-                .await,
-            };
-        api(i.create_response(
-            http,
+                .await;
+            }
+        };
+        let parent = i
+            .message
+            .as_deref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| Error::InvalidInteraction)?;
+        let reader = self
+            .published_reader
+            .as_ref()
+            .ok_or(Error::InvalidInteraction)?;
+        let bot = reader.bot_id().await?;
+        let response = if modal_updates_parent(parent.as_ref(), &member, &bot.to_string())? {
+            // Component-origin forms edit the same private panel. A deferred new
+            // reply would leave the old editable draft visible after every Save.
+            discord::CreateInteractionResponse::Acknowledge
+        } else {
             discord::CreateInteractionResponse::Defer(
                 discord::CreateInteractionResponseMessage::new().ephemeral(true),
-            ),
-        ))
-        .await?;
+            )
+        };
+        api(i.create_response(http, response)).await?;
         if self
             .run_private(
                 s,
@@ -547,6 +741,80 @@ mod tests {
             )]),
             created: Instant::now(),
         }
+    }
+    #[test]
+    fn component_origin_modal_updates_parent_without_creating_another_draft_panel() {
+        let message = json!({"author":{"id":"999","bot":true},"channel_id":"789",
+            "guild_id":"456","flags":64});
+        assert!(modal_updates_parent(Some(&message), &member(), "999").unwrap());
+        assert!(!modal_updates_parent(None, &member(), "999").unwrap());
+        assert!(modal_updates_parent(Some(&message), &member(), "998").is_err());
+        let mut other = member();
+        other.channel = "790".into();
+        assert!(modal_updates_parent(Some(&message), &other, "999").is_err());
+    }
+    #[test]
+    fn resume_requires_exact_bot_ephemeral_scope_and_canonical_run_footer() {
+        let message = json!({"author":{"id":"999","bot":true},"channel_id":"789",
+            "guild_id":"456","flags":64,"embeds":[{"footer":{"text":"Run ABCD2345 · Saved setup survives expired controls"}}]});
+        assert_eq!(
+            resume_run_id(&message, &member(), "999").unwrap(),
+            "ABCD2345"
+        );
+        assert!(resume_run_id(&message, &member(), "998").is_err());
+        for (field, value) in [
+            ("author", json!({"id":"999","bot":false})),
+            ("channel_id", json!("790")),
+            ("guild_id", json!("457")),
+            ("flags", json!(0)),
+            ("webhook_id", json!("998")),
+        ] {
+            let mut bad = message.clone();
+            bad[field] = value;
+            assert!(resume_run_id(&bad, &member(), "999").is_err(), "{field}");
+        }
+        for footer in [
+            "Run abcd2345 · Saved setup survives expired controls",
+            "Run ABCD1234 · Saved setup survives expired controls",
+            "Run ABCD2345 · Saved setup survives expired controls\nanything",
+            "Run ABCD2345",
+            "Run ABCD2345 · cancel",
+        ] {
+            let mut bad = message.clone();
+            bad["embeds"][0]["footer"]["text"] = json!(footer);
+            assert!(resume_run_id(&bad, &member(), "999").is_err(), "{footer}");
+        }
+    }
+    #[test]
+    fn expired_or_restarted_controls_can_only_recover_a_fresh_summary() {
+        let cards = PrivateCards::default();
+        let mut old = session();
+        old.created = Instant::now() - TTL;
+        old.actions
+            .get_mut("b0")
+            .unwrap()
+            .input
+            .insert("action".into(), json!("cancel"));
+        let id = cards.insert(old).unwrap();
+        assert!(cards.get(&id, "b0", &member()).is_err());
+        assert!(PrivateCards::default().get(&id, "b0", &member()).is_err());
+        let mut fresh = session().request;
+        fresh.interaction_id = Some("111".into());
+        fresh.private_action = Some(PrivateAction {
+            operation: "run_ui".into(),
+            input: json!({"action":"view","id":"ABCD2345","view":"summary"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        });
+        assert!(validate_resume_request(&fresh, "ABCD2345", "111").is_ok());
+        fresh
+            .private_action
+            .as_mut()
+            .unwrap()
+            .input
+            .insert("action".into(), json!("cancel"));
+        assert!(validate_resume_request(&fresh, "ABCD2345", "111").is_err());
     }
     #[test]
     fn reusable_owner_controls_keep_pinned_inputs_and_use_new_interaction_identity() {

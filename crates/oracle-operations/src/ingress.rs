@@ -94,6 +94,21 @@ pub enum OperationRequest {
 
 #[async_trait]
 pub trait HumanOperations: Send + Sync {
+    /// Trusted private-card recovery: resolve only a fresh run view, never replay
+    /// an expired control action or inherit its old invocation authority.
+    async fn resolve_run_resume(
+        &self,
+        _context: &PolicyContext,
+        _member: &oracle_core::member_read::MemberContext,
+        _run_id: &str,
+        _interaction_id: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<PublishedRequest> {
+        Err(oracle_core::Error::new(
+            oracle_core::ErrorCode::ForbiddenPermission,
+        ))
+    }
+
     async fn resolve_shared(
         &self,
         _context: &PolicyContext,
