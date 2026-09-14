@@ -70,6 +70,17 @@ fn run(start: u64) -> Run {
     run
 }
 #[test]
+fn monday_run_announces_the_previous_monday_before_its_day_before_reminder() {
+    let run = run(ms(2026, 9, 21, 22));
+    let times = ReminderTimes::for_run(&run, &config()).unwrap().unwrap();
+    assert_eq!(times.signups_open, ms(2026, 9, 14, 16));
+    assert_eq!(
+        times.due(&run, times.signups_open),
+        Some(ReminderKind::SignupsOpen)
+    );
+}
+
+#[test]
 fn friday_eight_pm_uses_monday_noon_and_absolute_offsets_across_dst() {
     for (start, monday) in [
         (ms(2026, 9, 19, 0), ms(2026, 9, 14, 16)),

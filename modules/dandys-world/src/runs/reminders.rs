@@ -54,7 +54,7 @@ impl ReminderTimes {
             .from_local_datetime(&monday.and_hms_opt(12, 0, 0).ok_or(Error::InvalidInput)?)
             .single()
             .ok_or(Error::InvalidInput)?;
-        if noon >= start {
+        if noon >= start - chrono::Duration::hours(24) {
             let previous = monday
                 .checked_sub_days(Days::new(7))
                 .ok_or(Error::InvalidInput)?;
