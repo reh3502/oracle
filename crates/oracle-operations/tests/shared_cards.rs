@@ -404,3 +404,44 @@ async fn reusable_controls_are_bound_to_message_scope_and_repost() {
     drop(journal);
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn proven_unsent_effect_can_retry_without_losing_newer_intent() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Storage::open(DatabaseConfig::Sqlite {
+        path: temp.path().join("unsent.sqlite"),
+    })
+    .await
+    .unwrap();
+    let guild = GuildId::new("123").unwrap();
+    let module = ModuleId::new("test.runs").unwrap();
+    store
+        .initialize_guilds(std::slice::from_ref(&guild))
+        .await
+        .unwrap();
+    let journal = SharedCardJournal::new(Arc::new(store));
+    journal
+        .enqueue(&guild, &module, "abcd1234", intent(1))
+        .await
+        .unwrap();
+    let send = effect(1, None);
+    journal.prepare(send.clone()).await.unwrap();
+    journal
+        .enqueue(&guild, &module, "abcd1234", intent(2))
+        .await
+        .unwrap();
+    let record = journal
+        .settle(
+            &send,
+            SharedObservation::NotSent {
+                reason: ErrorCode::Cancelled,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.phase, SharedPhase::Pending);
+    assert_eq!(record.desired.desired_revision, 2);
+    assert!(record.effect.is_none());
+    assert!(record.identity.is_none());
+    journal.prepare(effect(2, None)).await.unwrap();
+}

@@ -257,7 +257,12 @@ impl SharedCardTransport for DiscordSharedCards {
         cancel: CancellationToken,
     ) -> Result<SharedObservation> {
         validate_effect(effect)?;
-        let fence = self.authority.authorize(effect).await?;
+        let fence = match self.authority.authorize(effect).await {
+            Ok(fence) => fence,
+            Err(error) => {
+                return Ok(SharedObservation::NotSent { reason: error.code });
+            }
+        };
         let guard = SendGuard::with_fence(cancel.clone(), now() + 60, fence);
         let fresh = SharedFresh {
             transport: self,
@@ -308,6 +313,9 @@ impl SharedCardTransport for DiscordSharedCards {
             }
             Ok(response) if matches!(response.status, 400 | 401 | 403 | 404 | 405 | 413 | 429) => {
                 Ok(SharedObservation::Rejected)
+            }
+            Err(error) if !guard.request_started() => {
+                Ok(SharedObservation::NotSent { reason: error.code })
             }
             // A lost ACK or a 5xx may have committed. Never execute the effect again.
             _ => self.observe(effect, cancel).await,

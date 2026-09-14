@@ -188,6 +188,9 @@ impl SharedCards {
             .execute(&effect, cancel.child_token())
             .await
             .unwrap_or(SharedObservation::Unknown);
+        if let SharedObservation::NotSent { reason } = &observed {
+            tracing::warn!(%guild,%module,run=%id,error=?reason,"shared card deferred before request submission");
+        }
         self.journal.settle(&effect, observed).await?;
         Ok(())
     }

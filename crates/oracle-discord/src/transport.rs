@@ -281,6 +281,7 @@ impl DiscordWriteClient {
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload)))
             .map_err(|_| error(ErrorCode::InvalidInput))?;
+        guard.mark_request_started()?;
         let response = sender
             .send_request(request)
             .await
@@ -509,6 +510,26 @@ mod tests {
             assert!(!valid_write_path(&Method::PATCH, path));
         }
     }
+    #[tokio::test]
+    async fn preflight_failure_proves_no_request_started() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = client(listener.local_addr().unwrap());
+        let gate = guard();
+        assert!(
+            client
+                .execute(
+                    Method::POST,
+                    "/api/v10/channels/123/messages",
+                    &serde_json::json!({}),
+                    &gate,
+                    &Fresh(false)
+                )
+                .await
+                .is_err()
+        );
+        assert!(!gate.request_started());
+        assert!(!gate.clone().request_started());
+    }
     struct ReplyRegistry(std::sync::atomic::AtomicBool);
     impl oracle_operations::executor::DispatchFence for ReplyRegistry {
         fn dispatch(&self, send: &mut dyn FnMut() -> Result<()>) -> Result<()> {
@@ -551,17 +572,19 @@ mod tests {
             }
         });
         let fresh = CountFresh(std::sync::atomic::AtomicUsize::new(0));
+        let gate = guard();
         let result = client
             .execute(
                 Method::PATCH,
                 "/api/v10/webhooks/123/abc.def/messages/@original",
                 &json!({"content":"reply","allowed_mentions":{"parse":[]},"flags":68}),
-                &guard(),
+                &gate,
                 &fresh,
             )
             .await
             .unwrap();
         assert_eq!(result.status, 200);
+        assert!(gate.clone().request_started());
         assert_eq!(fresh.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         server.await.unwrap();
     }
@@ -705,17 +728,19 @@ mod tests {
                     .is_err()
             );
         });
+        let gate = guard();
         let error = client
             .execute(
                 Method::POST,
                 "/api/v10/guilds/100/channels",
                 &json!({}),
-                &guard(),
+                &gate,
                 &Fresh(true),
             )
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::UnknownOutcome);
+        assert!(gate.request_started());
         assert_eq!(error.diagnostic().detail, Some(ErrorDetail::HttpFailure));
         server.await.unwrap();
     }

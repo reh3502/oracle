@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
@@ -41,6 +44,7 @@ fn actor(context: &PolicyContext) -> String {
 #[derive(Clone)]
 pub struct SendGuard {
     revoked: Arc<Mutex<bool>>,
+    request_started: Arc<AtomicBool>,
     cancel: CancellationToken,
     expires_at: u64,
     fence: Option<Arc<dyn DispatchFence>>,
@@ -52,6 +56,7 @@ impl SendGuard {
     pub fn new(cancel: CancellationToken, expires_at: u64) -> Self {
         Self {
             revoked: Arc::new(Mutex::new(false)),
+            request_started: Arc::new(AtomicBool::new(false)),
             cancel,
             expires_at,
             fence: None,
@@ -64,10 +69,22 @@ impl SendGuard {
     ) -> Self {
         Self {
             revoked: Arc::new(Mutex::new(false)),
+            request_started: Arc::new(AtomicBool::new(false)),
             cancel,
             expires_at,
             fence: Some(fence),
         }
+    }
+    /// Mark immediately before submitting an HTTP request, never during preflight.
+    /// All clones share this evidence; cancellation before it proves no request started.
+    pub fn mark_request_started(&self) -> Result<()> {
+        self.dispatch(|| {
+            self.request_started.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    pub fn request_started(&self) -> bool {
+        self.request_started.load(Ordering::SeqCst)
     }
     pub fn revoke(&self) {
         *self.revoked.lock().unwrap() = true;

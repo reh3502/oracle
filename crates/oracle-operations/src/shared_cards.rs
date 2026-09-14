@@ -59,6 +59,8 @@ pub enum SharedObservation {
     Missing,
     /// The remote request was definitively rejected, with no side effect.
     Rejected,
+    /// Transport proved that no HTTP request was submitted. Safe to retry.
+    NotSent { reason: ErrorCode },
     /// Includes incomplete history, multiple matches and inaccessible channels.
     Unknown,
 }
@@ -484,6 +486,7 @@ impl SharedCardJournal {
                 }
                 SharedObservation::Missing => return Err(Error::new(ErrorCode::Integrity)),
                 SharedObservation::Rejected => record.phase = SharedPhase::Rejected,
+                SharedObservation::NotSent { .. } => record.phase = SharedPhase::Pending,
             }
             record.effect = None;
             match self.save(&effect.guild, Some(revision), &record).await {
