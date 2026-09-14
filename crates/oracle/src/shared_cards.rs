@@ -1,4 +1,6 @@
 //! Host composition for durable module projections and reusable public controls.
+mod reminders;
+
 use crate::{config::SharedCardDestination, host::Host};
 use async_trait::async_trait;
 use oracle_core::*;
@@ -20,6 +22,9 @@ pub(crate) struct SharedCards {
     cursor: std::sync::Mutex<usize>,
 }
 impl SharedCards {
+    pub async fn run_reminders(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
+        reminders::run(self, cancel).await
+    }
     pub fn new(
         host: &Arc<Host>,
         adapter: Arc<DiscordOperations>,
@@ -100,8 +105,16 @@ impl SharedCards {
                 .effect
                 .as_ref()
                 .ok_or_else(|| Error::new(ErrorCode::Integrity))?;
-            let observed = transport
-                .observe(effect, cancel.child_token())
+            // Deleting the same journal-bound message is idempotent. Creates and
+            // edits still require read-only recovery and are never blindly replayed.
+            let recovery = async {
+                if effect.payload.is_null() {
+                    transport.execute(effect, cancel.child_token()).await
+                } else {
+                    transport.observe(effect, cancel.child_token()).await
+                }
+            };
+            let observed = recovery
                 .await
                 .unwrap_or_else(|error| {
                     tracing::debug!(%guild,%module,run=%id,error=?error.code,"shared card observation unavailable");
@@ -115,6 +128,19 @@ impl SharedCards {
         let intent: SharedIntent = serde_json::from_value(source.intent)
             .map_err(|_| Error::new(ErrorCode::InvalidInput))?;
         record = self.journal.enqueue(guild, module, id, intent).await?;
+        if record.desired.delete {
+            if record.phase == SharedPhase::Confirmed {
+                return Ok(());
+            }
+            if record.effect.is_none()
+                && (record.identity.is_none() || record.phase == SharedPhase::Missing)
+            {
+                self.journal
+                    .complete_unpublished_delete(guild, module, id)
+                    .await?;
+                return Ok(());
+            }
+        }
         if record.phase == SharedPhase::Confirmed {
             let identity = record
                 .identity
@@ -148,6 +174,30 @@ impl SharedCards {
         let channel = self.destination(guild, module, &record.desired.destination)?;
         let target = self.adapter.shared_target(guild, channel, cancel).await?;
         let effect_id = uuid::Uuid::new_v4().to_string();
+        if record.desired.delete {
+            let identity = record
+                .identity
+                .as_ref()
+                .ok_or_else(|| Error::new(ErrorCode::Integrity))?;
+            let effect = SharedEffect {
+                effect_id: effect_id.clone(),
+                guild: guild.clone(),
+                module: module.clone(),
+                run_id: id.into(),
+                target,
+                message_id: Some(identity.message_id.clone()),
+                desired_revision: record.desired.desired_revision,
+                marker: format!("oracle-shared:{effect_id}"),
+                payload: Value::Null,
+            };
+            self.journal.prepare(effect.clone()).await?;
+            let observed = transport
+                .execute(&effect, cancel.child_token())
+                .await
+                .unwrap_or(SharedObservation::Unknown);
+            self.journal.settle(&effect, observed).await?;
+            return Ok(());
+        }
         let version = record
             .identity
             .as_ref()
@@ -203,6 +253,15 @@ fn status(record: &SharedRecord) -> Value {
 }
 #[async_trait]
 impl SharedCardService for SharedCards {
+    async fn run_reminder(
+        &self,
+        module: &ModuleId,
+        guild: &GuildId,
+        key: &str,
+        document: Value,
+    ) -> Result<Value> {
+        reminders::process(self, module, guild, key, document).await
+    }
     async fn enqueue(&self, module: &ModuleId, guild: &GuildId, intent: Value) -> Result<Value> {
         if serde_json::to_vec(&intent)
             .map_err(|_| Error::new(ErrorCode::InvalidInput))?
@@ -243,6 +302,24 @@ impl SharedCardAuthority for SharedCards {
             .await?;
         let intent: SharedIntent = serde_json::from_value(source.intent)
             .map_err(|_| Error::new(ErrorCode::InvalidInput))?;
+        if effect.payload.is_null() {
+            let (_, saved) = self
+                .journal
+                .get(&effect.guild, &effect.module, &effect.run_id)
+                .await?
+                .ok_or_else(|| Error::new(ErrorCode::ForbiddenScope))?;
+            if !intent.delete
+                || !saved.desired.delete
+                || saved.phase != SharedPhase::Unknown
+                || saved.effect.as_ref() != Some(effect)
+                || saved.identity.as_ref().is_none_or(|identity| {
+                    effect.message_id.as_ref() != Some(&identity.message_id)
+                        || effect.target != identity.target
+                })
+            {
+                return Err(Error::new(ErrorCode::ForbiddenScope));
+            }
+        }
         if self.destination(&effect.guild, &effect.module, &intent.destination)?
             != effect.target.channel_id
         {

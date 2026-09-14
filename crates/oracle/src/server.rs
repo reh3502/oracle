@@ -169,6 +169,16 @@ async fn run(
         })
         .map_err(|_| Error::new(ErrorCode::Cancelled))?;
     if let Some(shared) = host.shared_cards.get().cloned() {
+        let reminder_stop = stop.clone();
+        let reminders = shared.clone();
+        tasks
+            .spawn("run_reminders", async move {
+                reminders
+                    .run_reminders(reminder_stop)
+                    .await
+                    .map_err(|_| TaskError)
+            })
+            .map_err(|_| Error::new(ErrorCode::Cancelled))?;
         let shared_stop = stop.clone();
         tasks
             .spawn("shared_cards", async move {
