@@ -488,7 +488,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let upgraded = Storage::open_with_options(source.clone(), tools, &backups)
         .await
         .unwrap();
-    assert_eq!(upgraded.schema_version().await.unwrap(), 4);
+    assert_eq!(upgraded.schema_version().await.unwrap(), 5);
     assert_eq!(upgraded.status(None).await.unwrap().deployment, original);
     let bundles: Vec<_> = std::fs::read_dir(&backups).unwrap().collect();
     assert_eq!(bundles.len(), 1);
@@ -502,7 +502,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let restored = Storage::restore(destination.clone(), &old_bundle, tools)
         .await
         .unwrap();
-    assert_eq!(restored.schema_version().await.unwrap(), 4);
+    assert_eq!(restored.schema_version().await.unwrap(), 5);
     let status = restored.status(None).await.unwrap();
     assert_ne!(status.deployment, original);
     assert!(status.guilds[0].paused);
@@ -551,7 +551,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let upgraded2 = Storage::open_with_options(source2.clone(), tools, &backups2)
         .await
         .unwrap();
-    assert_eq!(upgraded2.schema_version().await.unwrap(), 4);
+    assert_eq!(upgraded2.schema_version().await.unwrap(), 5);
     let bundles2: Vec<_> = std::fs::read_dir(&backups2).unwrap().collect();
     assert_eq!(bundles2.len(), 1);
     let saved2: BackupManifest = serde_json::from_slice(
@@ -564,7 +564,7 @@ pub(super) async fn upgrades(base: &DatabaseConfig, root: &Path, tools: &PgTools
     let restored2 = Storage::restore(destination2.clone(), &stage2_bundle, tools)
         .await
         .unwrap();
-    assert_eq!(restored2.schema_version().await.unwrap(), 4);
+    assert_eq!(restored2.schema_version().await.unwrap(), 5);
     restored2.close().await.unwrap();
     drop(restored2);
     remove_isolated(base, &source2).await;
@@ -578,12 +578,13 @@ pub(super) async fn workflow_upgrade(
     base: &DatabaseConfig,
     root: &Path,
     tools: &PgTools,
+    source_version: i64,
 ) -> Result<()> {
     use oracle_core::WorkflowRepository;
-    let source = isolated(base, root, "stage3-source").await;
-    let destination = isolated(base, root, "stage3-restore").await;
+    let source = isolated(base, root, &format!("schema{source_version}-source")).await;
+    let destination = isolated(base, root, &format!("schema{source_version}-restore")).await;
     let raw = Storage::connect(normalize(source.clone())?, None).await?;
-    // Build the shipped v3 schema from immutable SQL, independently of fresh init.
+    // Build the shipped schema from immutable SQL, independently of fresh init.
     write_tx!(&raw, tx, {
         sqlx::query(
             "CREATE TABLE oracle_migrations(version BIGINT PRIMARY KEY,checksum TEXT NOT NULL)",
@@ -595,7 +596,11 @@ pub(super) async fn workflow_upgrade(
             (1, MIGRATION),
             (2, raw.second_migration()),
             (3, raw.third_migration()),
+            (4, raw.fourth_migration()),
         ] {
+            if version > source_version {
+                continue;
+            }
             sqlx::raw_sql(sql).execute(&mut *tx).await.map_err(db)?;
             sqlx::query("INSERT INTO oracle_migrations(version,checksum) VALUES($1,$2)")
                 .bind(version as i64)
@@ -613,12 +618,19 @@ pub(super) async fn workflow_upgrade(
     })?;
     let guild = GuildId::new("123").unwrap();
     raw.initialize_guilds(std::slice::from_ref(&guild)).await?;
-    let kinds = [
+    let mut kinds = vec![
         WorkflowKind::StructurePlan,
         WorkflowKind::ResourceBinding,
         WorkflowKind::CommandBinding,
         WorkflowKind::Configuration,
     ];
+    if source_version == 4 {
+        kinds.extend([
+            WorkflowKind::AgentRun,
+            WorkflowKind::AgentCall,
+            WorkflowKind::AgentSpend,
+        ]);
+    }
     for kind in kinds {
         raw.workflow_put(
             &guild,
@@ -647,7 +659,17 @@ pub(super) async fn workflow_upgrade(
         WorkflowKind::AgentRun,
         WorkflowKind::AgentCall,
         WorkflowKind::AgentSpend,
+        WorkflowKind::CommandGroup,
+        WorkflowKind::SharedCard,
     ] {
+        if source_version == 4
+            && matches!(
+                kind,
+                WorkflowKind::AgentRun | WorkflowKind::AgentCall | WorkflowKind::AgentSpend
+            )
+        {
+            continue;
+        }
         assert!(
             raw.workflow_put(&guild, kind, "agent", None, &json!(null))
                 .await
@@ -657,7 +679,7 @@ pub(super) async fn workflow_upgrade(
     let original = raw.status(None).await?.deployment;
     raw.close().await?;
     drop(raw);
-    let blocked = root.join("stage3-backup-blocked");
+    let blocked = root.join(format!("schema{source_version}-backup-blocked"));
     std::fs::write(&blocked, b"occupied").unwrap();
     assert!(
         Storage::open_with_options(source.clone(), tools, &blocked)
@@ -665,7 +687,7 @@ pub(super) async fn workflow_upgrade(
             .is_err()
     );
     let raw = Storage::connect(normalize(source.clone())?, None).await?;
-    assert_eq!(raw.schema_version().await?, 3);
+    assert_eq!(raw.schema_version().await?, source_version);
     assert_eq!(
         rows!(
             &raw,
@@ -682,9 +704,9 @@ pub(super) async fn workflow_upgrade(
             Ok(_) => panic!("PostgreSQL schema3 guessed backup destination"),
         }
     }
-    let backups = root.join("stage3-upgrade-backups");
+    let backups = root.join(format!("schema{source_version}-upgrade-backups"));
     let upgraded = Storage::open_with_options(source.clone(), tools, &backups).await?;
-    assert_eq!(upgraded.schema_version().await?, 4);
+    assert_eq!(upgraded.schema_version().await?, 5);
     assert_eq!(upgraded.status(None).await?.deployment, original);
     assert_eq!(
         rows!(
@@ -699,7 +721,10 @@ pub(super) async fn workflow_upgrade(
     let bundle = bundles[0].as_ref().unwrap().path();
     let manifest: BackupManifest =
         serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest.migrations, upgraded.expected_migrations()[..3]);
+    assert_eq!(
+        manifest.migrations,
+        upgraded.expected_migrations()[..source_version as usize]
+    );
     workflow_tests::agent_records(&upgraded).await;
     upgraded.close().await?;
     drop(upgraded);
@@ -709,7 +734,7 @@ pub(super) async fn workflow_upgrade(
     drop(reopened);
     // Restore the actual mandatory pre-upgrade v3 native backup under its guard.
     let restored = Storage::restore(destination.clone(), &bundle, tools).await?;
-    assert_eq!(restored.schema_version().await?, 4);
+    assert_eq!(restored.schema_version().await?, 5);
     assert_eq!(
         rows!(
             &restored,

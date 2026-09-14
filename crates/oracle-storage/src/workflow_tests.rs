@@ -169,10 +169,12 @@ pub(super) async fn restored(store: &Storage) {
     );
 }
 
-const AGENT_KINDS: [(WorkflowKind, &str); 3] = [
+const AGENT_KINDS: [(WorkflowKind, &str); 5] = [
     (WorkflowKind::AgentRun, "agent_run"),
     (WorkflowKind::AgentCall, "agent_call"),
     (WorkflowKind::AgentSpend, "agent_spend"),
+    (WorkflowKind::CommandGroup, "command_group"),
+    (WorkflowKind::SharedCard, "shared_card"),
 ];
 
 pub(super) async fn agent_records(store: &Storage) {
