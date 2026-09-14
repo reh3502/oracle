@@ -136,6 +136,9 @@ pub struct Run {
     #[serde(default)]
     pub schedule: Option<RunSchedule>,
     pub assignments: BTreeMap<String, Assignment>,
+    /// Benched players retain their Toon but consume no active place.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bench: BTreeMap<String, Assignment>,
     pub eligibility: EligibilitySnapshot,
     pub created_at: u64,
     pub updated_at: u64,
@@ -189,6 +192,10 @@ pub enum Command {
     SetSchedule {
         schedule: RunSchedule,
     },
+    Restore {
+        member_id: String,
+        toon: Option<String>,
+    },
     Lock,
     Reopen,
     Complete,
@@ -225,6 +232,7 @@ impl<'de> Deserialize<'de> for Command {
             "set_schedule" => &["action", "schedule"],
             "cancel" => &["action", "confirmation"],
             "remove" => &["action", "member_id", "confirmation"],
+            "restore" => &["action", "member_id", "toon"],
             "publish" | "leave" | "lock" | "reopen" | "complete" => &["action"],
             _ => return Err(D::Error::custom("unknown command action")),
         };
@@ -283,6 +291,8 @@ pub enum Error {
     ScheduleRequired,
     #[error("choose a start time in the future")]
     StartInPast,
+    #[error("you are on the bench; ask the host to restore your place")]
+    Benched,
     #[error("private confirmation is required")]
     ConfirmationRequired,
     #[error("the run or actor changed; review a fresh private confirmation")]
@@ -335,6 +345,7 @@ impl Run {
             host_toon: None,
             schedule: None,
             assignments: BTreeMap::new(),
+            bench: BTreeMap::new(),
             eligibility,
             created_at: now,
             updated_at: now,
@@ -370,6 +381,7 @@ impl Run {
             || self
                 .terminal_at
                 .is_some_and(|t| t < self.created_at || t > self.updated_at)
+            || self.bench.len() > 80
             || self.assignments.len() > MAX_PLAYERS
             || (self.state == RunState::Draft && !self.assignments.is_empty())
         {
@@ -399,6 +411,18 @@ impl Run {
                 return Err(Error::InvalidInput);
             }
             self.validate_selection(assignment.toon.as_deref())?;
+        }
+        for (member, assignment) in &self.bench {
+            if !valid_member_id(member)
+                || self.assignments.contains_key(member)
+                || assignment.joined_at < self.created_at
+                || assignment.joined_at > self.updated_at
+            {
+                return Err(Error::InvalidInput);
+            }
+            if let Some(toon) = &assignment.toon {
+                self.validate_toon(toon)?;
+            }
         }
         if serde_json::to_vec(self)
             .map_err(|_| Error::InvalidInput)?
@@ -487,6 +511,9 @@ impl Run {
     ) -> Result<(), Error> {
         if self.state != RunState::Open {
             return Err(Error::Closed);
+        }
+        if self.bench.contains_key(&actor.user_id) {
+            return Err(Error::Benched);
         }
         self.validate_selection(toon.as_deref())?;
         let existing = self.assignments.get(&actor.user_id);
@@ -678,6 +705,22 @@ pub fn apply(
                     }
                     next.schedule = Some(schedule.clone());
                 }
+                Command::Restore { member_id, toon } => {
+                    if !valid_member_id(member_id) || !run.bench.contains_key(member_id) {
+                        return Err(Error::InvalidInput);
+                    }
+                    next.bench.remove(member_id);
+                    next.assign(
+                        &Actor {
+                            guild_id: actor.guild_id.clone(),
+                            user_id: member_id.clone(),
+                            manage_all_runs: false,
+                        },
+                        toon,
+                        now,
+                        false,
+                    )?;
+                }
                 Command::Rename { name } => {
                     if run.state.is_terminal() {
                         return Err(Error::Closed);
@@ -725,6 +768,7 @@ pub fn apply(
                         return Err(Error::Closed);
                     }
                     next.assignments.remove(member_id);
+                    next.bench.remove(member_id);
                 }
                 Command::Join { .. } | Command::Switch { .. } | Command::Leave => unreachable!(),
             }
@@ -748,4 +792,44 @@ pub fn apply(
         card_revision: next.desired_card_revision,
     };
     Ok((next, outcome))
+}
+
+/// Maintenance-only transition. The caller supplies a host-verified closed
+/// attendance result, and commits this aggregate with its settlement receipt.
+pub fn bench_absent(
+    run: &Run,
+    expected: &BTreeMap<String, Assignment>,
+    confirmed: &std::collections::BTreeSet<String>,
+    starts_at: i64,
+    deadline: u64,
+    now: u64,
+) -> Result<Run, Error> {
+    run.validate()?;
+    if now < deadline || now < run.updated_at || expected.len() > MAX_PLAYERS {
+        return Err(Error::InvalidInput);
+    }
+    if !matches!(run.state, RunState::Open | RunState::Locked)
+        || run.schedule.as_ref().map(|s| s.starts_at) != Some(starts_at)
+    {
+        return Ok(run.clone());
+    }
+    let mut next = run.clone();
+    for (member, assignment) in expected {
+        if !confirmed.contains(member)
+            && let Some(current) = run.assignments.get(member)
+            && current.joined_at == assignment.joined_at
+        {
+            next.assignments.remove(member);
+            next.bench.insert(member.clone(), current.clone());
+        }
+    }
+    if next != *run {
+        next.updated_at = now;
+        next.desired_card_revision = next
+            .desired_card_revision
+            .checked_add(1)
+            .ok_or(Error::InvalidInput)?;
+    }
+    next.validate()?;
+    Ok(next)
 }

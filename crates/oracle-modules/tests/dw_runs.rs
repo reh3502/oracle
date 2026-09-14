@@ -835,7 +835,7 @@ async fn qualify(postgres: bool) {
             .await
             .unwrap()
             .data_version,
-        4
+        5
     );
     let bound = binding(&manager, &guild).await;
     assert!(
@@ -1086,7 +1086,7 @@ async fn qualify(postgres: bool) {
             .await
             .is_err()
     );
-    // Exercise the installed-manifest compatibility gate against real v4 documents.
+    // Exercise the installed-manifest compatibility gate against real v5 documents.
     // This deliberately uses the current executable: rejection must happen before
     // launching an artifact that declares only the older namespace readable.
     let old_dir = temp.0.join("older-package");
@@ -1139,7 +1139,7 @@ async fn qualify(postgres: bool) {
             .await
             .unwrap()
             .data_version,
-        4
+        5
     );
     assert!(
         storage
@@ -1363,7 +1363,7 @@ async fn qualify(postgres: bool) {
         .document_batch(
             &module,
             &guild,
-            4,
+            5,
             &[
                 DocumentWrite {
                     collection: "runs".into(),

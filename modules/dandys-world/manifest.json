@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
   "id": "community.dandys-world",
-  "version": "0.7.6",
+  "version": "0.8.0",
   "target": "x86_64-unknown-linux-gnu",
   "protocol_major": 1,
   "protocol_minor_min": 2,
-  "host_api": "^1.5",
-  "data_version": 4,
+  "host_api": "^1.6",
+  "data_version": 5,
   "readable_data_versions": [
-    4
+    5
   ],
   "capabilities": [
     "storage.own",
@@ -2332,7 +2332,8 @@
                   "set_allocation",
                   "remove_allocation",
                   "set_host_toon",
-                  "set_schedule"
+                  "set_schedule",
+                  "restore"
                 ]
               },
               "name": {
@@ -2783,7 +2784,8 @@
                   "remove",
                   "set_allocation",
                   "remove_allocation",
-                  "set_host_toon"
+                  "set_host_toon",
+                  "restore"
                 ]
               },
               "name": {
@@ -4420,7 +4422,8 @@
         "host.document_get",
         "host.document_batch",
         "host.shared_card_enqueue",
-        "host.shared_card_status"
+        "host.shared_card_status",
+        "host.run_reminder"
       ],
       "callback_collections": [
         "runs",
@@ -4473,7 +4476,8 @@
               "prepare_remove",
               "confirm_remove",
               "repost",
-              "set_schedule"
+              "set_schedule",
+              "restore"
             ]
           },
           "id": {
@@ -4495,7 +4499,8 @@
               "join",
               "switch",
               "manage",
-              "remove"
+              "remove",
+              "bench"
             ]
           },
           "page": {
@@ -5196,6 +5201,19 @@
       },
       "timeout_ms": 30000,
       "capabilities": []
+    },
+    {
+      "name": "migrate_run_reminders",
+      "description": "Upgrade stored runs with reminders and a bench",
+      "audience": "operator",
+      "input_schema": {
+        "type": "object"
+      },
+      "output_schema": {
+        "type": "array"
+      },
+      "timeout_ms": 30000,
+      "capabilities": []
     }
   ],
   "commands": {
@@ -5642,6 +5660,11 @@
       "from": 3,
       "to": 4,
       "operation": "migrate_run_schedule"
+    },
+    {
+      "from": 4,
+      "to": 5,
+      "operation": "migrate_run_reminders"
     }
   ],
   "configuration": {
@@ -5694,6 +5717,20 @@
             }
           },
           "required": [],
+          "additionalProperties": false
+        },
+        "reminders": {
+          "type": "object",
+          "properties": {
+            "timezone": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          },
+          "required": [
+            "timezone"
+          ],
           "additionalProperties": false
         }
       },

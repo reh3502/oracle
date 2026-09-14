@@ -33,6 +33,7 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 struct RunConfiguration {
     limits: Limits,
+    reminders: Option<dandys_world_core::runs::reminders::ReminderConfiguration>,
 }
 fn run_configuration(values: Value) -> Result<RunConfiguration> {
     let config: RunConfiguration = serde_json::from_value(values)
@@ -41,6 +42,11 @@ fn run_configuration(values: Value) -> Result<RunConfiguration> {
         .limits
         .validate()
         .map_err(|_| RpcError::Remote("Run limits may only lower the supported ceilings".into()))?;
+    if let Some(reminders) = &config.reminders {
+        reminders.validate().map_err(|_| {
+            RpcError::Remote("Choose a valid DW role and IANA announcement time zone".into())
+        })?;
+    }
     Ok(config)
 }
 struct LoadedCatalog {
@@ -433,6 +439,55 @@ impl Module for DwModule {
             .map_err(|_| RpcError::Remote("System clock is unavailable".into()))?
             .as_millis() as u64;
         let service = RunService::new(context.clone());
+        let values = self
+            .configuration
+            .read()
+            .unwrap()
+            .get(context.guild())
+            .map(|c| c.values.clone())
+            .unwrap_or_else(|| json!({}));
+        if let Some(config) = run_configuration(values)?.reminders {
+            let mut work = tokio::task::JoinSet::new();
+            let slots = Arc::new(tokio::sync::Semaphore::new(4));
+            for id in service
+                .reminder_candidates()
+                .await
+                .map_err(|e| RpcError::Remote(e.to_string()))?
+            {
+                let context = context.clone();
+                let config = config.clone();
+                let slots = slots.clone();
+                work.spawn(async move {
+                    let _slot = slots
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| RpcError::Cancelled)?;
+                    let service = RunService::new(context.clone());
+                    let Some(revision) = service
+                        .prepare_reminder(&id, &config, now)
+                        .await
+                        .map_err(|e| RpcError::Remote(e.to_string()))?
+                    else {
+                        return Ok::<_, RpcError>(());
+                    };
+                    let evidence = context.run_reminder(&id, revision).await?;
+                    let settled_now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| RpcError::Remote("System clock is unavailable".into()))?
+                        .as_millis() as u64;
+                    service
+                        .settle_attendance(&id, &evidence, settled_now)
+                        .await
+                        .map_err(|e| RpcError::Remote(e.to_string()))?;
+                    Ok(())
+                });
+            }
+            while let Some(result) = work.join_next().await {
+                if !matches!(result, Ok(Ok(()))) {
+                    eprintln!("Run reminder processing deferred; saved run retained");
+                }
+            }
+        }
         if let Ok(pending) = service.pending_projections().await {
             let cursor = self
                 .publication_cursor
@@ -471,6 +526,15 @@ impl Module for DwModule {
         to: u32,
         documents: Vec<ModuleDocument>,
     ) -> Result<Vec<DocumentWrite>> {
+        if operation == "migrate_run_reminders" && from == 4 && to == 5 {
+            return documents
+                .into_iter()
+                .map(|document| {
+                    dandys_world_core::runs::storage::migrate_v4_document(document)
+                        .map_err(|error| RpcError::Remote(error.to_string()))
+                })
+                .collect();
+        }
         if operation == "migrate_run_schedule" && from == 3 && to == 4 {
             return documents
                 .into_iter()

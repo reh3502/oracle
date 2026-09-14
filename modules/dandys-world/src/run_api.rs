@@ -284,6 +284,7 @@ pub async fn invoke(
                         View::Review
                     }
                     Action::Lock | Action::Reopen => View::Manage,
+                    Action::Restore => View::Bench,
                     _ => View::Summary,
                 };
                 let mut next = UiInput::show(&options.id, view);

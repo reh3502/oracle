@@ -190,9 +190,11 @@ fn migration_preserves_legacy_signups_without_inventing_schedule() {
     run.schedule = None;
     let old_revision = run.desired_card_revision;
     let stored = StoredRun {
+        reminder: None,
         schema_version: 3,
         moderator_audit: vec![],
         publication: Some(PublicationIntent {
+            delete: false,
             key: run.id.clone(),
             desired_revision: old_revision,
             repost_generation: 2,
@@ -241,6 +243,7 @@ fn migration_preserves_legacy_signups_without_inventing_schedule() {
 fn draft_and_maintenance_migrations_preserve_data_and_reject_wrong_versions() {
     let run = draft();
     let stored = StoredRun {
+        reminder: None,
         schema_version: 3,
         moderator_audit: vec![],
         publication: None,
@@ -284,6 +287,7 @@ fn editing_duration_preserves_a_pasted_start_with_seconds() {
     let mut run = open();
     run.schedule.as_mut().unwrap().starts_at = 1_800_003_630;
     let stored = StoredRun {
+        reminder: None,
         schema_version: storage::DATA_VERSION,
         moderator_audit: vec![],
         publication: None,

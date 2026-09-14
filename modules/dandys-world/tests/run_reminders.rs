@@ -14,7 +14,6 @@ fn ms(year: i32, month: u32, day: u32, hour: u32) -> u64 {
 }
 fn config() -> ReminderConfiguration {
     ReminderConfiguration {
-        role_id: "123".into(),
         timezone: "America/New_York".into(),
     }
 }
@@ -152,4 +151,150 @@ fn participant_ping_includes_host_even_when_not_signed_up_and_no_duplicates() {
     );
     run.assignments.remove("1");
     assert!(participant_recipients(&run).contains("1"));
+}
+
+#[test]
+fn benching_frees_places_preserves_toons_and_requires_host_restore() {
+    use dandys_world_core::runs::domain::{Command, Error, apply, bench_absent};
+    let run = run(ms(2026, 9, 19, 0));
+    let start = run.schedule.as_ref().unwrap().starts_at;
+    let deadline = start as u64 * 1000 - HOUR_MS;
+    let confirmed = BTreeSet::from(["1".into(), "3".into()]);
+    let next = bench_absent(
+        &run,
+        &run.assignments,
+        &confirmed,
+        start,
+        deadline,
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(next.assignments.len(), 2);
+    assert_eq!(next.bench.get("2"), run.assignments.get("2"));
+    assert_eq!(next.desired_card_revision, run.desired_card_revision + 1);
+    assert_eq!(
+        bench_absent(
+            &next,
+            &run.assignments,
+            &confirmed,
+            start,
+            deadline,
+            deadline
+        )
+        .unwrap(),
+        next
+    );
+    let member = Actor {
+        guild_id: "100".into(),
+        user_id: "2".into(),
+        manage_all_runs: false,
+    };
+    assert_eq!(
+        apply(
+            &next,
+            &member,
+            &Command::Join { toon: None },
+            &run.eligibility,
+            deadline + 1
+        ),
+        Err(Error::Benched)
+    );
+    assert_eq!(
+        apply(
+            &next,
+            &member,
+            &Command::Restore {
+                member_id: "2".into(),
+                toon: None
+            },
+            &run.eligibility,
+            deadline + 1
+        ),
+        Err(Error::Forbidden)
+    );
+    let host = Actor {
+        user_id: "1".into(),
+        ..member
+    };
+    let restored = apply(
+        &next,
+        &host,
+        &Command::Restore {
+            member_id: "2".into(),
+            toon: None,
+        },
+        &run.eligibility,
+        deadline + 1,
+    )
+    .unwrap()
+    .0;
+    assert!(restored.bench.is_empty());
+    assert_eq!(restored.assignments.len(), 3);
+}
+
+#[test]
+fn every_reminder_only_pings_roster_and_host() {
+    use dandys_world_core::runs::reminders::intent;
+    let run = run(ms(2026, 9, 19, 0));
+    let times = ReminderTimes::for_run(&run, &config()).unwrap().unwrap();
+    let announce = intent(&run, &config(), times.tomorrow, false)
+        .unwrap()
+        .unwrap();
+    assert!(announce.role_id.is_none());
+    assert_eq!(announce.users, vec!["1", "2", "3"]);
+    assert!(announce.text.contains("5 places still open"));
+    let attendance = intent(&run, &config(), times.attendance, false)
+        .unwrap()
+        .unwrap();
+    assert!(attendance.role_id.is_none());
+    assert_eq!(attendance.users, vec!["1", "2", "3"]);
+    assert!(attendance.text.contains("within 3 hours"));
+}
+
+#[test]
+fn migration_preserves_saved_run_and_starts_with_no_bench_or_reminder() {
+    use dandys_world_core::runs::storage::{DATA_VERSION, StoredRun, migrate_v4_document};
+    use oracle_contracts::ModuleDocument;
+    let run = run(ms(2026, 9, 19, 0));
+    let old = StoredRun {
+        schema_version: 4,
+        run: run.clone(),
+        publication: None,
+        reminder: None,
+        moderator_audit: vec![],
+    };
+    let migrated = migrate_v4_document(ModuleDocument {
+        collection: "runs".into(),
+        key: run.id.clone(),
+        revision: 7,
+        value: serde_json::to_value(old).unwrap(),
+    })
+    .unwrap();
+    assert_eq!(migrated.expected_revision, Some(7));
+    let current: StoredRun = serde_json::from_value(migrated.value.unwrap()).unwrap();
+    assert_eq!(current.schema_version, DATA_VERSION);
+    assert_eq!(current.run, run);
+    assert!(current.reminder.is_none());
+    assert!(current.run.bench.is_empty());
+}
+
+#[test]
+fn switching_toons_does_not_evade_attendance_and_bench_keeps_current_toon() {
+    use dandys_world_core::runs::domain::bench_absent;
+    let mut run = run(ms(2026, 9, 19, 0));
+    let expected = run.assignments.clone();
+    run.assignments.get_mut("2").unwrap().toon = Some("poppy".into());
+    let start = run.schedule.as_ref().unwrap().starts_at;
+    let deadline = start as u64 * 1000 - HOUR_MS;
+    let next = bench_absent(
+        &run,
+        &expected,
+        &BTreeSet::from(["1".into(), "3".into()]),
+        start,
+        deadline,
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(next.bench["2"].toon, Some("poppy".into()));
+    assert!(!next.assignments.contains_key("2"));
 }

@@ -30,6 +30,7 @@ pub enum Action {
     Complete,
     PrepareRemove,
     ConfirmRemove,
+    Restore,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +46,7 @@ pub enum View {
     Switch,
     Manage,
     Remove,
+    Bench,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +143,10 @@ impl Input {
             Action::Lock => Command::Lock,
             Action::Reopen => Command::Reopen,
             Action::Complete => Command::Complete,
+            Action::Restore => Command::Restore {
+                member_id: self.member.clone().ok_or(Error::InvalidInput)?,
+                toon: self.toon.clone(),
+            },
             Action::PrepareRemove | Action::ConfirmRemove => Command::Remove {
                 member_id: self.member.clone().ok_or(Error::InvalidInput)?,
                 confirmation: dummy(),
@@ -393,6 +399,15 @@ pub fn public_projection(run: &Run) -> (Value, Vec<PublicAction>) {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
+        ));
+    }
+    if !run.bench.is_empty() {
+        public_fields.push(field(
+            "Bench",
+            format!(
+                "{} players · open View players for details",
+                run.bench.len()
+            ),
         ));
     }
     public_fields.extend(schedule_fields(run));
@@ -734,6 +749,9 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                 run.assignments.len(),
                 run.capacity()
             ));
+            if !run.bench.is_empty() {
+                buttons.push(view_button(run, "View bench", "bench"));
+            }
             buttons.push(view_button(run, "My signup", "summary"));
         }
         View::Manage => {
@@ -756,11 +774,55 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
                     buttons.push(view_button(run, "Edit requirements", "toons"));
                 }
                 buttons.push(view_button(run, "Remove a signup", "remove"));
+                if !run.bench.is_empty() {
+                    buttons.push(view_button(run, "View bench", "bench"));
+                }
                 buttons.push(schedule_button(run));
                 buttons.push(prompt(
                     run, "Rename", "rename", "name", "Run name", 80, None,
                 ));
                 buttons.push(button("Cancel run", base(run, "prepare_cancel")));
+            }
+            buttons.push(view_button(run, "Back", "summary"));
+        }
+        View::Bench => {
+            title = "Bench";
+            description.push_str(
+                "These players missed the attendance check and do not occupy active places.",
+            );
+            let page =
+                usize::from(input.page.unwrap_or(0)).min(run.bench.len().saturating_sub(1) / 8);
+            let members:Vec<_>=run.bench.iter().skip(page*8).take(8).enumerate().map(|(i,(member,assignment))| {
+                if manager && run.state==RunState::Open {
+                    let mut choice=base(run,"restore");
+                    choice["member"]=json!(member);
+                    if let Some(toon)=&assignment.toon { choice["toon"]=json!(toon); }
+                    choices.push(json!({"label":format!("Restore player {}",page*8+i+1),"member_id":member,
+                        "description":assignment.toon.as_ref().map(|t|toon_name(run,t)).unwrap_or_else(||"Any Toon".into()),
+                        "operation":"run_ui","input":choice}));
+                }
+                json!({"user_id":member,"suffix":assignment.toon.as_ref().map(|t|format!(" — {}",toon_name(run,t))).unwrap_or_default()})
+            }).collect();
+            if !members.is_empty() {
+                fields.push(
+                    json!({"name":"Benched players","value":"","inline":false,"members":members}),
+                );
+            }
+            for (label, next) in [
+                ("Previous", page.checked_sub(1)),
+                (
+                    "Next",
+                    (page + 1 < run.bench.len().div_ceil(8)).then_some(page + 1),
+                ),
+            ] {
+                if let Some(next) = next {
+                    let mut b = view_button(run, label, "bench");
+                    b["input"]["page"] = json!(next);
+                    buttons.push(b);
+                }
+            }
+            if manager && run.state == RunState::Locked {
+                description.push_str(" Reopen signups in Manage run before restoring a player.");
             }
             buttons.push(view_button(run, "Back", "summary"));
         }
@@ -890,6 +952,7 @@ pub fn human_error(error: &super::storage::Error) -> String {
         S::Rule(Error::Forbidden)=>"Only the host or a configured moderator can manage this run.".into(),
         S::Rule(Error::StaleRevision|Error::StaleConfirmation)=>"The run changed. Review the latest details and try again.".into(),
         S::Rule(Error::CatalogUnavailable|Error::CatalogChanged)=>"The current playable Toon list cannot confirm this setup. Your saved draft is safe; review it after the wiki data is refreshed.".into(),
+        S::Rule(Error::Benched)=>"You are on the bench. Ask the host to restore your place.".into(),
         S::Rule(Error::BelowOccupancy)=>"Players already occupy those places. Remove or move their signups before reducing that count.".into(),
         S::Rule(Error::InvalidInput)=>"Check the entry: counts must be a single number from 1 to 8, and the name must be 1–80 characters.".into(),
         S::Busy|S::Conflict=>"Someone else updated the run. Try again; your saved signup has not been replaced.".into(),

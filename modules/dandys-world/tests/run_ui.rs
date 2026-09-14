@@ -30,6 +30,7 @@ fn draft(mode: RunMode) -> StoredRun {
         timezone: Some("UTC".into()),
     });
     StoredRun {
+        reminder: None,
         schema_version: 4,
         moderator_audit: vec![],
         publication: None,

@@ -12,7 +12,7 @@ use std::{
     io::Read,
 };
 
-pub const DATA_VERSION: u32 = 4;
+pub const DATA_VERSION: u32 = 5;
 pub const MAX_AGGREGATE_BYTES: usize = 40 * 1024;
 pub const DAY: u64 = 86_400_000;
 const MAX_BYTES: usize = 32 * 1024;
@@ -56,12 +56,18 @@ pub trait Documents: Send + Sync {
 pub struct PublicationIntent {
     pub key: String,
     pub desired_revision: u64,
+    #[serde(default, skip_serializing_if = "delete_disabled")]
+    pub delete: bool,
     #[serde(default)]
     pub repost_generation: u32,
     pub destination: String,
     pub created_at: u64,
     pub card: Value,
     pub actions: Vec<super::ui::PublicAction>,
+}
+
+fn delete_disabled(value: &bool) -> bool {
+    !*value
 }
 
 /// Bounded management history, removed with the aggregate at terminal expiry.
@@ -82,6 +88,8 @@ pub struct StoredRun {
     pub run: Run,
     /// Desired output only. The module never writes a host delivery receipt.
     pub publication: Option<PublicationIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<super::reminders::ReminderIntent>,
 }
 impl StoredRun {
     fn validate(&self, guild: &str, id: &str) -> Result<()> {
@@ -96,6 +104,7 @@ impl StoredRun {
             && (intent.key != id
                 || intent.destination != "runs"
                 || intent.desired_revision != self.run.desired_card_revision
+                || intent.delete && self.run.state != RunState::Cancelled
                 || intent.created_at < self.run.created_at)
         {
             return Err(Error::Corrupt);
@@ -751,6 +760,7 @@ impl<D: Documents> RunService<D> {
                                     schema_version: DATA_VERSION,
                                     run,
                                     publication: None,
+                                    reminder: None,
                                     moderator_audit: Vec::new(),
                                 },
                             )
@@ -862,7 +872,8 @@ impl<D: Documents> RunService<D> {
                                         .into(),
                                     at: now,
                                     affected_member: match &command {
-                                        Command::Remove { member_id, .. } => {
+                                        Command::Remove { member_id, .. }
+                                        | Command::Restore { member_id, .. } => {
                                             Some(member_id.clone())
                                         }
                                         _ => None,
@@ -883,6 +894,7 @@ impl<D: Documents> RunService<D> {
                                 stored.publication = Some(PublicationIntent {
                                     key: run.id.clone(),
                                     desired_revision: run.desired_card_revision,
+                                    delete: run.state == RunState::Cancelled,
                                     repost_generation: stored
                                         .publication
                                         .as_ref()
@@ -1320,7 +1332,7 @@ pub fn migrate_v3_document(document: ModuleDocument) -> Result<DocumentWrite> {
             let mut stored: StoredRun =
                 serde_json::from_value(value).map_err(|_| Error::Corrupt)?;
             stored.validate_version(&stored.run.guild_id, &document.key, 3)?;
-            stored.schema_version = DATA_VERSION;
+            stored.schema_version = 4;
             if let Some(intent) = &mut stored.publication {
                 stored.run.desired_card_revision = stored
                     .run
@@ -1332,11 +1344,43 @@ pub fn migrate_v3_document(document: ModuleDocument) -> Result<DocumentWrite> {
                 intent.card = card;
                 intent.actions = actions;
             }
-            stored.validate(&stored.run.guild_id, &document.key)?;
+            stored.validate_version(&stored.run.guild_id, &document.key, 4)?;
             value = serde_json::to_value(stored).map_err(|_| Error::Corrupt)?;
         }
         "run_index" if document.key == "maintenance" => {
             if value["version"] != 3 {
+                return Err(Error::Corrupt);
+            }
+            value["version"] = serde_json::json!(4);
+        }
+        "run_index" | "run_receipts" => (),
+        _ => return Err(Error::Corrupt),
+    }
+    Ok(DocumentWrite {
+        collection: document.collection,
+        key: document.key,
+        expected_revision: Some(document.revision),
+        value: Some(value),
+    })
+}
+
+/// Add reminder/bench support without inventing attendance or changing signups.
+pub fn migrate_v4_document(document: ModuleDocument) -> Result<DocumentWrite> {
+    let mut value = document.value;
+    match document.collection.as_str() {
+        "runs" => {
+            let mut stored: StoredRun =
+                serde_json::from_value(value).map_err(|_| Error::Corrupt)?;
+            stored.validate_version(&stored.run.guild_id, &document.key, 4)?;
+            if !stored.run.bench.is_empty() || stored.reminder.is_some() {
+                return Err(Error::Corrupt);
+            }
+            stored.schema_version = DATA_VERSION;
+            stored.validate(&stored.run.guild_id, &document.key)?;
+            value = serde_json::to_value(stored).map_err(|_| Error::Corrupt)?;
+        }
+        "run_index" if document.key == "maintenance" => {
+            if value["version"] != 4 {
                 return Err(Error::Corrupt);
             }
             value["version"] = serde_json::json!(DATA_VERSION);
@@ -1350,4 +1394,92 @@ pub fn migrate_v3_document(document: ModuleDocument) -> Result<DocumentWrite> {
         expected_revision: Some(document.revision),
         value: Some(value),
     })
+}
+impl<D: Documents> RunService<D> {
+    pub async fn reminder_candidates(&self) -> Result<Vec<String>> {
+        let mut tx = Transaction::new(&self.docs);
+        let live: Live = tx.get("run_index", "live").await?.unwrap_or_default();
+        if live.len() > 70 {
+            return Err(Error::Corrupt);
+        }
+        Ok(live
+            .into_iter()
+            .filter(|(_, entry)| matches!(entry.state, RunState::Open | RunState::Locked))
+            .map(|(id, _)| id)
+            .collect())
+    }
+    pub async fn prepare_reminder(
+        &self,
+        id: &str,
+        config: &super::reminders::ReminderConfiguration,
+        now: u64,
+    ) -> Result<Option<u64>> {
+        for _ in 0..3 {
+            let mut tx = Transaction::new(&self.docs);
+            let mut stored = self.load_run(&mut tx, id).await?;
+            let continuing = stored.reminder.as_ref().is_some_and(|i| {
+                i.kind == super::reminders::ReminderKind::Attendance
+                    && stored.run.schedule.as_ref().map(|s| s.starts_at) == Some(i.starts_at)
+            });
+            let Some(intent) = super::reminders::intent(&stored.run, config, now, continuing)?
+            else {
+                return Ok(None);
+            };
+            if stored.reminder.as_ref() == Some(&intent) {
+                return Ok(tx
+                    .reads
+                    .get(&("runs".into(), id.into()))
+                    .and_then(|r| r.as_ref())
+                    .map(|r| r.revision));
+            }
+            stored.reminder = Some(intent);
+            tx.put("runs", id, &stored).await?;
+            match tx.commit().await {
+                Ok(()) => return Ok(self.docs.get("runs", id).await?.map(|r| r.revision)),
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Busy)
+    }
+    /// Host callback result only; no member route exposes this method.
+    pub async fn settle_attendance(&self, id: &str, evidence: &Value, now: u64) -> Result<bool> {
+        if evidence["state"] != "settled" || evidence["kind"] != "attendance" {
+            return Ok(false);
+        }
+        let expected =
+            serde_json::from_value(evidence["expected"].clone()).map_err(|_| Error::Corrupt)?;
+        let confirmed =
+            serde_json::from_value(evidence["confirmed"].clone()).map_err(|_| Error::Corrupt)?;
+        let start = evidence["starts_at"].as_i64().ok_or(Error::Corrupt)?;
+        let deadline = evidence["deadline"].as_u64().ok_or(Error::Corrupt)?;
+        for _ in 0..3 {
+            let mut tx = Transaction::new(&self.docs);
+            let mut stored = self.load_run(&mut tx, id).await?;
+            let next =
+                domain::bench_absent(&stored.run, &expected, &confirmed, start, deadline, now)?;
+            if next == stored.run {
+                return Ok(false);
+            }
+            let mut meta: Maintenance = tx
+                .get("run_index", "maintenance")
+                .await?
+                .ok_or(Error::Corrupt)?;
+            stored.run = next;
+            let (card, actions) = super::ui::public_projection(&stored.run);
+            let publication = stored.publication.as_mut().ok_or(Error::Corrupt)?;
+            publication.desired_revision = stored.run.desired_card_revision;
+            publication.card = card;
+            publication.actions = actions;
+            meta.pending.insert(id.into());
+            tx.put("runs", id, &stored).await?;
+            tx.put("run_index", "maintenance", &meta).await?;
+            match tx.commit().await {
+                Ok(()) => return Ok(true),
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Busy)
+    }
 }

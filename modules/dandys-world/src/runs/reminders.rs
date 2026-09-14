@@ -10,14 +10,10 @@ pub const HOUR_MS: u64 = 3_600_000;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReminderConfiguration {
-    pub role_id: String,
     pub timezone: String,
 }
 impl ReminderConfiguration {
     pub fn validate(&self) -> Result<Tz, Error> {
-        if !valid_member_id(&self.role_id) {
-            return Err(Error::InvalidInput);
-        }
         self.timezone.parse().map_err(|_| Error::InvalidInput)
     }
 }
@@ -166,9 +162,13 @@ impl Attendance {
         self.expected
             .iter()
             .filter(|(id, assignment)| {
-                !self.confirmed.contains(*id) && run.assignments.get(*id) == Some(*assignment)
+                !self.confirmed.contains(*id)
+                    && run
+                        .assignments
+                        .get(*id)
+                        .is_some_and(|current| current.joined_at == assignment.joined_at)
             })
-            .map(|(id, assignment)| (id.clone(), assignment.clone()))
+            .map(|(id, _)| (id.clone(), run.assignments[id].clone()))
             .collect()
     }
 }
@@ -179,4 +179,107 @@ pub fn participant_recipients(run: &Run) -> BTreeSet<String> {
         .cloned()
         .chain(std::iter::once(run.owner_id.clone()))
         .collect()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReminderIntent {
+    pub kind: ReminderKind,
+    pub starts_at: i64,
+    pub not_before: u64,
+    pub expires_at: u64,
+    pub role_id: Option<String>,
+    pub users: Vec<String>,
+    pub text: String,
+}
+pub fn intent(
+    run: &Run,
+    config: &ReminderConfiguration,
+    now: u64,
+    continue_attendance: bool,
+) -> Result<Option<ReminderIntent>, Error> {
+    let Some(times) = ReminderTimes::for_run(run, config)? else {
+        return Ok(None);
+    };
+    let kind = if continue_attendance
+        && matches!(run.state, RunState::Open | RunState::Locked)
+        && now >= times.attendance
+        && now < times.starts_at
+    {
+        Some(ReminderKind::Attendance)
+    } else {
+        times.due(run, now)
+    };
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    let start = run
+        .schedule
+        .as_ref()
+        .ok_or(Error::ScheduleRequired)?
+        .starts_at;
+    let available = usize::from(run.capacity()).saturating_sub(run.assignments.len());
+    let places = if run.state == RunState::Locked {
+        "Signups are currently locked.".to_owned()
+    } else if let Some(rows) = &run.allocations {
+        let open: Vec<_> = rows
+            .iter()
+            .filter_map(|(toon, count)| {
+                let occupied = run
+                    .assignments
+                    .values()
+                    .filter(|a| a.toon.as_ref() == Some(toon))
+                    .count();
+                let free = usize::from(*count).saturating_sub(occupied);
+                (free > 0).then(|| {
+                    format!(
+                        "{}: {free}",
+                        run.eligibility.toons.get(toon).unwrap_or(toon)
+                    )
+                })
+            })
+            .collect();
+        if open.is_empty() {
+            "All Toon places are filled.".into()
+        } else {
+            format!("Open Toon places: {}.", open.join(", "))
+        }
+    } else {
+        format!("{available} places still open.")
+    };
+    let (not_before, expires_at, message) = match kind {
+        ReminderKind::SignupsOpen => (
+            times.signups_open,
+            times.tomorrow,
+            format!(
+                "Signups are open for {}!\nStarts <t:{start}:F> (<t:{start}:R>).\n{places}",
+                run.name
+            ),
+        ),
+        ReminderKind::Tomorrow => (
+            times.tomorrow,
+            times.attendance,
+            format!(
+                "{} is tomorrow: <t:{start}:F> (<t:{start}:R>).\n{places}",
+                run.name
+            ),
+        ),
+        ReminderKind::Attendance => (
+            times.attendance,
+            times.starts_at - 3 * HOUR_MS,
+            format!(
+                "Attendance check for {} — starts <t:{start}:F>.\nReact with ✅ within 3 hours of this message to keep your place. Players who do not respond will move to the bench.",
+                run.name
+            ),
+        ),
+    };
+    Ok(Some(ReminderIntent {
+        kind,
+        starts_at: start,
+        not_before,
+        expires_at,
+        role_id: None,
+        users: participant_recipients(run).into_iter().collect(),
+        text: format!("{message}\nRun {}", run.id),
+    }))
 }

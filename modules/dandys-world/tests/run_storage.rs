@@ -1277,3 +1277,436 @@ async fn blocked_casual_post_keeps_one_draft_and_reports_the_owner_limit() {
     store.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+async fn reminder_run(service: &RunService<Db>, owner: &Actor) -> String {
+    let id = create(service, owner, RunMode::Casual).await;
+    change(
+        service,
+        owner,
+        &id,
+        Command::SetSchedule {
+            schedule: RunSchedule {
+                starts_at: ((NOW + 4 * 3_600_000) / 1000) as i64,
+                duration_minutes: 90,
+                timezone: Some("America/New_York".into()),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    change(service, owner, &id, Command::Publish).await.unwrap();
+    for user in ["200", "201"] {
+        change(service, &actor(user), &id, Command::Join { toon: None })
+            .await
+            .unwrap();
+    }
+    id
+}
+fn settled_evidence(run: &Run) -> serde_json::Value {
+    serde_json::json!({
+        "state":"settled","kind":"attendance",
+        "starts_at":run.schedule.as_ref().unwrap().starts_at,
+        "deadline":NOW+3*3_600_000,
+        "expected":run.assignments,
+        "confirmed":["100","200"]
+    })
+}
+async fn reminder_change_at<D: Documents>(
+    service: &RunService<D>,
+    who: &Actor,
+    id: &str,
+    command: Command,
+    now: u64,
+) -> storage::Result<Response> {
+    service
+        .execute(
+            who,
+            &interaction(now),
+            Request::Change {
+                run_id: id.into(),
+                command,
+                confirmation: None,
+                expected_revision: None,
+            },
+            &catalog(),
+            now,
+        )
+        .await
+}
+#[tokio::test]
+async fn reminder_preparation_and_attendance_settlement_are_durable_and_idempotent() {
+    use dandys_world_core::runs::reminders::{ReminderConfiguration, ReminderKind};
+    let root = std::env::temp_dir().join(format!("dw-reminder-settlement-{}", interaction(NOW)));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let db = Db::new(store.clone());
+    let service = RunService::new(db.clone());
+    let owner = actor("100");
+    let id = reminder_run(&service, &owner).await;
+    let config = ReminderConfiguration {
+        timezone: "America/New_York".into(),
+    };
+    let before = service.view(&owner, &id).await.unwrap();
+    let before_doc = db.get("runs", &id).await.unwrap().unwrap();
+    let revision = service
+        .prepare_reminder(&id, &config, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    let prepared = db.get("runs", &id).await.unwrap().unwrap();
+    assert_eq!(revision, prepared.revision);
+    assert!(revision > before_doc.revision);
+    let persisted = RunService::new(Db::new(store.clone()))
+        .view(&owner, &id)
+        .await
+        .unwrap();
+    assert_eq!(persisted.schema_version, 5);
+    assert_eq!(
+        persisted.run, before.run,
+        "delivery intent must not alter signup state"
+    );
+    assert_eq!(
+        persisted.reminder.as_ref().unwrap().kind,
+        ReminderKind::Attendance
+    );
+    assert_eq!(
+        persisted.reminder.as_ref().unwrap().users,
+        vec!["100", "200", "201"]
+    );
+    assert_eq!(
+        service.prepare_reminder(&id, &config, NOW).await.unwrap(),
+        Some(revision)
+    );
+    assert_eq!(
+        serde_json::to_value(db.get("runs", &id).await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(prepared).unwrap(),
+        "repeated prepare must not churn revisions"
+    );
+    service
+        .release_confirmed(&id, persisted.run.desired_card_revision)
+        .await
+        .unwrap();
+    assert!(service.pending_projections().await.unwrap().is_empty());
+    let evidence = settled_evidence(&persisted.run);
+    let deadline = NOW + 3 * 3_600_000;
+    assert!(
+        service
+            .settle_attendance(&id, &evidence, deadline - 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(service.view(&owner, &id).await.unwrap(), persisted);
+    assert!(service.pending_projections().await.unwrap().is_empty());
+    assert!(
+        service
+            .settle_attendance(&id, &evidence, deadline)
+            .await
+            .unwrap()
+    );
+    let settled = RunService::new(Db::new(store.clone()))
+        .view(&owner, &id)
+        .await
+        .unwrap();
+    assert_eq!(
+        settled
+            .run
+            .assignments
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["100", "200"]
+    );
+    assert_eq!(
+        settled.run.bench.get("201"),
+        persisted.run.assignments.get("201")
+    );
+    assert_eq!(
+        settled.run.desired_card_revision,
+        persisted.run.desired_card_revision + 1
+    );
+    let publication = settled.publication.as_ref().unwrap();
+    assert_eq!(
+        publication.desired_revision,
+        settled.run.desired_card_revision
+    );
+    let (card, actions) = dandys_world_core::runs::ui::public_projection(&settled.run);
+    assert_eq!((&publication.card, &publication.actions), (&card, &actions));
+    assert_eq!(
+        service.pending_projections().await.unwrap(),
+        vec![id.clone()]
+    );
+    let stored_after = db.get("runs", &id).await.unwrap().unwrap();
+    assert!(
+        !service
+            .settle_attendance(&id, &evidence, deadline + 1)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(db.get("runs", &id).await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(stored_after).unwrap()
+    );
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[tokio::test]
+async fn attendance_settlement_preserves_rescheduled_runs_and_later_rejoins() {
+    let root = std::env::temp_dir().join(format!("dw-reminder-stale-{}", interaction(NOW)));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let service = RunService::new(Db::new(store.clone()));
+    let owner = actor("100");
+    let id = reminder_run(&service, &owner).await;
+    let initial = service.view(&owner, &id).await.unwrap();
+    let evidence = settled_evidence(&initial.run);
+    reminder_change_at(&service, &actor("201"), &id, Command::Leave, NOW + 1)
+        .await
+        .unwrap();
+    reminder_change_at(
+        &service,
+        &actor("201"),
+        &id,
+        Command::Join { toon: None },
+        NOW + 2,
+    )
+    .await
+    .unwrap();
+    let rejoined = service.view(&owner, &id).await.unwrap();
+    assert_ne!(
+        rejoined.run.assignments["201"],
+        initial.run.assignments["201"]
+    );
+    assert!(
+        !service
+            .settle_attendance(&id, &evidence, NOW + 3 * 3_600_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(service.view(&owner, &id).await.unwrap(), rejoined);
+    let second = reminder_run(&service, &owner).await;
+    let second_before = service.view(&owner, &second).await.unwrap();
+    let second_evidence = settled_evidence(&second_before.run);
+    reminder_change_at(
+        &service,
+        &owner,
+        &second,
+        Command::SetSchedule {
+            schedule: RunSchedule {
+                starts_at: ((NOW + 24 * 3_600_000) / 1000) as i64,
+                duration_minutes: 90,
+                timezone: Some("America/New_York".into()),
+            },
+        },
+        NOW + 1,
+    )
+    .await
+    .unwrap();
+    let rescheduled = service.view(&owner, &second).await.unwrap();
+    assert!(
+        !service
+            .settle_attendance(&second, &second_evidence, NOW + 3 * 3_600_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(service.view(&owner, &second).await.unwrap(), rescheduled);
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[derive(Clone)]
+struct ReminderRaceDb {
+    db: Db,
+    conflicts: Arc<AtomicU64>,
+    settling: bool,
+    wait_first: Arc<AtomicBool>,
+    signup_committed: Arc<tokio::sync::Notify>,
+}
+#[async_trait]
+impl Documents for ReminderRaceDb {
+    fn guild(&self) -> &str {
+        self.db.guild()
+    }
+    async fn get(&self, collection: &str, key: &str) -> storage::Result<Option<ModuleDocument>> {
+        let document = self.db.get(collection, key).await?;
+        if self.settling
+            && collection == "runs"
+            && key == self.db.raced
+            && self.wait_first.swap(false, Ordering::SeqCst)
+        {
+            self.signup_committed.notified().await;
+        }
+        Ok(document)
+    }
+    async fn batch(&self, writes: Vec<DocumentWrite>) -> storage::Result<()> {
+        let result = self.db.batch(writes).await;
+        if self.settling && matches!(result, Err(storage::Error::Conflict)) {
+            self.conflicts.fetch_add(1, Ordering::SeqCst);
+        }
+        if !self.settling && result.is_ok() {
+            self.signup_committed.notify_one();
+        }
+        result
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attendance_settlement_cas_retry_preserves_a_concurrent_signup() {
+    let root = std::env::temp_dir().join(format!("dw-reminder-race-{}", interaction(NOW)));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let db = Db::new(store.clone());
+    let service = RunService::new(db.clone());
+    let owner = actor("100");
+    let id = reminder_run(&service, &owner).await;
+    let initial = service.view(&owner, &id).await.unwrap();
+    let evidence = settled_evidence(&initial.run);
+    let barrier = Arc::new(Barrier::new(2));
+    let conflicts = Arc::new(AtomicU64::new(0));
+    let signup_committed = Arc::new(tokio::sync::Notify::new());
+    let racing = |settling| {
+        let mut copy = db.clone();
+        copy.barrier = Some(barrier.clone());
+        copy.raced = id.clone();
+        copy.first = Arc::new(AtomicBool::new(true));
+        RunService::new(ReminderRaceDb {
+            db: copy,
+            conflicts: conflicts.clone(),
+            settling,
+            wait_first: Arc::new(AtomicBool::new(true)),
+            signup_committed: signup_committed.clone(),
+        })
+    };
+    let settle = racing(true);
+    let signup = racing(false);
+    let deadline = NOW + 3 * 3_600_000;
+    let new_member = actor("202");
+    let (settled, joined) = tokio::join!(
+        settle.settle_attendance(&id, &evidence, deadline),
+        reminder_change_at(
+            &signup,
+            &new_member,
+            &id,
+            Command::Join { toon: None },
+            deadline
+        )
+    );
+    assert!(settled.unwrap());
+    joined.unwrap();
+    assert!(
+        conflicts.load(Ordering::SeqCst) >= 1,
+        "settlement must retry a real failed compare-and-swap after signup commits"
+    );
+    let final_run = service.view(&owner, &id).await.unwrap();
+    assert_eq!(
+        final_run
+            .run
+            .assignments
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["100", "200", "202"]
+    );
+    assert_eq!(
+        final_run.run.bench.get("201"),
+        initial.run.assignments.get("201")
+    );
+    assert_eq!(
+        final_run.run.desired_card_revision,
+        initial.run.desired_card_revision + 2
+    );
+    assert_eq!(
+        final_run.publication.as_ref().unwrap().desired_revision,
+        final_run.run.desired_card_revision
+    );
+    assert_eq!(
+        service.pending_projections().await.unwrap(),
+        vec![id.clone()]
+    );
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn confirmed_cancellation_queues_original_publication_deletion_only_after_posting() {
+    let root = std::env::temp_dir().join(format!("dw-cancel-deletion-{}", interaction(NOW)));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let service = RunService::new(Db::new(store.clone()));
+    let owner = actor("100");
+    let id = create(&service, &owner, RunMode::Casual).await;
+    publish(&service, &owner, &id).await.unwrap();
+    let before = service.view(&owner, &id).await.unwrap();
+    let original = before.publication.as_ref().unwrap();
+    service
+        .release_confirmed(&id, original.desired_revision)
+        .await
+        .unwrap();
+    assert!(service.pending_projections().await.unwrap().is_empty());
+    confirmed(
+        &service,
+        &owner,
+        &id,
+        Command::Cancel {
+            confirmation: dummy(),
+        },
+    )
+    .await
+    .unwrap();
+    let cancelled = service.view(&owner, &id).await.unwrap();
+    assert_eq!(cancelled.run.id, before.run.id);
+    assert_eq!(cancelled.run.state, RunState::Cancelled);
+    assert_eq!(
+        cancelled.run.desired_card_revision,
+        before.run.desired_card_revision + 1
+    );
+    let deletion = cancelled.publication.as_ref().unwrap();
+    assert!(deletion.delete);
+    assert_eq!(deletion.key, original.key);
+    assert_eq!(deletion.destination, original.destination);
+    assert_eq!(deletion.created_at, original.created_at);
+    assert_eq!(deletion.repost_generation, original.repost_generation);
+    assert_eq!(
+        deletion.desired_revision,
+        cancelled.run.desired_card_revision
+    );
+    assert!(deletion.actions.is_empty());
+    assert_eq!(
+        service.pending_projections().await.unwrap(),
+        vec![id.clone()]
+    );
+    let draft_id = create(&service, &owner, RunMode::Casual).await;
+    assert_ne!(draft_id, id);
+    confirmed(
+        &service,
+        &owner,
+        &draft_id,
+        Command::Cancel {
+            confirmation: dummy(),
+        },
+    )
+    .await
+    .unwrap();
+    let draft = service.view(&owner, &draft_id).await.unwrap();
+    assert_eq!(draft.run.state, RunState::Cancelled);
+    assert!(
+        draft.publication.is_none(),
+        "unpublished drafts have no deletion target"
+    );
+    assert_eq!(
+        service.pending_projections().await.unwrap(),
+        vec![id.clone()]
+    );
+    assert_eq!(service.view(&owner, &id).await.unwrap(), cancelled);
+    store.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
