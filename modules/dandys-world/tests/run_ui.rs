@@ -51,7 +51,13 @@ fn organized_paged_counts_host_review_and_post_keep_durable_rows() {
         &Input::show(&stored.run.id, View::Summary),
         None,
     );
-    assert_eq!(first["choices"].as_array().unwrap().len(), 25);
+    assert_eq!(
+        first["buttons"][0]["prompt"]["select"]["choices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        25
+    );
     apply_input(
         &mut stored,
         json!({"action":"set_count","id":"abcd2345","toon":"toon00","count":"2"}),
@@ -59,7 +65,13 @@ fn organized_paged_counts_host_review_and_post_keep_durable_rows() {
     let mut page = Input::show(&stored.run.id, View::Toons);
     page.page = Some(1);
     let second = ui::render(&stored, &owner(), &page, None);
-    assert_eq!(second["choices"].as_array().unwrap().len(), 15);
+    assert_eq!(
+        second["buttons"][0]["prompt"]["select"]["choices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        15
+    );
     apply_input(
         &mut stored,
         json!({"action":"set_count","id":"abcd2345","toon":"toon30","count":"6"}),

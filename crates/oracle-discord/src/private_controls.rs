@@ -154,14 +154,21 @@ fn split(id: &str) -> Result<(&str, &str)> {
 fn request(
     s: &Session,
     a: Action,
-    input: Option<&str>,
+    input: Option<(&str, Option<&str>)>,
     interaction_id: &str,
 ) -> Result<PublishedRequest> {
     let mut values = a.input;
     match (a.prompt, input) {
-        (Some(p), Some(v))
+        (Some(p), Some((v, selected)))
             if !v.trim().is_empty() && v.encode_utf16().count() <= usize::from(p.max_length) =>
         {
+            match (&p.select, selected) {
+                (Some(select), Some(value)) if select.choices.iter().any(|c| c.value == value) => {
+                    values.insert(select.option.clone(), Value::String(value.into()));
+                }
+                (None, None) => {}
+                _ => return Err(Error::InvalidInteraction),
+            }
             values.insert(p.option, Value::String(v.trim().into()));
         }
         (None, None) => {}
@@ -182,7 +189,7 @@ impl DiscordBootstrap {
         &self,
         s: Session,
         a: Action,
-        input: Option<&str>,
+        input: Option<(&str, Option<&str>)>,
         member: MemberContext,
         interaction_id: &str,
         application: u64,
@@ -283,13 +290,36 @@ impl DiscordBootstrap {
                 .placeholder(p.placeholder.clone())
                 .max_length(p.max_length)
                 .required(true);
+            let mut components = Vec::new();
+            if let Some(select) = &p.select {
+                let options = select
+                    .choices
+                    .iter()
+                    .map(|c| discord::CreateSelectMenuOption::new(c.label.clone(), c.value.clone()))
+                    .collect::<Vec<_>>();
+                components.push(discord::CreateModalComponent::Label(
+                    discord::CreateLabel::select_menu(
+                        select.label.clone(),
+                        discord::CreateSelectMenu::new(
+                            "selection",
+                            discord::CreateSelectMenuKind::String {
+                                options: options.into(),
+                            },
+                        )
+                        .min_values(1)
+                        .max_values(1)
+                        .required(true),
+                    ),
+                ));
+            }
+            components.push(discord::CreateModalComponent::Label(
+                discord::CreateLabel::input_text(p.label.clone(), input),
+            ));
             return api(i.create_response(
                 http,
                 discord::CreateInteractionResponse::Modal(
                     discord::CreateModal::new(format!("op2:{id}:input"), p.label.clone())
-                        .components(vec![discord::CreateModalComponent::Label(
-                            discord::CreateLabel::input_text(p.label.clone(), input),
-                        )]),
+                        .components(components),
                 ),
             ))
             .await;
@@ -334,18 +364,38 @@ impl DiscordBootstrap {
             if key != "input" {
                 return Err(Error::InvalidInteraction);
             }
-            let [discord::ModalComponent::Label(label)] = i.data.components.as_ref() else {
-                return Err(Error::InvalidInteraction);
-            };
-            let discord::LabelComponent::InputText(input) = &label.component else {
-                return Err(Error::InvalidInteraction);
-            };
-            if input.custom_id.as_str() != "value" {
-                return Err(Error::InvalidInteraction);
-            }
             let (s, a) = self.cards.1.get(id, key, &member)?;
-            request(&s, a.clone(), Some(input.value.as_str()), &i.id.to_string())?;
-            Ok((member, s, a, input.value.to_string()))
+            let mut text = None;
+            let mut selected = None;
+            for component in &i.data.components {
+                let discord::ModalComponent::Label(label) = component else {
+                    return Err(Error::InvalidInteraction);
+                };
+                match &label.component {
+                    discord::LabelComponent::InputText(input)
+                        if input.custom_id.as_str() == "value" && text.is_none() =>
+                    {
+                        text = Some(input.value.to_string())
+                    }
+                    discord::LabelComponent::SelectMenu(select)
+                        if select.custom_id.as_str() == "selection"
+                            && selected.is_none()
+                            && matches!(select.kind, discord::SelectMenuKind::String { .. })
+                            && select.values.len() == 1 =>
+                    {
+                        selected = Some(select.values[0].clone())
+                    }
+                    _ => return Err(Error::InvalidInteraction),
+                }
+            }
+            let text = text.ok_or(Error::InvalidInteraction)?;
+            request(
+                &s,
+                a.clone(),
+                Some((&text, selected.as_deref())),
+                &i.id.to_string(),
+            )?;
+            Ok((member, s, a, (text, selected)))
         })();
         let (member, s, a, input) =
             match resolved {
@@ -373,7 +423,7 @@ impl DiscordBootstrap {
             .run_private(
                 s,
                 a,
-                Some(&input),
+                Some((&input.0, input.1.as_deref())),
                 member,
                 &i.id.to_string(),
                 i.application_id.get(),
@@ -446,6 +496,7 @@ mod tests {
                         label: "Places".into(),
                         max_length: 1,
                         placeholder: "1–8".into(),
+                        select: None,
                     }),
                 },
             )]),
@@ -458,7 +509,7 @@ mod tests {
         let id = cards.insert(session()).unwrap();
         for interaction in ["111", "222"] {
             let (s, a) = cards.get(&id, "b0", &member()).unwrap();
-            let request = request(&s, a, Some("2"), interaction).unwrap();
+            let request = request(&s, a, Some(("2", None)), interaction).unwrap();
             assert_eq!(request.interaction_id.as_deref(), Some(interaction));
             let action = request.private_action.unwrap();
             assert_eq!(action.input["toon"], "toon:astro");
@@ -467,6 +518,40 @@ mod tests {
             assert!(!request.member_only);
         }
         assert!(cards.get(&id, "b0", &member()).is_ok());
+    }
+    #[test]
+    fn combined_modal_accepts_only_offered_choices_and_keeps_revision() {
+        let s = session();
+        let mut a = s.actions["b0"].clone();
+        a.input.remove("toon");
+        a.prompt.as_mut().unwrap().select = Some(oracle_core::PrivateCardPromptSelect {
+            option: "toon".into(),
+            label: "Toon".into(),
+            choices: vec![oracle_core::PrivateCardPromptOption {
+                label: "Pebble".into(),
+                value: "toon:pebble".into(),
+            }],
+        });
+        for selected in [None, Some("toon:astro"), Some(""), Some("actor_id")] {
+            assert!(request(&s, a.clone(), Some(("2", selected)), "111").is_err());
+        }
+        let accepted = request(&s, a.clone(), Some(("2", Some("toon:pebble"))), "111")
+            .unwrap()
+            .private_action
+            .unwrap();
+        assert_eq!(accepted.input["toon"], "toon:pebble");
+        assert_eq!(accepted.input["count"], "2");
+        assert_eq!(accepted.input["expected_revision"], 7);
+        assert!(a.input.get("toon").is_none());
+        assert!(
+            request(
+                &s,
+                s.actions["b0"].clone(),
+                Some(("2", Some("toon:pebble"))),
+                "111"
+            )
+            .is_err()
+        );
     }
     #[test]
     fn foreign_context_expiry_and_registry_revocation_fail_closed() {
@@ -504,7 +589,7 @@ mod tests {
         let id = cards.insert(session()).unwrap();
         let (s, a) = cards.get(&id, "b0", &member()).unwrap();
         for value in [None, Some(""), Some("12"), Some("😀")] {
-            assert!(request(&s, a.clone(), value, "111").is_err());
+            assert!(request(&s, a.clone(), value.map(|v| (v, None)), "111").is_err());
         }
         assert!(cards.get(&id, "b0", &member()).is_ok());
         assert_eq!(s.actions["b0"].input.get("count"), None);

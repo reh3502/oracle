@@ -257,12 +257,12 @@ async fn qualify_ui(
     .await
     .unwrap();
     let id = page["result"]["run_id"].as_str().unwrap().to_owned();
-    assert_eq!(page["reply"]["choices"].as_array().unwrap().len(), 25);
-    let first_choice = page["reply"]["choices"][0]["input"].clone();
-    let first_toon = first_choice["toon"].as_str().unwrap().to_owned();
-    let toon_card = ui(manager, guild, binding, "910", first_choice).await;
-    // Opening and abandoning a count modal must not alter the saved draft.
-    let count_input = control(&toon_card, "Set count");
+    let options = &page["reply"]["buttons"][0]["prompt"]["select"]["choices"];
+    assert_eq!(options.as_array().unwrap().len(), 25);
+    let first_toon = options[0]["value"].as_str().unwrap().to_owned();
+    // Opening and abandoning the combined Toon/count modal leaves the draft unchanged.
+    let mut count_input = control(&page, "Add or edit Toon");
+    count_input["toon"] = json!(first_toon);
     let before = saved_run(manager, guild, binding, "910", &id).await;
     page = call(
         manager,
@@ -284,10 +284,12 @@ async fn qualify_ui(
     page = ui(manager, guild, binding, "910", set_first).await;
     let mut reachable = BTreeSet::new();
     loop {
-        let choices = page["reply"]["choices"].as_array().unwrap();
+        let choices = page["reply"]["buttons"][0]["prompt"]["select"]["choices"]
+            .as_array()
+            .unwrap();
         assert!(choices.len() <= 25);
         for choice in choices {
-            assert!(reachable.insert(choice["input"]["toon"].as_str().unwrap().to_owned()));
+            assert!(reachable.insert(choice["value"].as_str().unwrap().to_owned()));
         }
         if !page["reply"]["buttons"]
             .as_array()
@@ -302,11 +304,13 @@ async fn qualify_ui(
     assert!(reachable.len() > 25);
     let all = before["eligibility"]["toons"].as_object().unwrap();
     assert_eq!(reachable, all.keys().cloned().collect());
-    let last_choice = page["reply"]["choices"][0]["input"].clone();
-    let last_toon = last_choice["toon"].as_str().unwrap().to_owned();
+    let last_toon = page["reply"]["buttons"][0]["prompt"]["select"]["choices"][0]["value"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_ne!(first_toon, last_toon);
-    let toon_card = ui(manager, guild, binding, "910", last_choice).await;
-    let mut set_last = control(&toon_card, "Set count");
+    let mut set_last = control(&page, "Add or edit Toon");
+    set_last["toon"] = json!(last_toon);
     set_last["count"] = json!("6");
     page = ui(manager, guild, binding, "910", set_last).await;
     let host = ui(

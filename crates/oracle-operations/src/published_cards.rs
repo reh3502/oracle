@@ -560,6 +560,33 @@ pub fn render_private_card(result: &Value) -> Result<PrivateCardPresentation> {
             {
                 return Err(invalid());
             }
+            // Prompt fields obey the same flat-data and actor-authority rules as pinned inputs.
+            private_action(
+                &b.operation,
+                &Map::from_iter([(p.option.clone(), json!("value"))]),
+            )?;
+            if let Some(select) = &mut p.select {
+                select.label = label(&select.label, 45, false)?;
+                if !name(&select.option)
+                    || select.option == p.option
+                    || b.input.contains_key(&select.option)
+                    || !(1..=25).contains(&select.choices.len())
+                {
+                    return Err(invalid());
+                }
+                let mut seen = std::collections::HashSet::new();
+                for choice in &mut select.choices {
+                    choice.label = label(&choice.label, 100, false)?;
+                    checked(&choice.value, 100, false)?;
+                    if !seen.insert(choice.value.clone()) {
+                        return Err(invalid());
+                    }
+                    private_action(
+                        &b.operation,
+                        &Map::from_iter([(select.option.clone(), json!(choice.value))]),
+                    )?;
+                }
+            }
         }
     }
     for c in &mut controls.choices {
@@ -625,6 +652,25 @@ mod private_tests {
         assert!(render_private_card(&v).is_err());
         let mut v = card();
         v["reply"]["buttons"][0]["input"]["count"] = json!("2");
+        assert!(render_private_card(&v).is_err());
+    }
+    #[test]
+    fn modal_selects_are_bounded_unique_and_cannot_supply_authority() {
+        let mut v = card();
+        v["reply"]["buttons"][0]["prompt"]["select"] = json!({"option":"toon","label":"Toon","choices":[{"label":"Pebble","value":"toon:pebble"}]});
+        assert!(render_private_card(&v).is_ok());
+        for key in ["count", "id", "actor_id", "permissions", "member"] {
+            let mut bad = v.clone();
+            bad["reply"]["buttons"][0]["prompt"]["select"]["option"] = json!(key);
+            assert!(render_private_card(&bad).is_err(), "{key}");
+        }
+        for size in [0, 2, 26] {
+            let mut bad = v.clone();
+            bad["reply"]["buttons"][0]["prompt"]["select"]["choices"] =
+                json!(vec![json!({"label":"Pebble","value":"toon:pebble"}); size]);
+            assert!(render_private_card(&bad).is_err());
+        }
+        v["reply"]["buttons"][0]["prompt"]["option"] = json!("actor_id");
         assert!(render_private_card(&v).is_err());
     }
     #[test]

@@ -394,16 +394,35 @@ pub fn render(stored: &StoredRun, actor: &Actor, input: &Input, notice: Option<&
             let page =
                 usize::from(input.page.unwrap_or(0)).min(available.len().saturating_sub(1) / 25);
             description.push_str(&format!(
-                "Page {} of {}. Select a Toon to set its count. Your other choices stay saved.",
+                "Page {} of {}. Open Add or edit Toon to choose a Toon and its count together. Your other choices stay saved.",
                 page + 1,
                 available.len().div_ceil(25)
             ));
-            for (toon, name) in available.iter().skip(page * 25).take(25) {
+            let options: Vec<_> = available
+                .iter()
+                .skip(page * 25)
+                .take(25)
+                .map(|(toon, name)| json!({"label":text(name,80),"value":toon}))
+                .collect();
+            if !options.is_empty() {
+                let mut add = prompt(
+                    run,
+                    "Add or edit Toon",
+                    "set_count",
+                    "count",
+                    "Number of places (1–8)",
+                    1,
+                    None,
+                );
+                add["prompt"]["select"] = json!({"option":"toon","label":"Toon","choices":options});
+                buttons.push(add);
+            }
+            for (toon, count) in run.allocations.iter().flat_map(|a| a.iter()) {
                 let mut choice = base(run, "view");
                 choice["view"] = json!("toon");
                 choice["toon"] = json!(toon);
                 choice["page"] = json!(page);
-                choices.push(json!({"label":text(name,80),"description":run.allocations.as_ref().and_then(|a|a.get(*toon)).map(|n|format!("{n} required")).unwrap_or_else(||"Add required Toon".into()),"operation":"run_ui","input":choice}));
+                choices.push(json!({"label":text(&toon_name(run,toon),80),"description":format!("{count} required · edit or remove"),"operation":"run_ui","input":choice}));
             }
             for (label, next) in [
                 ("Previous", page.checked_sub(1)),
