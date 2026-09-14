@@ -741,7 +741,7 @@ fn configure_fixture_worker(dir: &Path, script: &str) -> PathBuf {
     .unwrap();
     worker
 }
-async fn wait_for_refresh_result(dir: &Path, result: &str) -> Value {
+async fn wait_for_refresh_result(dir: &Path, result: &str, module: &DwModule) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(bytes) = fs::read(dir.join("refresh-schedule.json"))
@@ -756,8 +756,9 @@ async fn wait_for_refresh_result(dir: &Path, result: &str) -> Value {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "refresh attempt did not reach {result}: {:?}",
-            fs::read_to_string(dir.join("refresh-schedule.json"))
+            "refresh attempt did not reach {result}: {:?}; diagnostics: {}",
+            fs::read_to_string(dir.join("refresh-schedule.json")),
+            module.refresh.read().unwrap()
         )
     })
 }
@@ -776,7 +777,7 @@ async fn scheduled_access_denial_is_persisted_across_module_restart() {
     let h = Harness::new(module.clone());
     h.hello().await;
     h.initialize(json!({"data_directory":dir.0})).await.unwrap();
-    let state = wait_for_refresh_result(&dir.0, "source_denied").await;
+    let state = wait_for_refresh_result(&dir.0, "source_denied", &module).await;
     assert_eq!(state["stopped_denied"], true);
     assert!(state["last_success_ms"].is_null());
     assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
@@ -815,7 +816,12 @@ async fn stalled_refresh_keeps_queries_available_and_shutdown_reaps_worker() {
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "refresh worker did not start: {}",
+            module.refresh.read().unwrap()
+        )
+    });
     let pid = fs::read_to_string(worker.with_extension("pid")).unwrap();
     h.call("activate", json!({"guild":"123","epoch":2}))
         .await
@@ -865,7 +871,7 @@ async fn scheduled_candidate_requires_review_before_serving_changed_facts() {
     let h = Harness::new(module.clone());
     h.hello().await;
     h.initialize(json!({"data_directory":dir.0})).await.unwrap();
-    let state = wait_for_refresh_result(&dir.0, "review_required").await;
+    let state = wait_for_refresh_result(&dir.0, "review_required", &module).await;
     assert!(state["last_success_ms"].is_null());
     assert_eq!(module.engine.read().unwrap().as_ref().unwrap().id, first.id);
     let control = RefreshControl::new(&dir.0).unwrap();
@@ -917,7 +923,7 @@ async fn server_retry_floor_survives_worker_and_scheduler_boundaries() {
     let h = Harness::new(module.clone());
     h.hello().await;
     h.initialize(json!({"data_directory":dir.0})).await.unwrap();
-    let state = wait_for_refresh_result(&dir.0, "rate_limited").await;
+    let state = wait_for_refresh_result(&dir.0, "rate_limited", &module).await;
     assert!(state["next_due_ms"].as_u64().unwrap() >= floor);
     assert!(state["last_success_ms"].is_null());
     assert!(module.query("lookup", json!({"name":"Rock"}), NOW).is_ok());
@@ -1254,4 +1260,69 @@ async fn run_ingress_requires_outer_actor_before_any_callback() {
             .is_err()
     );
     h.close().await;
+}
+
+#[tokio::test]
+async fn refresh_waits_for_real_writer_lock_before_starting_source_work() {
+    let dir = Temp::new();
+    Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+        .unwrap();
+    let worker = configure_fixture_worker(
+        &dir.0,
+        "from pathlib import Path\nimport sys\nPath(__file__).with_suffix('.started').write_text('yes')\nsys.exit(3)\n",
+    );
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.0.join("writer.lock"))
+        .unwrap();
+    writer.lock().unwrap();
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module.clone());
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !worker.with_extension("started").exists(),
+        "no source access before durable schedule"
+    );
+    assert!(!dir.0.join("refresh-schedule.json").exists());
+    writer.unlock().unwrap();
+    let state = wait_for_refresh_result(&dir.0, "source_denied", &module).await;
+    assert!(state["stopped_denied"].as_bool().unwrap());
+    assert!(worker.with_extension("started").exists());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn cancelling_refresh_metadata_retry_never_starts_a_worker_after_shutdown() {
+    let dir = Temp::new();
+    Store::new(&dir.0)
+        .unwrap()
+        .publish_bytes(&serde_json::to_vec(&catalog()).unwrap())
+        .unwrap();
+    let worker = configure_fixture_worker(
+        &dir.0,
+        "from pathlib import Path\nimport sys\nPath(__file__).with_suffix('.started').write_text('yes')\nsys.exit(3)\n",
+    );
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.0.join("writer.lock"))
+        .unwrap();
+    writer.lock().unwrap();
+    let module = Arc::new(DwModule::default());
+    let h = Harness::new(module);
+    h.hello().await;
+    h.initialize(json!({"data_directory":dir.0})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(1), h.close())
+        .await
+        .expect("shutdown cancels metadata wait before its two-second retry budget");
+    writer.unlock().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!worker.with_extension("started").exists());
+    assert!(!dir.0.join("refresh-schedule.json").exists());
 }

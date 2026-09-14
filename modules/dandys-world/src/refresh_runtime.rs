@@ -46,11 +46,31 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, ()> {
     }
     Ok(Some(bytes))
 }
-fn save(root: &Path, schedule: &RefreshSchedule) -> Result<(), ()> {
+async fn save(
+    root: &Path,
+    schedule: &RefreshSchedule,
+    cancel: &oracle_module_sdk::CancellationToken,
+) -> Result<(), ()> {
     let bytes = serde_json::to_vec(schedule).map_err(|_| ())?;
-    Store::new(root)
-        .and_then(|store| store.write_refresh_file("refresh-schedule.json", &bytes))
-        .map_err(|_| ())
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if cancel.is_cancelled() {
+            return Err(());
+        }
+        match Store::new(root)
+            .and_then(|store| store.write_refresh_file("refresh-schedule.json", &bytes))
+        {
+            Ok(()) => return Ok(()),
+            Err(dandys_world_core::snapshot::Error::Busy)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                // A concurrent publisher or briefly inherited flock may own the
+                // writer. No source request is started until this exact state commits.
+                tokio::select! {biased; _=cancel.cancelled()=>return Err(()), _=tokio::time::sleep(Duration::from_millis(25))=>{}}
+            }
+            Err(_) => return Err(()),
+        }
+    }
 }
 fn report(diagnostics: &Diagnostics, message: impl Into<String>) {
     *diagnostics.write().unwrap() = message.into();
@@ -98,13 +118,15 @@ pub fn start(root: PathBuf, global: &TaskScope, diagnostics: Diagnostics) -> Res
             return Ok(());
         }
     };
-    if schedule.resume(&identity, now(), &limits, now()).is_err() || save(&root, &schedule).is_err()
-    {
+    if schedule.resume(&identity, now(), &limits, now()).is_err() {
         report(&diagnostics, "Stopped: cannot resume refresh schedule");
         return Ok(());
     }
     let cancel = global.cancellation();
     global.spawn("dw-wiki-refresh", async move {
+        if save(&root,&schedule,&cancel).await.is_err() {
+            report(&diagnostics,"Stopped: cannot resume refresh schedule");return Ok(());
+        }
         loop {
             if cancel.is_cancelled() { break; }
             if !schedule.due(now()) {
@@ -114,8 +136,8 @@ pub fn start(root: PathBuf, global: &TaskScope, diagnostics: Diagnostics) -> Res
                 tokio::select! { biased; _ = cancel.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
                 continue;
             }
-            if schedule.start(now()).is_err() || save(&root, &schedule).is_err() {
-                report(&diagnostics, "Stopped: cannot record refresh attempt"); break;
+            if schedule.start(now()).is_err() || save(&root,&schedule,&cancel).await.is_err() {
+                report(&diagnostics,"Stopped: cannot record refresh attempt");break;
             }
             report(&diagnostics, "Wiki refresh running; queries use the current snapshot");
             let mut retry_floor = None;
@@ -147,8 +169,8 @@ pub fn start(root: PathBuf, global: &TaskScope, diagnostics: Diagnostics) -> Res
                     _ => AttemptResult::Interrupted,
                 },
             };
-            if schedule.finish_with_retry_after(result, now(), &limits, now(), retry_floor).is_err() || save(&root, &schedule).is_err() {
-                report(&diagnostics, "Stopped: cannot record refresh result"); break;
+            if schedule.finish_with_retry_after(result,now(),&limits,now(),retry_floor).is_err() || save(&root,&schedule,&cancel).await.is_err() {
+                report(&diagnostics,"Stopped: cannot record refresh result");break;
             }
         }
         Ok(())
