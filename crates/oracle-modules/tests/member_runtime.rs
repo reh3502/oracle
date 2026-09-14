@@ -4,7 +4,10 @@ use oracle_core::{
     member_read::{MemberContext, MemberReadPolicy},
     *,
 };
-use oracle_modules::{ModuleCatalogEntry, ModuleManager, runtime_settings::ModuleRuntimeSettings};
+use oracle_modules::{
+    ConfigurationPolicy, DispatchPermit, ModuleCatalogEntry, ModuleManager, NotificationCheck,
+    NotificationRequest, NotificationTransport, runtime_settings::ModuleRuntimeSettings,
+};
 use oracle_storage::{DatabaseConfig, Storage};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +19,50 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio_util::sync::CancellationToken;
+
+// The real host supplies these services for manifests declaring configuration
+// and subscriptions. This wiki-only fixture grants neither capability, applies
+// no run configuration, and never enables member mutations.
+struct WikiOnlyPolicy;
+#[async_trait::async_trait]
+impl ConfigurationPolicy for WikiOnlyPolicy {
+    async fn validate(
+        &self,
+        _: &PolicyContext,
+        _: &GuildId,
+        _: &ModuleId,
+        _: &Value,
+    ) -> Result<()> {
+        Err(Error::new(ErrorCode::ForbiddenPermission))
+    }
+    async fn validate_subscriptions(
+        &self,
+        _: &PolicyContext,
+        _: &GuildId,
+        _: &ModuleId,
+        subscriptions: &[GuildEventKind],
+    ) -> Result<()> {
+        if subscriptions == [GuildEventKind::Maintenance] {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorCode::ForbiddenPermission))
+        }
+    }
+}
+struct NoSend;
+#[async_trait::async_trait]
+impl NotificationTransport for NoSend {
+    async fn send(
+        &self,
+        _: &NotificationRequest,
+        _: &DispatchPermit,
+        _: &dyn NotificationCheck,
+        _: CancellationToken,
+    ) -> Result<Value> {
+        panic!("wiki-only qualification must not send Discord messages")
+    }
+}
 
 const PREFIX: &str = "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=";
 struct Temp(PathBuf);
@@ -178,7 +225,13 @@ async fn run(postgres: bool) {
     ));
     let manager =
         ModuleManager::new(storage.clone(), core.clone(), temp.0.join("artifacts")).unwrap();
-    // Install verifies the real v2 DW schema. A descriptor/schema mismatch fails before spawning.
+    manager
+        .set_configuration_services(storage.clone(), Arc::new(WikiOnlyPolicy))
+        .unwrap();
+    manager
+        .set_event_services(BTreeSet::from(["guilds".into()]), Arc::new(NoSend))
+        .unwrap();
+    // Install verifies the real DW schema. A descriptor/schema mismatch fails before spawning.
     let bad = package(&temp.0, &binary, "bad-package", |m| {
         let ModuleCommandInput::Typed { options } = m.commands.as_mut().unwrap().routes[0]
             .input
@@ -223,10 +276,14 @@ async fn run(postgres: bool) {
         .await
         .unwrap();
     assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o700);
-    assert!(
-        manager.load(&installed.digest).await.is_err(),
-        "empty snapshot directory must fail initialization"
-    );
+    manager
+        .load(&installed.digest)
+        .await
+        .expect("configured empty catalog permits durable run recovery");
+    manager
+        .unload(&module, Duration::from_secs(3))
+        .await
+        .unwrap();
     snapshot(&directory);
     manager.load(&installed.digest).await.unwrap();
     for g in [&guild, &other] {
@@ -235,6 +292,10 @@ async fn run(postgres: bool) {
             .await
             .unwrap();
     }
+    assert!(
+        manager.event_health().is_empty(),
+        "wiki-only activation must not admit Maintenance work"
+    );
     let actor = member(&guild);
     let ordinary = PolicyContext::Discord {
         guild: guild.clone(),
@@ -310,7 +371,13 @@ async fn run(postgres: bool) {
         answer.value["reply"]["text"]
             .as_str()
             .unwrap()
-            .contains("Value: 2")
+            .contains("2 hearts")
+    );
+    assert!(
+        answer.value["reply"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Two synthetic fixture hearts")
     );
     assert_eq!(answer.value["reply"]["citations"][0]["revision"], 2);
     answer.policy.check().unwrap();
