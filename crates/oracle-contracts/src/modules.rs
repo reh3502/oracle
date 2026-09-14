@@ -306,7 +306,22 @@ impl ModuleCommands {
 struct ModuleCommandsV2 {
     namespace: String,
     description: String,
+    #[serde(deserialize_with = "legacy_routes")]
     routes: Vec<ModuleCommandRoute>,
+}
+fn legacy_routes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ModuleCommandRoute>, D::Error> {
+    let routes = Vec::<ModuleCommandRoute>::deserialize(d)?;
+    if routes.iter().any(|route| {
+        matches!(
+            route.presentation,
+            Some(ModulePresentation::PrivateCardV2 { .. })
+        )
+    }) {
+        return Err(serde::de::Error::custom("v3 presentation"));
+    }
+    Ok(routes)
 }
 impl From<ModuleCommandsV2> for ModuleCommands {
     fn from(v: ModuleCommandsV2) -> Self {

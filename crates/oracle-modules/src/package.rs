@@ -695,16 +695,17 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
                     Some(ModulePresentation::CardV1 { pointer }) => {
                         validate_card_presentation(pointer, &operation.output_schema)?
                     }
-                    Some(ModulePresentation::PrivateCardV2 { pointer }) => {
+                    Some(ModulePresentation::PrivateCardV2 { pointer })
                         if manifest.manifest_version != 3
                             || operation.audience != ModuleAudience::MemberMutation
                             || pointer != "/reply"
                             || operation.output_schema["type"] != "object"
-                            || operation.output_schema["properties"]["reply"]["type"] != "object"
-                        {
-                            return Err(err(ErrorCode::InvalidInput));
-                        }
+                            || operation.output_schema["properties"]["reply"]["type"]
+                                != "object" =>
+                    {
+                        return Err(err(ErrorCode::InvalidInput));
                     }
+                    Some(ModulePresentation::PrivateCardV2 { .. }) => {}
                     None => {}
                 }
             }
@@ -1487,6 +1488,10 @@ mod tests {
             },
         ];
         assert!(validate_manifest(&manifest).is_err());
+        let mut old_presentation = serde_json::to_value(member_manifest()).unwrap();
+        old_presentation["commands"]["routes"][0]["presentation"] =
+            json!({"kind":"private_card_v2","pointer":"/reply"});
+        assert!(serde_json::from_value::<ModuleManifest>(old_presentation).is_err());
         // Even an explicitly empty aliases field must not extend a v2 wire shape.
         let mut legacy = serde_json::to_value(member_manifest()).unwrap();
         legacy["commands"]["aliases"] = json!([]);
