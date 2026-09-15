@@ -418,7 +418,7 @@ async fn qualify_ui(
     assert_eq!(draft["state"], "draft");
     let mut schedule = control(&review, "Set date & duration");
     schedule["starts_at"] = json!("2099-01-01 20:00");
-    schedule["timezone"] = json!("America/New_York");
+    // A plain local date uses the configured UX default when timezone is omitted.
     schedule["duration"] = json!("1h 30m");
     let review = ui(manager, guild, binding, "910", schedule).await;
     assert!(
@@ -510,7 +510,7 @@ async fn qualify_ui(
     assert!(!casual["reply"].to_string().contains("set_count"));
     let mut schedule = control(&casual, "Set date & duration");
     schedule["starts_at"] = json!("<t:4070908800:F>");
-    schedule["timezone"] = json!("UTC");
+    // A Hammertime timestamp must work without any timezone input.
     schedule["duration"] = json!("90m");
     let casual = ui(manager, guild, binding, "920", schedule).await;
     ui(manager, guild, binding, "920", control(&casual, "Post run")).await;

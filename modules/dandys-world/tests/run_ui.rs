@@ -407,3 +407,30 @@ fn public_manage_opens_private_controls_only_for_managers() {
     );
     assert!(!denied.to_string().contains("\"action\":\"cancel\""));
 }
+
+#[test]
+fn timestamp_schedule_edit_keeps_timestamp_and_places_optional_timezone_last() {
+    let mut stored = draft(RunMode::Casual);
+    stored.run.schedule.as_mut().unwrap().timezone = None;
+    let card = ui::render(
+        &stored,
+        &owner(),
+        &Input::show(&stored.run.id, View::Review),
+        None,
+    );
+    let edit = card["buttons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["input"]["action"] == "set_schedule")
+        .unwrap();
+    let prompt = &edit["prompt"];
+    assert_eq!(
+        prompt["value"],
+        format!("<t:{}:F>", stored.run.schedule.as_ref().unwrap().starts_at)
+    );
+    assert_eq!(prompt["additional_fields"][0]["option"], "duration");
+    assert_eq!(prompt["additional_fields"][1]["option"], "timezone");
+    assert_eq!(prompt["additional_fields"][1]["required"], false);
+    assert!(prompt["additional_fields"][1]["value"].is_null());
+}

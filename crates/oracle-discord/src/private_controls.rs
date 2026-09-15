@@ -169,17 +169,24 @@ fn request(
                 (None, None) => {}
                 _ => return Err(Error::InvalidInteraction),
             }
-            if fields.len() != p.additional_fields.len() {
+            if fields
+                .keys()
+                .any(|key| !(0..p.additional_fields.len()).any(|i| key == &format!("extra{i}")))
+            {
                 return Err(Error::InvalidInteraction);
             }
             for (index, field) in p.additional_fields.iter().enumerate() {
                 let value = fields
                     .get(&format!("extra{index}"))
-                    .ok_or(Error::InvalidInteraction)?;
-                if value.trim().is_empty()
-                    || value.encode_utf16().count() > usize::from(field.max_length)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if value.encode_utf16().count() > usize::from(field.max_length)
+                    || field.required && value.trim().is_empty()
                 {
                     return Err(Error::InvalidInteraction);
+                }
+                if value.trim().is_empty() {
+                    continue;
                 }
                 values.insert(field.option.clone(), Value::String(value.trim().into()));
             }
@@ -490,7 +497,7 @@ impl DiscordBootstrap {
                 )
                 .placeholder(field.placeholder.clone())
                 .max_length(field.max_length)
-                .required(true);
+                .required(field.required);
                 if let Some(value) = &field.value {
                     input = input.value(value.clone());
                 }
@@ -956,5 +963,38 @@ mod tests {
             assert!(request(&s, a.clone(), Some(("2099-01-01 20:00", None, &bad)), "111").is_err());
         }
         assert!(!a.input.contains_key("duration"));
+    }
+    #[test]
+    fn timestamp_form_allows_blank_or_absent_optional_timezone_but_requires_duration() {
+        let s = session();
+        let mut a = s.actions["b0"].clone();
+        let p = a.prompt.as_mut().unwrap();
+        p.option = "starts_at".into();
+        p.max_length = 100;
+        p.additional_fields = serde_json::from_value(serde_json::json!([
+            {"option":"duration","label":"Duration","max_length":40},
+            {"option":"timezone","label":"Time zone","max_length":100,"required":false}
+        ]))
+        .unwrap();
+        for fields in [
+            HashMap::from([("extra0".into(), "90m".into())]),
+            HashMap::from([
+                ("extra0".into(), "90m".into()),
+                ("extra1".into(), " ".into()),
+            ]),
+        ] {
+            let result = request(
+                &s,
+                a.clone(),
+                Some(("<t:1800000000:F>", None, &fields)),
+                "111",
+            )
+            .unwrap();
+            let input = result.private_action.unwrap().input;
+            assert_eq!(input["duration"], "90m");
+            assert!(!input.contains_key("timezone"));
+        }
+        let fields = HashMap::from([("extra1".into(), "UTC".into())]);
+        assert!(request(&s, a, Some(("<t:1800000000:F>", None, &fields)), "111").is_err());
     }
 }

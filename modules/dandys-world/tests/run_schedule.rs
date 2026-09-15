@@ -307,7 +307,7 @@ fn editing_duration_preserves_a_pasted_start_with_seconds() {
         .unwrap()["prompt"];
     let parsed = dandys_world_core::runs::schedule::parse_start(
         prompt["value"].as_str().unwrap(),
-        prompt["additional_fields"][0]["value"].as_str(),
+        prompt["additional_fields"][1]["value"].as_str(),
     )
     .unwrap();
     assert_eq!(parsed.starts_at, 1_800_003_630);

@@ -81,10 +81,18 @@ pub struct PrivateCardPromptField {
     pub option: String,
     pub label: String,
     pub max_length: u16,
+    #[serde(default = "required_field", skip_serializing_if = "is_required_field")]
+    pub required: bool,
     #[serde(default)]
     pub placeholder: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+}
+fn required_field() -> bool {
+    true
+}
+fn is_required_field(required: &bool) -> bool {
+    *required
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

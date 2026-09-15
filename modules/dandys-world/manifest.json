@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "id": "community.dandys-world",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "target": "x86_64-unknown-linux-gnu",
   "protocol_major": 1,
   "protocol_minor_min": 2,
-  "host_api": "^1.6",
+  "host_api": "^1.7",
   "data_version": 5,
   "readable_data_versions": [
     5
@@ -1894,6 +1894,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -2206,6 +2209,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -2656,6 +2662,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -3051,6 +3060,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -3370,6 +3382,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -3687,6 +3702,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -4004,6 +4022,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -4310,6 +4331,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -4768,6 +4792,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [
@@ -5086,6 +5113,9 @@
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 200
+                              },
+                              "required": {
+                                "type": "boolean"
                               }
                             },
                             "required": [

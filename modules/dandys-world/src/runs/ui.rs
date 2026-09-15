@@ -280,7 +280,7 @@ fn schedule_button(run: &Run) -> Value {
     );
     button["prompt"]["placeholder"] =
         json!("YYYY-MM-DD HH:MM (24-hour) or paste a Hammertime timestamp");
-    let mut zone = json!({"option":"timezone","label":"Time zone","max_length":100,"placeholder":"e.g. America/New_York, Europe/London, UTC"});
+    let mut zone = json!({"option":"timezone","label":"Time zone (local dates only)","required":false,"max_length":100,"placeholder":"Blank = America/New_York; not needed for timestamps"});
     let mut duration = json!({"option":"duration","label":"Estimated duration","max_length":40,"placeholder":"e.g. 90m or 1h 30m"});
     if let Some(schedule) = &run.schedule {
         let input_zone = schedule
@@ -289,7 +289,7 @@ fn schedule_button(run: &Run) -> Value {
             .unwrap_or("UTC")
             .parse::<chrono_tz::Tz>()
             .unwrap_or(chrono_tz::UTC);
-        if schedule.starts_at % 60 != 0 {
+        if schedule.timezone.is_none() || schedule.starts_at % 60 != 0 {
             button["prompt"]["value"] = json!(format!("<t:{}:F>", schedule.starts_at));
         } else if let Some(start) = chrono::DateTime::from_timestamp(schedule.starts_at, 0) {
             button["prompt"]["value"] = json!(
@@ -299,10 +299,12 @@ fn schedule_button(run: &Run) -> Value {
                     .to_string()
             );
         }
-        zone["value"] = json!(schedule.timezone.as_deref().unwrap_or("UTC"));
+        if let Some(timezone) = &schedule.timezone {
+            zone["value"] = json!(timezone);
+        }
         duration["value"] = json!(format!("{}m", schedule.duration_minutes));
     }
-    button["prompt"]["additional_fields"] = json!([zone, duration]);
+    button["prompt"]["additional_fields"] = json!([duration, zone]);
     button
 }
 fn setup_fields(run: &Run) -> Vec<Value> {

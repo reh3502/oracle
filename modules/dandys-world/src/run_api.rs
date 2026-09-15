@@ -172,7 +172,14 @@ pub async fn invoke(
             let parsed = (|| {
                 let start = dandys_world_core::runs::schedule::parse_start(
                     options.starts_at.as_deref().unwrap_or(""),
-                    options.timezone.as_deref(),
+                    Some(
+                        options
+                            .timezone
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("America/New_York"),
+                    ),
                 )?;
                 let duration = dandys_world_core::runs::schedule::parse_duration(
                     options.duration.as_deref().unwrap_or(""),
