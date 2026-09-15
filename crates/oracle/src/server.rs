@@ -182,18 +182,7 @@ async fn run(
         let shared_stop = stop.clone();
         tasks
             .spawn("shared_cards", async move {
-                loop {
-                    tokio::select! {biased;
-                        _ = shared_stop.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                    }
-                    if let Err(error) = shared.tick(&shared_stop).await {
-                        if shared_stop.is_cancelled() {
-                            return Ok(());
-                        }
-                        tracing::warn!(error=?error.code, "shared card reconciliation deferred");
-                    }
-                }
+                shared.run(shared_stop).await.map_err(|_| TaskError)
             })
             .map_err(|_| Error::new(ErrorCode::Cancelled))?;
     }

@@ -11,8 +11,71 @@ use oracle_discord::{
 use oracle_modules::{SharedCardDispatch, SharedCardService};
 use oracle_operations::{executor::DispatchFence, published::render_private_card, shared_cards::*};
 use serde_json::{Value, json};
-use std::sync::{Arc, Weak};
+use std::time::Duration;
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::{Arc, Mutex, Weak},
+};
+use tokio::{sync::Notify, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+type CardKey = (GuildId, ModuleId, String);
+fn dirty(phase: &SharedPhase) -> bool {
+    matches!(phase, SharedPhase::Pending | SharedPhase::Unknown)
+}
+#[derive(Default)]
+struct ReadyCards {
+    queue: VecDeque<CardKey>,
+}
+impl ReadyCards {
+    fn push(&mut self, key: CardKey) {
+        if !self.queue.contains(&key) {
+            self.queue.push_back(key);
+        }
+    }
+    fn prioritize(&mut self, key: CardKey) {
+        if let Some(index) = self.queue.iter().position(|pending| pending == &key) {
+            self.queue.remove(index);
+        }
+        self.queue.push_front(key);
+    }
+    fn pop(&mut self, active: &BTreeSet<CardKey>) -> Option<CardKey> {
+        let index = self.queue.iter().position(|key| !active.contains(key))?;
+        self.queue.remove(index)
+    }
+}
+
+#[derive(Default)]
+struct PendingCards {
+    ready: Mutex<ReadyCards>,
+    wake: Notify,
+}
+impl PendingCards {
+    fn push(&self, key: CardKey) {
+        self.ready.lock().unwrap().prioritize(key);
+        self.wake.notify_one();
+    }
+    fn recover(&self, key: CardKey) {
+        self.ready.lock().unwrap().push(key);
+        self.wake.notify_one();
+    }
+    fn pop(&self, active: &BTreeSet<CardKey>) -> Option<CardKey> {
+        self.ready.lock().unwrap().pop(active)
+    }
+    fn next(
+        &self,
+        active: &BTreeSet<CardKey>,
+        probe: &mut Option<CardKey>,
+        probe_active: bool,
+    ) -> Option<(CardKey, bool)> {
+        self.pop(active).map(|key| (key, false)).or_else(|| {
+            if probe_active || active.contains(probe.as_ref()?) {
+                return None;
+            }
+            probe.take().map(|key| (key, true))
+        })
+    }
+}
 
 pub(crate) struct SharedCards {
     host: Weak<Host>,
@@ -20,6 +83,7 @@ pub(crate) struct SharedCards {
     pub journal: SharedCardJournal,
     destinations: Vec<SharedCardDestination>,
     cursor: std::sync::Mutex<usize>,
+    pending: PendingCards,
 }
 impl SharedCards {
     pub async fn run_reminders(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
@@ -36,6 +100,7 @@ impl SharedCards {
             journal: SharedCardJournal::new(host.storage.clone()),
             destinations,
             cursor: std::sync::Mutex::new(0),
+            pending: PendingCards::default(),
         })
     }
     fn host(&self) -> Result<Arc<Host>> {
@@ -52,9 +117,14 @@ impl SharedCards {
             .map(|binding| binding.channel.as_str())
             .ok_or_else(|| Error::new(ErrorCode::ForbiddenScope))
     }
-    pub async fn tick(self: &Arc<Self>, cancel: &CancellationToken) -> Result<()> {
-        let mut work = Vec::new();
-        let mut scopes = std::collections::BTreeSet::new();
+    fn queue(&self, key: CardKey) {
+        self.pending.push(key);
+    }
+    /// Scanning the durable journal recovers work after restart or a lost wakeup.
+    /// Only one unchanged publication is probed per scan; mutations use separate lanes.
+    async fn scan(&self) -> Result<Option<CardKey>> {
+        let mut probes = Vec::new();
+        let mut scopes = BTreeSet::new();
         for binding in &self.destinations {
             if scopes.insert((&binding.guild, &binding.module)) {
                 for id in self
@@ -62,29 +132,71 @@ impl SharedCards {
                     .run_ids(&binding.guild, &binding.module)
                     .await?
                 {
-                    work.push((binding.guild.clone(), binding.module.clone(), id));
+                    let key = (binding.guild.clone(), binding.module.clone(), id);
+                    if let Some((_, record)) = self.journal.get(&key.0, &key.1, &key.2).await? {
+                        if dirty(&record.phase) {
+                            self.pending.recover(key);
+                        } else if record.phase == SharedPhase::Confirmed && !record.desired.delete {
+                            probes.push(key);
+                        }
+                    }
                 }
             }
         }
-        if work.is_empty() {
-            return Ok(());
+        if probes.is_empty() {
+            return Ok(None);
         }
-        let start = {
-            let mut cursor = self.cursor.lock().unwrap();
-            let start = *cursor % work.len();
-            *cursor = (start + 4) % work.len();
-            start
-        };
-        for offset in 0..work.len().min(4) {
-            if cancel.is_cancelled() {
-                return Err(Error::new(ErrorCode::Cancelled));
+        let mut cursor = self.cursor.lock().unwrap();
+        let selected = probes[*cursor % probes.len()].clone();
+        *cursor = (*cursor + 1) % probes.len();
+        Ok(Some(selected))
+    }
+    pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut active = BTreeSet::new();
+        let mut jobs = JoinSet::new();
+        let mut probe = None;
+        let mut probe_active = false;
+        loop {
+            while jobs.len() < 4 {
+                let next = self.pending.next(&active, &mut probe, probe_active);
+                let Some((key, background)) = next else {
+                    break;
+                };
+                active.insert(key.clone());
+                probe_active |= background;
+                let worker = self.clone();
+                let stop = cancel.child_token();
+                jobs.spawn(async move {
+                    if let Err(error) = worker.reconcile(&key.0, &key.1, &key.2, &stop).await {
+                        tracing::debug!(guild=%key.0,module=%key.1,run=%key.2,error=?error.code,"shared card remains pending");
+                    }
+                    (key, background)
+                });
             }
-            let (guild, module, id) = &work[(start + offset) % work.len()];
-            if let Err(error) = self.reconcile(guild, module, id, cancel).await {
-                tracing::debug!(%guild,%module,run=%id,error=?error.code,"shared card remains pending");
+            tokio::select! { biased;
+                _ = cancel.cancelled() => {
+                    // Cancellation is forwarded to each fenced operation before joining.
+                    while jobs.join_next().await.is_some() {}
+                    return Ok(());
+                }
+                completed = jobs.join_next(), if !jobs.is_empty() => {
+                    let (key, background) = completed
+                        .ok_or_else(|| Error::new(ErrorCode::Integrity))?
+                        .map_err(|_| Error::new(ErrorCode::Integrity))?;
+                    active.remove(&key);
+                    if background { probe_active = false; }
+                }
+                _ = self.pending.wake.notified() => {}
+                _ = interval.tick() => {
+                    match self.scan().await {
+                        Ok(next) => probe = next,
+                        Err(error) => tracing::warn!(error=?error.code,"shared card scan deferred"),
+                    }
+                }
             }
         }
-        Ok(())
     }
     async fn reconcile(
         self: &Arc<Self>,
@@ -275,9 +387,11 @@ impl SharedCardService for SharedCards {
         self.destination(guild, module, &intent.destination)?;
         render_private_card(&json!({"reply":{"card":intent.card,"choices":[],"buttons":[]}}))?;
         let id = intent.key.clone();
-        Ok(status(
-            &self.journal.enqueue(guild, module, &id, intent).await?,
-        ))
+        let record = self.journal.enqueue(guild, module, &id, intent).await?;
+        if dirty(&record.phase) {
+            self.queue((guild.clone(), module.clone(), id));
+        }
+        Ok(status(&record))
     }
     async fn status(&self, module: &ModuleId, guild: &GuildId, intent_key: &str) -> Result<Value> {
         let record = self.journal.get(guild, module, intent_key).await?;
@@ -336,5 +450,87 @@ impl SharedCardAuthority for SharedCards {
             )
             .await?;
         Ok(Arc::new(WorkerFence(lease)))
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    fn key(run: &str) -> CardKey {
+        (
+            "123".parse().unwrap(),
+            "test.runs".parse().unwrap(),
+            run.into(),
+        )
+    }
+    #[test]
+    fn durable_mutations_and_recovery_have_priority_over_confirmed_probes() {
+        assert!(dirty(&SharedPhase::Pending));
+        assert!(dirty(&SharedPhase::Unknown));
+        for phase in [
+            SharedPhase::Confirmed,
+            SharedPhase::Missing,
+            SharedPhase::Rejected,
+        ] {
+            assert!(!dirty(&phase));
+        }
+    }
+    #[test]
+    fn queued_signup_runs_before_presence_probe_and_other_probes_cannot_fill_lanes() {
+        let queue = PendingCards::default();
+        let active = BTreeSet::new();
+        let mut probe = Some(key("unchanged"));
+        queue.recover(key("older-recovery"));
+        queue.push(key("signup"));
+        assert_eq!(
+            queue.next(&active, &mut probe, false),
+            Some((key("signup"), false))
+        );
+        assert_eq!(probe, Some(key("unchanged")));
+        assert_eq!(
+            queue.next(&active, &mut probe, false),
+            Some((key("older-recovery"), false))
+        );
+        assert!(queue.next(&active, &mut probe, true).is_none());
+        assert_eq!(
+            queue.next(&active, &mut probe, false),
+            Some((key("unchanged"), true))
+        );
+    }
+    #[test]
+    fn rapid_changes_coalesce_but_changes_during_dispatch_remain_queued() {
+        let queue = PendingCards::default();
+        let first = key("first");
+        let other = key("other");
+        queue.push(first.clone());
+        queue.push(first.clone());
+        let mut active = BTreeSet::new();
+        assert_eq!(queue.pop(&active), Some(first.clone()));
+        assert!(queue.pop(&active).is_none());
+        active.insert(first.clone());
+        queue.push(first.clone());
+        queue.push(other.clone());
+        assert_eq!(queue.pop(&active), Some(other));
+        assert!(queue.pop(&active).is_none());
+        active.clear();
+        assert_eq!(queue.pop(&active), Some(first));
+    }
+    #[tokio::test]
+    async fn enqueue_wakes_idle_worker_without_waiting_for_five_second_scan() {
+        let queue = PendingCards::default();
+        // An enqueue that races just before the worker starts waiting retains a permit.
+        queue.push(key("before-wait"));
+        tokio::time::timeout(Duration::from_millis(100), queue.wake.notified())
+            .await
+            .unwrap();
+        assert_eq!(queue.pop(&BTreeSet::new()), Some(key("before-wait")));
+        let waiting = queue.wake.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        queue.push(key("during-wait"));
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap();
+        assert_eq!(queue.pop(&BTreeSet::new()), Some(key("during-wait")));
     }
 }
