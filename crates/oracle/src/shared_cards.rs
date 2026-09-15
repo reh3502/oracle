@@ -122,7 +122,7 @@ impl SharedCards {
     }
     /// Scanning the durable journal recovers work after restart or a lost wakeup.
     /// Only one unchanged publication is probed per scan; mutations use separate lanes.
-    async fn scan(&self) -> Result<Option<CardKey>> {
+    async fn scan(&self, probe_due: bool) -> Result<Option<CardKey>> {
         let mut probes = Vec::new();
         let mut scopes = BTreeSet::new();
         for binding in &self.destinations {
@@ -143,7 +143,7 @@ impl SharedCards {
                 }
             }
         }
-        if probes.is_empty() {
+        if !probe_due || probes.is_empty() {
             return Ok(None);
         }
         let mut cursor = self.cursor.lock().unwrap();
@@ -158,6 +158,7 @@ impl SharedCards {
         let mut jobs = JoinSet::new();
         let mut probe = None;
         let mut probe_active = false;
+        let mut next_probe = tokio::time::Instant::now();
         loop {
             while jobs.len() < 4 {
                 let next = self.pending.next(&active, &mut probe, probe_active);
@@ -169,9 +170,11 @@ impl SharedCards {
                 let worker = self.clone();
                 let stop = cancel.child_token();
                 jobs.spawn(async move {
+                    let started = std::time::Instant::now();
                     if let Err(error) = worker.reconcile(&key.0, &key.1, &key.2, &stop).await {
                         tracing::debug!(guild=%key.0,module=%key.1,run=%key.2,error=?error.code,"shared card remains pending");
                     }
+                    tracing::debug!(guild=%key.0,module=%key.1,run=%key.2,background,elapsed_ms=started.elapsed().as_millis() as u64,"shared card reconciliation finished");
                     (key, background)
                 });
             }
@@ -190,8 +193,12 @@ impl SharedCards {
                 }
                 _ = self.pending.wake.notified() => {}
                 _ = interval.tick() => {
-                    match self.scan().await {
-                        Ok(next) => probe = next,
+                    let probe_due = tokio::time::Instant::now() >= next_probe;
+                    match self.scan(probe_due).await {
+                        Ok(next) => if probe_due {
+                            probe = next;
+                            next_probe = tokio::time::Instant::now() + Duration::from_secs(60);
+                        },
                         Err(error) => tracing::warn!(error=?error.code,"shared card scan deferred"),
                     }
                 }
@@ -284,7 +291,11 @@ impl SharedCards {
             return Ok(());
         }
         let channel = self.destination(guild, module, &record.desired.destination)?;
-        let target = self.adapter.shared_target(guild, channel, cancel).await?;
+        let target = match &record.identity {
+            Some(identity) if identity.target.channel_id == channel => identity.target.clone(),
+            Some(_) => return Err(Error::new(ErrorCode::ForbiddenScope)),
+            None => self.adapter.shared_target(guild, channel, cancel).await?,
+        };
         let effect_id = uuid::Uuid::new_v4().to_string();
         if record.desired.delete {
             let identity = record

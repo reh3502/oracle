@@ -102,7 +102,7 @@ impl DiscordOperations {
             .await
             .copied()
     }
-    async fn application_id(&self) -> Result<discord::ApplicationId> {
+    pub(crate) async fn application_id(&self) -> Result<discord::ApplicationId> {
         self.application
             .get_or_try_init(|| async {
                 let id = read(self.http.get_current_application_info()).await?.id;
@@ -147,11 +147,19 @@ impl DiscordOperations {
                 discord::UserId::new(sid(user.as_str())?)
             }
         };
-        let (details, actor, bot) = tokio::try_join!(
-            read(self.http.get_guild(guild_id)),
-            read(self.http.get_member(guild_id, actor_id)),
-            read(self.http.get_member(guild_id, bot_id))
-        )?;
+        let (details, actor, bot) = if actor_id == bot_id {
+            let (details, bot) = tokio::try_join!(
+                read(self.http.get_guild(guild_id)),
+                read(self.http.get_member(guild_id, bot_id))
+            )?;
+            (details, bot.clone(), bot)
+        } else {
+            tokio::try_join!(
+                read(self.http.get_guild(guild_id)),
+                read(self.http.get_member(guild_id, actor_id)),
+                read(self.http.get_member(guild_id, bot_id))
+            )?
+        };
         if details.id != guild_id
             || actor.user.id != actor_id
             || bot.user.id != bot_id

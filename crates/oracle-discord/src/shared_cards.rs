@@ -28,17 +28,20 @@ impl DiscordSharedCards {
     pub fn new(adapter: Arc<DiscordOperations>, authority: Arc<dyn SharedCardAuthority>) -> Self {
         Self { adapter, authority }
     }
-    async fn fresh(&self, effect: &SharedEffect) -> Result<()> {
+    async fn identity(&self, effect: &SharedEffect) -> Result<()> {
         self.authority
             .authorize(effect)
             .await?
             .dispatch(&mut || Ok(()))?;
-        let app = read(self.adapter.http.get_current_application_info()).await?;
-        if app.id.to_string() != effect.target.application_id
+        if self.adapter.application_id().await?.to_string() != effect.target.application_id
             || self.adapter.bot_id().await?.to_string() != effect.target.bot_id
         {
             return Err(Error::new(ErrorCode::ForbiddenScope));
         }
+        Ok(())
+    }
+    async fn fresh(&self, effect: &SharedEffect) -> Result<()> {
+        self.identity(effect).await?;
         // Re-fetch the bot's complete channel permission facts together.
         let snapshot = self
             .adapter
@@ -72,7 +75,9 @@ impl DiscordSharedCards {
         Ok(())
     }
     async fn observe_inner(&self, effect: &SharedEffect) -> Result<SharedObservation> {
-        self.fresh(effect).await?;
+        // Successful exact-message GETs enforce Discord read access themselves.
+        // Refresh full permissions only when absence could be caused by lost access.
+        self.identity(effect).await?;
         let channel = discord::GenericChannelId::new(sid(&effect.target.channel_id)?);
         if let Some(id) = &effect.message_id {
             let fetched = tokio::time::timeout(
@@ -82,31 +87,15 @@ impl DiscordSharedCards {
                     .get_message(channel, discord::MessageId::new(sid(id)?)),
             )
             .await;
-            return match fetched {
-                Ok(Ok(message)) => Ok(
-                    if confirms(
-                        effect,
-                        &serde_json::to_value(message)
-                            .map_err(|_| Error::new(ErrorCode::InvalidInput))?,
-                    ) {
-                        SharedObservation::Confirmed {
-                            message_id: id.clone(),
-                        }
-                    } else {
-                        SharedObservation::Unknown
-                    },
+            let found = match fetched {
+                Ok(Ok(message)) => MessageRead::Found(
+                    serde_json::to_value(message)
+                        .map_err(|_| Error::new(ErrorCode::InvalidInput))?,
                 ),
-                Ok(Err(failure)) if is_not_found(&failure) => {
-                    // A permission change can hide a message behind 404. Require a
-                    // second fresh channel/authority check before reporting absence.
-                    if self.fresh(effect).await.is_ok() {
-                        Ok(SharedObservation::Missing)
-                    } else {
-                        Ok(SharedObservation::Unknown)
-                    }
-                }
-                _ => Ok(SharedObservation::Unknown),
+                Ok(Err(failure)) if is_not_found(&failure) => MessageRead::Missing,
+                _ => MessageRead::Unknown,
             };
+            return Ok(observe_message(effect, found, self.fresh(effect)).await);
         }
         let messages = read(
             self.adapter.http.get_messages(
@@ -138,6 +127,25 @@ impl DiscordSharedCards {
         })
     }
 }
+enum MessageRead {
+    Found(Value),
+    Missing,
+    Unknown,
+}
+async fn observe_message(
+    effect: &SharedEffect,
+    message: MessageRead,
+    fresh_absence: impl std::future::Future<Output = Result<()>>,
+) -> SharedObservation {
+    match message {
+        MessageRead::Found(message) if confirms(effect, &message) => SharedObservation::Confirmed {
+            message_id: message["id"].as_str().unwrap().to_owned(),
+        },
+        MessageRead::Missing if fresh_absence.await.is_ok() => SharedObservation::Missing,
+        _ => SharedObservation::Unknown,
+    }
+}
+
 struct SharedFresh<'a> {
     transport: &'a DiscordSharedCards,
     effect: &'a SharedEffect,
@@ -371,7 +379,7 @@ impl DiscordOperations {
         if cancel.is_cancelled() {
             return Err(Error::new(ErrorCode::Cancelled));
         }
-        let app = read(self.http.get_current_application_info()).await?;
+        let app = self.application_id().await?;
         let bot = self.bot_id().await?;
         let snapshot = self
             .channel_mutation_authority(&PolicyContext::LocalOperator, guild, channel)
@@ -399,7 +407,7 @@ impl DiscordOperations {
         }
         Ok(oracle_operations::shared_cards::SharedTarget {
             channel_id: channel.into(),
-            application_id: app.id.to_string(),
+            application_id: app.to_string(),
             bot_id: bot.to_string(),
         })
     }
@@ -438,6 +446,56 @@ mod tests {
         v
     }
 
+    #[tokio::test]
+    async fn successful_exact_readback_does_not_refresh_permission_snapshot() {
+        let mut e = effect();
+        e.message_id = Some("555".into());
+        let observation = observe_message(&e, MessageRead::Found(message(&e)), async {
+            panic!("successful GET must not fetch redundant permission facts");
+        })
+        .await;
+        assert!(
+            matches!(observation, SharedObservation::Confirmed {message_id} if message_id == "555")
+        );
+        let mut wrong = message(&e);
+        wrong["author"]["id"] = json!("999");
+        assert!(matches!(
+            observe_message(&e, MessageRead::Found(wrong), async {
+                panic!("mismatched content cannot be repaired with permissions");
+            })
+            .await,
+            SharedObservation::Unknown
+        ));
+    }
+    #[tokio::test]
+    async fn missing_message_requires_fresh_access_and_never_confirms_hidden_message() {
+        let mut e = effect();
+        e.message_id = Some("555".into());
+        let refreshed = std::sync::atomic::AtomicBool::new(false);
+        assert!(matches!(
+            observe_message(&e, MessageRead::Missing, async {
+                refreshed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await,
+            SharedObservation::Missing
+        ));
+        assert!(refreshed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            observe_message(&e, MessageRead::Missing, async {
+                Err(Error::new(ErrorCode::ForbiddenPermission))
+            })
+            .await,
+            SharedObservation::Unknown
+        ));
+        assert!(matches!(
+            observe_message(&e, MessageRead::Unknown, async {
+                panic!("network failure cannot establish absence");
+            })
+            .await,
+            SharedObservation::Unknown
+        ));
+    }
     #[test]
     fn deletion_requires_exact_existing_identity_and_never_confirms_a_present_message() {
         let original = effect();
