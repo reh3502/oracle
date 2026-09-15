@@ -488,6 +488,11 @@ impl Module for DwModule {
                 }
             }
         }
+        if let Ok(active) = service.reminder_candidates().await {
+            for id in active {
+                let _ = service.refresh_public_projection(&id).await;
+            }
+        }
         if let Ok(pending) = service.pending_projections().await {
             let cursor = self
                 .publication_cursor

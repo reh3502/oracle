@@ -1030,7 +1030,7 @@ async fn qualify(postgres: bool) {
         if run["state"] == "completed" {
             assert!(source.intent["actions"].as_array().unwrap().is_empty());
         } else {
-            assert_eq!(source.intent["actions"].as_array().unwrap().len(), 3);
+            assert_eq!(source.intent["actions"].as_array().unwrap().len(), 4);
         }
         let dispatch = manager
             .shared_card_dispatch(

@@ -1268,6 +1268,46 @@ pub fn migrate_v2_document(document: ModuleDocument) -> Result<DocumentWrite> {
     })
 }
 impl<D: Documents> RunService<D> {
+    /// Refresh a saved presentation after a module update without editing signup data.
+    pub async fn refresh_public_projection(&self, id: &str) -> Result<bool> {
+        for _ in 0..3 {
+            let mut tx = Transaction::new(&self.docs);
+            let mut stored = self.load_run(&mut tx, id).await?;
+            if stored.run.state.is_terminal() {
+                return Ok(false);
+            }
+            let Some(intent) = stored.publication.as_mut() else {
+                return Ok(false);
+            };
+            let (card, actions) = super::ui::public_projection(&stored.run);
+            if intent.card == card && intent.actions == actions {
+                return Ok(false);
+            }
+            stored.run.desired_card_revision = stored
+                .run
+                .desired_card_revision
+                .checked_add(1)
+                .ok_or(Error::Corrupt)?;
+            intent.desired_revision = stored.run.desired_card_revision;
+            intent.card = card;
+            intent.actions = actions;
+            stored.validate(self.docs.guild(), id)?;
+            let mut meta: Maintenance = tx
+                .get("run_index", "maintenance")
+                .await?
+                .ok_or(Error::Corrupt)?;
+            meta.pending.insert(id.to_owned());
+            tx.put("runs", id, &stored).await?;
+            tx.put("run_index", "maintenance", &meta).await?;
+            match tx.commit().await {
+                Ok(()) => return Ok(true),
+                Err(Error::Conflict) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Busy)
+    }
+
     pub async fn pending_projections(&self) -> Result<Vec<String>> {
         let mut tx = Transaction::new(&self.docs);
         let meta: Maintenance = tx

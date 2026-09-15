@@ -134,7 +134,7 @@ fn organized_paged_counts_host_review_and_post_keep_durable_rows() {
     assert_eq!(card["fields"][0]["members"][0]["user_id"], "7");
     assert_eq!(
         actions.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
-        vec!["join", "leave", "players"]
+        vec!["join", "leave", "players", "manage"]
     );
 }
 #[test]
@@ -383,4 +383,27 @@ fn ordinary_members_never_receive_management_controls() {
                 .all(|b| b["input"]["action"] == "view")
         );
     }
+}
+
+#[test]
+fn public_manage_opens_private_controls_only_for_managers() {
+    let mut stored = draft(RunMode::Casual);
+    apply_input(&mut stored, json!({"action":"post","id":"abcd2345"}));
+    let (_, actions) = ui::public_projection(&stored.run);
+    let manage = actions.iter().find(|a| a.name == "manage").unwrap();
+    assert_eq!(manage.label, "Manage");
+    let input: Input = serde_json::from_value(manage.input.clone()).unwrap();
+    let host = ui::render(&stored, &owner(), &input, None);
+    assert!(host.to_string().contains("Management controls are private"));
+    let outsider = Actor {
+        user_id: "8".into(),
+        ..owner()
+    };
+    let denied = ui::render(&stored, &outsider, &input, None);
+    assert!(
+        denied
+            .to_string()
+            .contains("Only the host or a configured moderator")
+    );
+    assert!(!denied.to_string().contains("\"action\":\"cancel\""));
 }

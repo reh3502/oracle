@@ -373,7 +373,7 @@ pub fn public_projection(run: &Run) -> (Value, Vec<PublicAction>) {
     } else {
         "Casual · Any Toon"
     };
-    let mut card = json!({"title":text(&run.name,160),"description":format!("{} · {}\nRun {}\n{} / {} places filled · {} available",mode,state,run.id,run.assignments.len(),run.capacity(),usize::from(run.capacity()).saturating_sub(run.assignments.len())),"fields":[],"footer":"Join or view players to open your private controls"});
+    let mut card = json!({"title":text(&run.name,160),"description":format!("{} · {}\nRun {}\n{} / {} places filled · {} available",mode,state,run.id,run.assignments.len(),run.capacity(),usize::from(run.capacity()).saturating_sub(run.assignments.len())),"fields":[],"footer":"Use the buttons below to join, view players, or manage this run"});
     let mut public_fields =
         vec![json!({"name":"Host","value":"","inline":false,"members":[{"user_id":run.owner_id}]})];
     if let Some(rows) = &run.allocations {
@@ -433,6 +433,12 @@ pub fn public_projection(run: &Run) -> (Value, Vec<PublicAction>) {
             label: "View players".into(),
             operation: "run_ui".into(),
             input: json!({"action":"view","id":run.id,"view":"players"}),
+        });
+        actions.push(PublicAction {
+            name: "manage".into(),
+            label: "Manage".into(),
+            operation: "run_ui".into(),
+            input: json!({"action":"view","id":run.id,"view":"manage"}),
         });
     }
     (card, actions)

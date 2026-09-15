@@ -1710,3 +1710,56 @@ async fn confirmed_cancellation_queues_original_publication_deletion_only_after_
     store.close().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn presentation_refresh_updates_existing_card_once_without_changing_signups() {
+    let root = std::env::temp_dir().join(format!("dw-card-refresh-{}", interaction(NOW)));
+    std::fs::create_dir(&root).unwrap();
+    let store = initialize(DatabaseConfig::Sqlite {
+        path: root.join("state.sqlite"),
+    })
+    .await;
+    let db = Db::new(store);
+    let service = RunService::new(db.clone());
+    let owner = actor("100");
+    let id = create(&service, &owner, RunMode::Casual).await;
+    publish(&service, &owner, &id).await.unwrap();
+    let original = service.view(&owner, &id).await.unwrap();
+    service
+        .release_confirmed(&id, original.run.desired_card_revision)
+        .await
+        .unwrap();
+    let doc = db.get("runs", &id).await.unwrap().unwrap();
+    let mut legacy = original.clone();
+    legacy
+        .publication
+        .as_mut()
+        .unwrap()
+        .actions
+        .retain(|a| a.name != "manage");
+    Documents::batch(
+        &db,
+        vec![DocumentWrite {
+            collection: "runs".into(),
+            key: id.clone(),
+            expected_revision: Some(doc.revision),
+            value: Some(serde_json::to_value(legacy).unwrap()),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(service.refresh_public_projection(&id).await.unwrap());
+    let refreshed = service.view(&owner, &id).await.unwrap();
+    let mut expected = original.run.clone();
+    expected.desired_card_revision += 1;
+    assert_eq!(refreshed.run, expected);
+    let publication = refreshed.publication.unwrap();
+    assert_eq!(
+        publication.created_at,
+        original.publication.unwrap().created_at
+    );
+    assert!(publication.actions.iter().any(|a| a.name == "manage"));
+    assert!(service.pending_projections().await.unwrap().contains(&id));
+    assert!(!service.refresh_public_projection(&id).await.unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
