@@ -23,10 +23,17 @@ use tokio_util::sync::CancellationToken;
 struct Backend {
     commands: Mutex<Vec<PublishedCommand>>,
     writes: Mutex<usize>,
+    lists: std::sync::atomic::AtomicUsize,
+    fail_list: std::sync::atomic::AtomicBool,
 }
 #[async_trait]
 impl CommandBackend for Backend {
     async fn list(&self, _: &GuildId) -> Result<Vec<PublishedCommand>> {
+        use std::sync::atomic::Ordering;
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        if self.fail_list.load(Ordering::SeqCst) {
+            return Err(Error::new(ErrorCode::Io));
+        }
         Ok(self.commands.lock().unwrap().clone())
     }
     async fn create(
@@ -486,3 +493,193 @@ async fn published_command_identity_and_explicit_grants_survive_lifecycle_change
 
 #[path = "command_runtime_member_tests.rs"]
 mod member_tests;
+
+async fn deferred_host() -> (
+    tempfile::TempDir,
+    Arc<crate::host::Host>,
+    Arc<Backend>,
+    GuildId,
+) {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("oracle.json");
+    crate::config::initialize(&path, None).unwrap();
+    let mut config = crate::config::Config::load(&path).unwrap();
+    let guild: GuildId = "123".parse().unwrap();
+    config.guilds.push(GuildPolicy {
+        guild: guild.clone(),
+        operators: vec!["42".parse().unwrap()],
+    });
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let host = Arc::new(
+        crate::host::Host::open(&config, Default::default())
+            .await
+            .unwrap(),
+    );
+    let backend = Arc::new(Backend::default());
+    assert!(
+        host.command_sync
+            .set(Arc::new(CommandReconciler::new(
+                host.storage.clone(),
+                backend.clone()
+            )))
+            .is_ok()
+    );
+    (scratch, host, backend, guild)
+}
+
+#[tokio::test]
+async fn deferred_publication_requires_successful_explicit_publish_before_watching() {
+    use std::sync::atomic::Ordering;
+    let (scratch, host, backend, guild) = deferred_host().await;
+    let cancel = CancellationToken::new();
+    let watcher = tokio::spawn(super::run(
+        host.clone(),
+        vec![guild.clone()],
+        cancel.clone(),
+    ));
+    // Longer than the normal 250ms publication debounce: even registry reads
+    // must be absent while the installer is configuring its live module host.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
+    assert_eq!(*backend.writes.lock().unwrap(), 0);
+    backend.fail_list.store(true, Ordering::SeqCst);
+    assert_eq!(
+        super::publish_once(&host).await.unwrap_err().code,
+        ErrorCode::Io
+    );
+    assert!(!host.command_publication_enabled.is_cancelled());
+    let attempts = backend.lists.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(backend.lists.load(Ordering::SeqCst), attempts);
+    backend.fail_list.store(false, Ordering::SeqCst);
+    super::publish_once(&host).await.unwrap();
+    assert!(host.command_publication_enabled.is_cancelled());
+    let published_lists = backend.lists.load(Ordering::SeqCst);
+    let publication = host
+        .command_sync
+        .get()
+        .unwrap()
+        .publication_status(&guild)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publication["active"], false);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        backend.lists.load(Ordering::SeqCst),
+        published_lists,
+        "watcher must not repeat a synchronized manual publication"
+    );
+    assert_eq!(
+        host.command_sync
+            .get()
+            .unwrap()
+            .publication_status(&guild)
+            .await
+            .unwrap()
+            .unwrap(),
+        publication
+    );
+    assert_eq!(
+        *backend.writes.lock().unwrap(),
+        1,
+        "watcher must not duplicate the explicit publication"
+    );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), watcher)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    host.close().await.unwrap();
+    drop(host);
+    // Immediate reopen needs no publication-lease wait or recovery attempt.
+    let config = crate::config::Config::load(&scratch.path().join("oracle.json")).unwrap();
+    let restarted = crate::host::Host::open(&config, Default::default())
+        .await
+        .unwrap();
+    assert!(
+        restarted
+            .command_sync
+            .set(Arc::new(CommandReconciler::new(
+                restarted.storage.clone(),
+                backend.clone()
+            )))
+            .is_ok()
+    );
+    super::publish_once(&restarted).await.unwrap();
+    assert_eq!(
+        restarted
+            .command_sync
+            .get()
+            .unwrap()
+            .publication_status(&guild)
+            .await
+            .unwrap()
+            .unwrap()["active"],
+        false
+    );
+    assert_eq!(*backend.writes.lock().unwrap(), 1);
+    restarted.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn deferred_publication_shutdown_does_not_wait_for_enable_or_publish() {
+    use std::sync::atomic::Ordering;
+    let (_scratch, host, backend, guild) = deferred_host().await;
+    let cancel = CancellationToken::new();
+    let watcher = tokio::spawn(super::run(host.clone(), vec![guild], cancel.clone()));
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(3), watcher)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!host.command_publication_enabled.is_cancelled());
+    assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
+    assert_eq!(*backend.writes.lock().unwrap(), 0);
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_publication_does_not_hide_a_registry_change_before_watcher_start() {
+    use std::sync::atomic::Ordering;
+    let (_scratch, host, backend, guild) = deferred_host().await;
+    super::publish_once(&host).await.unwrap();
+    let before = backend.lists.load(Ordering::SeqCst);
+    host.modules
+        .configure_member_reads(&ACTOR, &guild, &ModuleId::new("test.absent").unwrap(), None)
+        .await
+        .unwrap();
+    let revision = host.modules.registry_revision();
+    let cancel = CancellationToken::new();
+    let watcher = tokio::spawn(super::run(
+        host.clone(),
+        vec![guild.clone()],
+        cancel.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if host
+                .command_status
+                .lock()
+                .unwrap()
+                .get(&guild)
+                .is_some_and(|status| {
+                    status["state"] == "synchronized"
+                        && status["revision"].as_u64() == Some(revision)
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(backend.lists.load(Ordering::SeqCst) > before);
+    cancel.cancel();
+    watcher.await.unwrap().unwrap();
+    host.close().await.unwrap();
+}

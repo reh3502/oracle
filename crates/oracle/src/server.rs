@@ -12,7 +12,11 @@ use oracle_core::{
 };
 use oracle_storage::PgTools;
 use std::{str::FromStr, sync::Arc, time::Duration};
-pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
+pub(crate) async fn serve(
+    config: Config,
+    tools: PgTools,
+    defer_command_publication: bool,
+) -> Result<()> {
     // Resolve required credentials before acquiring resources or publishing readiness.
     let token = config
         .discord
@@ -24,6 +28,9 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
         .transpose()?;
     let mut signals = Signals::new()?;
     let host = Arc::new(Host::open(&config, tools).await?);
+    if !defer_command_publication {
+        host.command_publication_enabled.cancel();
+    }
     let mut published_adapter = None;
     if let Some(token) = &token {
         let adapter = Arc::new(oracle_discord::operations::DiscordOperations::new(

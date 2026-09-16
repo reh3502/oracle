@@ -68,7 +68,9 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let config = Config::load(&cli.config)?;
     match cli.command {
-        Command::Serve => serve(config, tools).await,
+        Command::Serve {
+            defer_command_publication,
+        } => serve(config, tools, defer_command_publication).await,
         Command::Stop => output(control::send(&config.socket(), Request::Shutdown).await?),
         Command::Agent(args) => output(control::send(&config.socket(), args.request()).await?),
         Command::Restore { backup } => {

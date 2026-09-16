@@ -360,8 +360,13 @@ fn stop_acknowledges_joins_and_allows_restart() {
     let sandbox = Sandbox::new();
     let config = sandbox.config();
     successful(invoke(&config, ["init"]));
-    for _ in 0..2 {
-        let mut host = Running::spawn(command(&config).arg("serve"));
+    for defer in [false, true] {
+        let mut serve = command(&config);
+        serve.arg("serve");
+        if defer {
+            serve.arg("--defer-command-publication");
+        }
+        let mut host = Running::spawn(&mut serve);
         wait_for_socket(&mut host, &sandbox.0.join("state/control.sock"));
         let response = successful(invoke(&config, ["stop"]));
         assert_eq!(response["stopping"], true);

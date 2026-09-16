@@ -29,7 +29,11 @@ pub(crate) enum Command {
         postgres_url_env: Option<String>,
     },
     /// Boot the host and optional Discord Gateway; no Gemini key is required.
-    Serve,
+    Serve {
+        /// Wait for successful publish-commands before automatically publishing registry changes.
+        #[arg(long)]
+        defer_command_publication: bool,
+    },
     /// Stop the running host, joining module processes and flushing storage.
     Stop,
     Status {
@@ -242,6 +246,23 @@ impl AgentArgs {
 #[cfg(test)]
 mod agent_tests {
     use super::*;
+    #[test]
+    fn command_publication_is_automatic_unless_explicitly_deferred() {
+        assert!(matches!(
+            Cli::try_parse_from(["oracle", "serve"]).unwrap().command,
+            Command::Serve {
+                defer_command_publication: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["oracle", "serve", "--defer-command-publication"])
+                .unwrap()
+                .command,
+            Command::Serve {
+                defer_command_publication: true
+            }
+        ));
+    }
     #[test]
     fn agent_controls_are_exact_private_socket_requests() {
         let cli = Cli::try_parse_from([

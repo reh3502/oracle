@@ -463,6 +463,12 @@ pub async fn run(
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use std::{sync::Arc, time::Duration};
+    // First-run installers may need live Discord services while loading and
+    // activating modules. Do not race those registry changes with publication.
+    tokio::select! { biased;
+        _ = cancel.cancelled() => return Ok(()),
+        _ = host.command_publication_enabled.cancelled() => {},
+    }
     let reconciler = host
         .command_sync
         .get()
@@ -470,6 +476,27 @@ pub async fn run(
     let mut changes = host.modules.registry_changes();
     'refresh: loop {
         let revision = *changes.borrow_and_update();
+        let already_synchronized = {
+            let statuses = host.command_status.lock().unwrap();
+            guilds.iter().all(|guild| {
+                statuses.get(guild).is_some_and(|status| {
+                    status["state"] == "synchronized"
+                        && status["revision"].as_u64() == Some(revision)
+                })
+            })
+        };
+        if already_synchronized {
+            // A successful explicit publication supplied this exact snapshot.
+            // Avoid opening a redundant journal that shutdown could interrupt.
+            // changed() still observes mutations since borrow_and_update above.
+            tokio::select! { biased;
+                _ = cancel.cancelled() => return Ok(()),
+                changed = changes.changed() => {
+                    changed.map_err(|_| Error::new(ErrorCode::Cancelled))?;
+                    continue 'refresh;
+                },
+            }
+        }
         // Collapse rapid load/activation changes before reading Discord's registry.
         tokio::select! { biased;
             _ = cancel.cancelled() => return Ok(()),
@@ -770,6 +797,7 @@ pub async fn publish_once(host: &super::Host) -> Result<serde_json::Value> {
         .await?
         .guilds;
     let mut reports = Vec::new();
+    let mut synchronized = Vec::new();
     let cancel = host.operation_tasks.token();
     for guild in guilds {
         let (revision, desired) = prepare(host, &guild.guild).await?;
@@ -782,8 +810,16 @@ pub async fn publish_once(host: &super::Host) -> Result<serde_json::Value> {
                 Arc::new(RegistryFence(host.modules.registry_permit(revision))),
             )
             .await?;
+        synchronized.push((
+            guild.guild.clone(),
+            json!({"state":"synchronized","revision":revision,"report":report}),
+        ));
         reports.push(json!({"guild":guild.guild,"revision":revision,"report":report}));
     }
+    host.command_status.lock().unwrap().extend(synchronized);
+    // Enable only after every configured guild completed successfully. Errors
+    // preserve the startup gate and all existing reconciler recovery guards.
+    host.command_publication_enabled.cancel();
     Ok(json!(reports))
 }
 

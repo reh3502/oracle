@@ -17,6 +17,8 @@ pub(crate) struct Host {
     pub(crate) operations: std::sync::OnceLock<Arc<oracle_operations::executor::StructureExecutor>>,
     pub(crate) command_sync:
         std::sync::OnceLock<Arc<oracle_operations::commands::CommandReconciler>>,
+    /// A one-way startup gate; cancellation enables automatic publication.
+    pub(crate) command_publication_enabled: tokio_util::sync::CancellationToken,
     pub(crate) command_status: std::sync::Mutex<BTreeMap<GuildId, serde_json::Value>>,
     pub(crate) operation_tasks: HostTasks,
     pub(crate) storage: Arc<Storage>,
@@ -173,6 +175,7 @@ impl Host {
             ai: std::sync::OnceLock::new(),
             operations: std::sync::OnceLock::new(),
             command_sync: std::sync::OnceLock::new(),
+            command_publication_enabled: tokio_util::sync::CancellationToken::new(),
             command_status: std::sync::Mutex::new(BTreeMap::new()),
             operation_tasks: HostTasks::new(),
             storage,
