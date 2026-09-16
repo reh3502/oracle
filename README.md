@@ -4,7 +4,7 @@ Oracle is a Rust Discord bot framework under development. It provides scoped hum
 
 ## Build and initialize
 
-Development requires Rust 1.95 or newer. The host supports Linux and Windows x64. For a portable Windows DW bot with a desktop Start/Stop window, see the [Windows launcher](tools/windows-launcher/README.md). Prepare the pinned, locally editable Serenity checkout before invoking Cargo:
+Development requires Rust 1.95 or newer. The host supports Linux and Windows x64. For a portable Windows DW bot with a terminal window, see the [Windows launcher](tools/windows-launcher/README.md). Prepare the pinned, locally editable Serenity checkout before invoking Cargo:
 
 ```sh
 python3 scripts/prepare-serenity.py

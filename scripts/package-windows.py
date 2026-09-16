@@ -58,7 +58,13 @@ def stage(args):
         snapshots[digest] = data
     output.mkdir(parents=True, mode=0o700)
     shutil.copy2(args.host, output / 'oracle-host.exe')
-    shutil.copy2(args.launcher, output / 'Start Oracle.exe')
+    # Folder deployment keeps the .NET runtime visible; no self-extracting GUI bundle.
+    launcher_dir = args.launcher.parent
+    if not (launcher_dir / 'Start Oracle.runtimeconfig.json').is_file():
+        raise ValueError('Launcher must be a console folder publish')
+    for source in launcher_dir.iterdir():
+        if source.is_file() and source.suffix.lower() != '.pdb':
+            shutil.copy2(source, output / source.name)
     for dll in args.dll:
         shutil.copy2(dll, output / dll.name)
     payload = output / 'payload'
@@ -107,8 +113,8 @@ def stage(args):
     (output / 'READ ME.txt').write_text(
         'Oracle — Dandy\'s World\n\n'
         '1. Extract the entire ZIP to a folder. Do not run inside the ZIP.\n'
-        '2. Double-click Start Oracle.exe. Press Start if it is stopped.\n'
-        '3. Press Stop or close the window to stop the bot.\n\n'
+        '2. Double-click Start Oracle.exe. A terminal opens and starts the bot.\n'
+        '3. Press Ctrl+C for a graceful stop, or close the terminal to stop the bot.\n\n'
         'AI is disabled. No Python, Rust, or .NET installation is required.\n'
         'Your saves live under %LOCALAPPDATA%\\OracleSister. Keep that folder when updating.\n'
         'The .env contains your private bot token. Keep this package private.\n'

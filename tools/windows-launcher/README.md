@@ -6,7 +6,7 @@ Publish with .NET 10 SDK (Windows targeting works on Linux):
 dotnet publish tools/windows-launcher/OracleLauncher.csproj -c Release -o /absolute/output
 ```
 
-Ship `Start Oracle.exe` alongside `oracle-host.exe`, `.env`, and:
+Ship the complete publish folder (including `Start Oracle.exe` and its runtime DLLs) alongside `oracle-host.exe`, `.env`, and:
 
 - `payload/oracle.json`: fresh deployment template, with AI disabled and the recipient's guild/operator policies.
 - `payload/catalog/`: active snapshot store (`active` plus hash-named catalog JSON).
@@ -15,7 +15,7 @@ Ship `Start Oracle.exe` alongside `oracle-host.exe`, `.env`, and:
 
 `.env` contains one `DISCORD_TOKEN=...` assignment. Blank lines, comments and matching single/double quotes are supported. No shell expansion or interpolation occurs. The token is passed only in the host child's environment, never as an argument, in generated config, or in logs. Keep the release archive private.
 
-Double-clicking opens the window and starts the bot. Start/Stop buttons control it. Closing waits for a graceful stop; if an initial command publication is already in progress, it first waits for that bounded operation to finish. If stopping fails the window remains open. The bot must stay open for Discord commands to work. Only one launcher instance is allowed per Windows session.
+Double-clicking opens a terminal and starts the bot. Ctrl+C requests graceful shutdown. Closing the terminal requests shutdown within Windows’ limited close-handler time; a kill-on-close Job Object guarantees that the host and all descendants stop when the launcher exits. Closing during command publication may interrupt that write, which the host must reconcile on restart. Keep the window open while using the bot. Only one launcher instance is allowed per Windows session. This is a self-contained console folder deployment, with no Windows Forms or self-extraction.
 
 On first start, the launcher creates `%LOCALAPPDATA%/OracleSister` with a protected current-user/SYSTEM ACL, copies the catalog/module package, creates a fresh SQLite configuration, installs and activates Dandy's World, then publishes the Discord commands. Automatic publication is deferred until this explicit publication succeeds, preventing startup changes from interrupting the first publication. Each later startup explicitly synchronizes commands before enabling normal watching. Later starts reuse that deployment and its run data. No original database is included. Moving or replacing the release folder does not erase local data. AI is always disabled; an edited runtime config that enables it is rejected.
 
@@ -50,4 +50,4 @@ Use a new output directory for each release. The Python runtime script verifies 
 
 Run the offline launcher smoke test twice against the same private test directory to verify initial installation and restart. Smoke mode disables Discord and source acquisition. Native Windows validation is still necessary for OS behavior that Wine cannot reproduce, including named-pipe first-instance exclusivity and Windows symbolic links. Windows publication flushes files and uses atomic write-through moves; no Unix directory-fsync power-loss equivalence is claimed.
 
-`"Start Oracle.exe" --close-check C:\absolute\fresh-close-check-directory` opens the actual WinForms window in offline mode and triggers Close after 50 ms while startup is in progress. It exercises the real FormClosing/cancellation/shutdown path, verifies that the owned host exited, and writes `close-result.txt` with exit code 0/1. No token is read.
+`"Start Oracle.exe" --close-check C:\absolute\fresh-close-check-directory` runs offline and invokes the console stop callback during startup. It verifies callback cancellation and host shutdown and writes `close-result.txt`. Native terminal-window close must also be verified on Windows; Wine is not a substitute for the operating system’s close deadline.

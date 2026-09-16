@@ -31,6 +31,14 @@ def verify(root, private=False):
         offset = struct.unpack_from('<I', data, 60)[0]
         if data[:2] != b'MZ' or data[offset:offset + 6] != b'PE\0\0d\x86':
             raise ValueError('Expected a native Windows x64 executable: ' + name)
+    launcher = (root / 'Start Oracle.exe').read_bytes()
+    pe_offset = struct.unpack_from('<I', launcher, 60)[0]
+    if struct.unpack_from('<H', launcher, pe_offset + 24 + 68)[0] != 3:
+        raise ValueError('Launcher must open a console window')
+    if not (root / 'Start Oracle.runtimeconfig.json').is_file():
+        raise ValueError('Missing console runtime configuration')
+    if any('Windows.Forms' in p.name for p in paths):
+        raise ValueError('Release unexpectedly contains the GUI framework')
     config = json.loads((root / 'payload/oracle.json').read_text())
     if config.get('ai') is not None or config['discord']['token_env'] != 'DISCORD_TOKEN':
         raise ValueError('Recipient AI/credential configuration mismatch')

@@ -10,19 +10,7 @@ internal static class Program
     [STAThread]
     static int Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "--close-check")
-        {
-            if (args.Length != 2) return 2;
-            ApplicationConfiguration.Initialize();
-            var controller = new BotController(Path.GetFullPath(args[1]), true);
-            using var form = new LauncherForm(controller, true);
-            Application.Run(form);
-            bool passed = !controller.Running && form.CheckFailure is null;
-            Directory.CreateDirectory(controller.Root);
-            File.WriteAllText(Path.Combine(controller.Root, "close-result.txt"),
-                passed ? "PASS: actual FormClosing during startup stopped the host\n" : "FAIL: " + (form.CheckFailure ?? "host still running") + "\n");
-            return passed ? 0 : 1;
-        }
+        ConsoleLifetime.Initialize();
         if (args.Length > 0 && args[0] is "--smoke-test" or "--live-check")
         {
             if (args.Length != 2) return 2;
@@ -54,11 +42,50 @@ internal static class Program
             }
         }
         using var instance = new Mutex(true, @"Local\OracleSisterLauncher", out bool owns);
-        if (!owns) { MessageBox.Show("Oracle is already open.", "Oracle"); return 0; }
-        ApplicationConfiguration.Initialize();
-        Application.Run(new LauncherForm());
-        return 0;
+        if (!owns) { Console.WriteLine("Oracle is already open."); return 0; }
+        bool closeCheck = args.Length == 2 && args[0] == "--close-check";
+        var bot = new BotController(closeCheck ? Path.GetFullPath(args[1]) : null, closeCheck);
+        using var cancellation = new CancellationTokenSource();
+        ConsoleLifetime.StopRequested = () => cancellation.Cancel();
+        try { Console.Title = "Oracle — Dandy's World"; }
+        catch (IOException) { /* Output may be redirected by a terminal or test runner. */ }
+        Console.WriteLine("Starting Oracle. AI is disabled.");
+        Console.WriteLine("Keep this window open. Press Ctrl+C or close it to stop the bot.");
+        int result = 0;
+        try
+        {
+            if (closeCheck) _ = Task.Run(async () => {
+                await Task.Delay(200);
+                ConsoleLifetime.RequestStopForTest();
+            });
+            bot.StartAsync(cancellation.Token).GetAwaiter().GetResult();
+            Console.WriteLine("Bot is running.");
+            while (!cancellation.IsCancellationRequested && bot.Running) Thread.Sleep(100);
+            if (!cancellation.IsCancellationRequested) throw new IOException("The bot stopped unexpectedly.");
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception error) { Console.WriteLine(error.Message); result = 1; }
+        finally
+        {
+            Console.WriteLine("Stopping Oracle…");
+            try { bot.StopAsync().GetAwaiter().GetResult(); }
+            catch { Console.WriteLine("Graceful shutdown failed; closing owned bot processes."); result = 1; }
+            ConsoleLifetime.Stopped.Set();
+        }
+        if (closeCheck)
+        {
+            Directory.CreateDirectory(bot.Root);
+            File.WriteAllText(Path.Combine(bot.Root, "close-result.txt"),
+                result == 0 && !bot.Running ? "PASS: console interrupt during startup stopped the host\n" : "FAIL\n");
+        }
+        else if (result != 0 && !bot.Running && !cancellation.IsCancellationRequested)
+        {
+            Console.WriteLine("Press Enter to close.");
+            Console.ReadLine();
+        }
+        return result;
     }
+
 }
 
 internal sealed class BotController
@@ -347,76 +374,4 @@ internal sealed class BotController
         finally { commandTimeout = TimeSpan.FromSeconds(60); }
     }
 
-}
-
-internal sealed class LauncherForm : Form
-{
-    readonly BotController bot;
-    readonly bool closeCheck;
-    internal string? CheckFailure { get; private set; }
-    readonly Label status = new() { Text = "Stopped", AutoSize = true, Top = 35, Left = 25 };
-    readonly Button start = new() { Text = "Start bot", Top = 85, Left = 25, Width = 145 };
-    readonly Button stop = new() { Text = "Stop bot", Top = 85, Left = 185, Width = 145, Enabled = false };
-    bool busy, closing, closeRequested;
-    CancellationTokenSource? startup;
-    readonly System.Windows.Forms.Timer monitor = new() { Interval = 1000 };
-    internal LauncherForm(BotController? controller = null, bool closeCheck = false)
-    {
-        bot = controller ?? new BotController();
-        this.closeCheck = closeCheck;
-        if (closeCheck)
-        {
-            var closeTimer = new System.Windows.Forms.Timer { Interval = 50 };
-            closeTimer.Tick += (_, _) => { closeTimer.Stop(); closeTimer.Dispose(); Close(); };
-            Shown += (_, _) => closeTimer.Start();
-        }
-        Text = "Oracle — Dandy's World"; ClientSize = new Size(440, 170);
-        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false;
-        StartPosition = FormStartPosition.CenterScreen;
-        Controls.AddRange([status, start, stop]);
-        start.Click += async (_, _) => await RunAction(true);
-        stop.Click += async (_, _) => await RunAction(false);
-        Shown += async (_, _) => await RunAction(true);
-        monitor.Tick += (_, _) => { if (!busy && !bot.Running) { status.Text = "Stopped"; start.Enabled = true; stop.Enabled = false; } };
-        monitor.Start();
-        FormClosing += async (_, e) =>
-        {
-            if (closing) return;
-            e.Cancel = true;
-            if (busy)
-            {
-                closeRequested = true;
-                status.Text = "Stopping safely…";
-                startup?.Cancel();
-                return;
-            }
-            await RunAction(false);
-            if (!bot.Running) { closing = true; monitor.Dispose(); Close(); }
-        };
-    }
-    async Task RunAction(bool run)
-    {
-        if (busy) return;
-        busy = true; start.Enabled = stop.Enabled = false;
-        status.Text = run ? "Starting…" : "Stopping safely…";
-        try
-        {
-            if (run) { startup = new(); await bot.StartAsync(startup.Token); }
-            else await bot.StopAsync();
-            status.Text = bot.Running ? "Running — AI disabled" : "Stopped";
-        }
-        catch (OperationCanceledException) when (closeRequested) { status.Text = "Stopped"; }
-        catch (Exception error)
-        {
-            status.Text = bot.Running ? "Stop failed — bot is still running" : "Could not start";
-            if (closeCheck) CheckFailure = error.Message;
-            else MessageBox.Show(this, error.Message, "Oracle", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-        finally
-        {
-            startup?.Dispose(); startup = null;
-            busy = false; start.Enabled = !bot.Running; stop.Enabled = bot.Running;
-            if (closeRequested) { closeRequested = false; BeginInvoke(Close); }
-        }
-    }
 }
