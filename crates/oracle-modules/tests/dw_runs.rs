@@ -13,11 +13,12 @@ use oracle_modules::{
 use oracle_storage::{DatabaseConfig, Storage};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
-    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -26,6 +27,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
+
 const PREFIX: &str = "https://dandys-world-robloxhorror.fandom.com/index.php?oldid=";
 const DAY: u64 = 86_400_000;
 struct Temp(PathBuf);
@@ -707,8 +709,15 @@ async fn native_runs_postgres() {
     qualify(true).await;
 }
 async fn qualify(postgres: bool) {
+    // Wine's Z: drive exposes Unix /dev. Use the Windows temp drive so the
+    // fixture cannot accidentally hide Windows-only filesystem assumptions.
+    #[cfg(windows)]
+    std::env::set_current_dir(std::env::temp_dir()).unwrap();
     let temp = Temp(std::env::temp_dir().join(format!("oracle-dw-runs-{}", uuid::Uuid::new_v4())));
+    #[cfg(unix)]
     fs::DirBuilder::new().mode(0o700).create(&temp.0).unwrap();
+    #[cfg(windows)]
+    oracle_local_ipc::create_private_directory_new(&temp.0).unwrap();
     let storage = Arc::new(
         Storage::open(if postgres {
             DatabaseConfig::Postgres {
@@ -778,13 +787,21 @@ async fn qualify(postgres: bool) {
     fs::create_dir(&package_dir).unwrap();
     let bytes =
         fs::read(std::env::var_os("DW_MODULE_BINARY").expect("built DW module required")).unwrap();
-    fs::write(package_dir.join("module"), &bytes).unwrap();
-    let manifest: ModuleManifest =
+    let executable = if cfg!(windows) {
+        "module.exe"
+    } else {
+        "module"
+    };
+    fs::write(package_dir.join(executable), &bytes).unwrap();
+    let mut manifest: ModuleManifest =
         serde_json::from_str(include_str!("../../../modules/dandys-world/manifest.json")).unwrap();
+    if cfg!(windows) {
+        manifest.target = "x86_64-pc-windows-gnu".into();
+    }
     let package = ModulePackage {
         manifest,
-        entrypoint: "module".into(),
-        files: BTreeMap::from([("module".into(), format!("{:x}", Sha256::digest(&bytes)))]),
+        entrypoint: executable.into(),
+        files: BTreeMap::from([(executable.into(), format!("{:x}", Sha256::digest(&bytes)))]),
         source_revision: "dw-run-native-test".into(),
         toolchain: "real DW SDK executable".into(),
         license: "test fixture".into(),
@@ -808,7 +825,16 @@ async fn qualify(postgres: bool) {
                 },
             )]),
             &[temp.0.join("state.sqlite")],
-            fs::metadata(&temp.0).unwrap().uid(),
+            {
+                #[cfg(unix)]
+                {
+                    fs::metadata(&temp.0).unwrap().uid()
+                }
+                #[cfg(windows)]
+                {
+                    0
+                }
+            },
         )
         .await
         .unwrap();
@@ -820,7 +846,29 @@ async fn qualify(postgres: bool) {
     )
     .unwrap();
     snapshot(&data, &catalog);
-    manager.load(&installed.digest).await.unwrap();
+    let previous = std::env::var_os("DW_PREVIOUS_MODULE_BINARY").map(|path| {
+        let directory = temp.0.join("previous-package");
+        fs::create_dir(&directory).unwrap();
+        let bytes = fs::read(path).unwrap();
+        fs::write(directory.join(executable), &bytes).unwrap();
+        let mut previous = package.clone();
+        previous.manifest.version = "0.8.3".into();
+        previous
+            .files
+            .insert(executable.into(), format!("{:x}", Sha256::digest(&bytes)));
+        fs::write(
+            directory.join("package.json"),
+            serde_json::to_vec(&previous).unwrap(),
+        )
+        .unwrap();
+        directory
+    });
+    if let Some(directory) = &previous {
+        let previous = manager.install(directory, true).await.unwrap();
+        manager.load(&previous.digest).await.unwrap();
+    } else {
+        manager.load(&installed.digest).await.unwrap();
+    }
     manager
         .activate(&PolicyContext::LocalOperator, activation(&module, &guild))
         .await
@@ -854,6 +902,12 @@ async fn qualify(postgres: bool) {
     );
     configure(&manager, &guild, &module).await;
     configure(&manager, &other, &module).await;
+    if previous.is_some() {
+        manager
+            .upgrade(&module, &installed.digest, Duration::from_secs(3))
+            .await
+            .unwrap();
+    }
     let bound = binding(&manager, &guild).await;
     for input in [
         json!({"owner_id":"901"}),
@@ -1091,7 +1145,7 @@ async fn qualify(postgres: bool) {
     // launching an artifact that declares only the older namespace readable.
     let old_dir = temp.0.join("older-package");
     fs::create_dir(&old_dir).unwrap();
-    fs::write(old_dir.join("module"), &bytes).unwrap();
+    fs::write(old_dir.join(executable), &bytes).unwrap();
     let mut older = package.clone();
     older.manifest.version = "0.7.2".into();
     older.manifest.data_version = 3;
@@ -1157,9 +1211,18 @@ async fn qualify(postgres: bool) {
     let pid = health[&module]["host"]["pid"]
         .as_u64()
         .expect("native subprocess PID");
+    #[cfg(unix)]
     assert!(
         std::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    #[cfg(windows)]
+    assert!(
+        std::process::Command::new("taskkill.exe")
+            .args(["/PID", &pid.to_string(), "/F"])
             .status()
             .unwrap()
             .success()

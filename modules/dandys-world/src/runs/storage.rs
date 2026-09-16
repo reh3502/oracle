@@ -7,10 +7,7 @@ use oracle_contracts::{DocumentWrite, ModuleDocument};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Read,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const DATA_VERSION: u32 = 5;
 pub const MAX_AGGREGATE_BYTES: usize = 40 * 1024;
@@ -328,9 +325,7 @@ fn hash(value: &impl Serialize) -> Result<String> {
 }
 fn random(bytes: usize) -> Result<Vec<u8>> {
     let mut result = vec![0; bytes];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut result))
-        .map_err(|_| Error::Unavailable)?;
+    getrandom::fill(&mut result).map_err(|_| Error::Unavailable)?;
     Ok(result)
 }
 fn new_id() -> Result<String> {

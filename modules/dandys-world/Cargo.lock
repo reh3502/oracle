@@ -251,6 +251,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "chrono-tz",
+ "getrandom 0.4.3",
  "libc",
  "oracle-contracts",
  "oracle-core",
