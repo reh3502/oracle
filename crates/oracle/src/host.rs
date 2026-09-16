@@ -24,17 +24,18 @@ pub(crate) struct Host {
     pub(crate) modules: Arc<ModuleManager>,
     pub(crate) tools: PgTools,
     _state_lock: std::fs::File,
+    pub(crate) shutdown: tokio_util::sync::CancellationToken,
 }
 impl Host {
     pub(crate) async fn open(config: &Config, tools: PgTools) -> Result<Self> {
         config.prepare_state_dir()?;
+        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
-        let state_lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let state_lock = options
             .open(config.state_dir.join("host.lock"))
             .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
         fs2::FileExt::try_lock_exclusive(&state_lock)
@@ -105,9 +106,13 @@ impl Host {
         };
         let module_configuration = async {
             if !config.module_runtime.is_empty() {
+                #[cfg(unix)]
                 use std::os::unix::fs::MetadataExt;
                 let state = std::fs::canonicalize(&config.state_dir)
                     .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+                #[cfg(windows)]
+                let owner = 0;
+                #[cfg(unix)]
                 let owner = std::fs::metadata(&state)
                     .map_err(|e| Error::with_source(ErrorCode::Io, e))?
                     .uid();
@@ -175,6 +180,7 @@ impl Host {
             modules,
             tools,
             _state_lock: state_lock,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
     }
     pub(crate) async fn close(&self) -> Result<()> {
@@ -185,6 +191,7 @@ impl Host {
     }
     pub(crate) async fn handle(&self, request: Request) -> Result<serde_json::Value> {
         match request {
+            Request::Shutdown => Ok(serde_json::json!({"stopping":true})),
             Request::PublishCommands => command_runtime::publish_once(self).await,
             Request::Operation { guild, request } => {
                 self.execute(

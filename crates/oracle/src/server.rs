@@ -11,15 +11,7 @@ use oracle_core::{
     *,
 };
 use oracle_storage::PgTools;
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
-use tokio::net::{UnixListener, UnixStream};
-
-struct SocketGuard(PathBuf);
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+use std::{str::FromStr, sync::Arc, time::Duration};
 pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
     // Resolve required credentials before acquiring resources or publishing readiness.
     let token = config
@@ -30,10 +22,7 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
                 .map_err(|_| Error::new(ErrorCode::InvalidInput))
         })
         .transpose()?;
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+    let mut signals = Signals::new()?;
     let host = Arc::new(Host::open(&config, tools).await?);
     let mut published_adapter = None;
     if let Some(token) = &token {
@@ -80,16 +69,7 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
     let mut stopped = None;
     let result: Result<()> = async {
         let socket = config.socket();
-        if UnixStream::connect(&socket).await.is_ok() {
-            return Err(Error::new(ErrorCode::AlreadyRunning));
-        }
-        if socket.exists() {
-            std::fs::remove_file(&socket).map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-        }
-        let listener =
-            UnixListener::bind(&socket).map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-        let socket_guard = SocketGuard(socket.clone());
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        let mut listener = oracle_local_ipc::Listener::bind(&socket)
             .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
         let tasks = HostTasks::new();
         // Every startup/run error after spawning work converges on joined cleanup.
@@ -97,15 +77,13 @@ pub(crate) async fn serve(config: Config, tools: PgTools) -> Result<()> {
             &host,
             &config,
             token.zip(published_adapter),
-            &mut term,
-            &mut interrupt,
-            &listener,
+            &mut signals,
+            &mut listener,
             &tasks,
         )
         .await;
         drop(listener);
         let summary = tasks.shutdown(Duration::from_secs(15)).await;
-        drop(socket_guard);
         stopped = Some(serde_json::json!({"event":"stopped","tasks":summary}));
         result
     }
@@ -124,9 +102,8 @@ async fn run(
         oracle_discord::Token,
         Arc<oracle_discord::operations::DiscordOperations>,
     )>,
-    term: &mut tokio::signal::unix::Signal,
-    interrupt: &mut tokio::signal::unix::Signal,
-    listener: &UnixListener,
+    signals: &mut Signals,
+    listener: &mut oracle_local_ipc::Listener,
     tasks: &HostTasks,
 ) -> Result<()> {
     let stop = tasks.token();
@@ -213,8 +190,8 @@ async fn run(
             })
             .map_err(|_| Error::new(ErrorCode::Cancelled))?;
         tokio::select! { biased;
-            _ = term.recv() => return Ok(()),
-            _ = interrupt.recv() => return Ok(()),
+            _ = signals.recv() => return Ok(()),
+            _ = host.shutdown.cancelled() => return Ok(()),
             _ = stop.cancelled() => return Err(Error::new(ErrorCode::Io)),
             ready = gateway.wait_ready(Duration::from_secs(30)) => {
                 ready.map_err(|e| Error::with_source(ErrorCode::Io, e))?;
@@ -287,10 +264,10 @@ async fn run(
     loop {
         tokio::select! { biased;
             _ = stop.cancelled() => return Err(Error::new(ErrorCode::Io)),
-            _ = interrupt.recv() => return Ok(()),
-            _ = term.recv() => return Ok(()),
+            _ = signals.recv() => return Ok(()),
+            _ = host.shutdown.cancelled() => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+                let stream = accepted.map_err(|e| Error::with_source(ErrorCode::Io, e))?;
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
                 let host = host.clone();
                 let cancel = stop.clone();
@@ -304,5 +281,41 @@ async fn run(
                 }).map_err(|_| Error::new(ErrorCode::Cancelled))?;
             }
         }
+    }
+}
+
+struct Signals {
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    interrupt: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    close: tokio::signal::windows::CtrlClose,
+}
+impl Signals {
+    fn new() -> Result<Self> {
+        (|| -> std::io::Result<Self> {
+            Ok(Self {
+                #[cfg(unix)]
+                term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+                #[cfg(unix)]
+                interrupt: tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::interrupt(),
+                )?,
+                #[cfg(windows)]
+                interrupt: tokio::signal::windows::ctrl_c()?,
+                #[cfg(windows)]
+                close: tokio::signal::windows::ctrl_close()?,
+            })
+        })()
+        .map_err(|e| Error::with_source(ErrorCode::Io, e))
+    }
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! { _ = self.term.recv() => {}, _ = self.interrupt.recv() => {} }
+        #[cfg(windows)]
+        tokio::select! { _ = self.close.recv() => {}, _ = self.interrupt.recv() => {} }
     }
 }

@@ -1714,6 +1714,7 @@ dependencies = [
  "oracle-ai",
  "oracle-core",
  "oracle-discord",
+ "oracle-local-ipc",
  "oracle-modules",
  "oracle-operations",
  "oracle-storage",
@@ -1878,6 +1879,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-local-ipc"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "oracle-module-sdk"
 version = "0.1.0"
 dependencies = [
@@ -1898,6 +1909,7 @@ dependencies = [
  "async-trait",
  "jsonschema",
  "oracle-core",
+ "oracle-local-ipc",
  "oracle-process",
  "oracle-rpc",
  "oracle-storage",

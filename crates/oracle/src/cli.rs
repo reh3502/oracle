@@ -30,6 +30,8 @@ pub(crate) enum Command {
     },
     /// Boot the host and optional Discord Gateway; no Gemini key is required.
     Serve,
+    /// Stop the running host, joining module processes and flushing storage.
+    Stop,
     Status {
         #[arg(long)]
         guild: Option<GuildId>,

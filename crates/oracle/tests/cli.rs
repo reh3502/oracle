@@ -354,3 +354,25 @@ fn missing_discord_secret_fails_before_socket_publication_and_releases_ownership
     assert_eq!(after["deployment"], initial["deployment"]);
     assert_eq!(after["modules_loaded"], 0);
 }
+
+#[test]
+fn stop_acknowledges_joins_and_allows_restart() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.config();
+    successful(invoke(&config, ["init"]));
+    for _ in 0..2 {
+        let mut host = Running::spawn(command(&config).arg("serve"));
+        wait_for_socket(&mut host, &sandbox.0.join("state/control.sock"));
+        let response = successful(invoke(&config, ["stop"]));
+        assert_eq!(response["stopping"], true);
+        let output = host.collect();
+        assert!(output.status.success());
+        assert!(!sandbox.0.join("state/control.sock").exists());
+        let events: Vec<Value> = serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<Value>()
+            .map(|event| event.unwrap())
+            .collect();
+        assert!(events.iter().any(|event| event["event"] == "stopped"));
+    }
+    rejected(invoke(&config, ["stop"]));
+}

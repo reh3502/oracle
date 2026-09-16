@@ -8,6 +8,7 @@ members = [
     "crates/oracle-storage",
     "crates/oracle-discord",
     "crates/oracle",
+    "crates/oracle-local-ipc",
     "crates/oracle-task-scope",
     "crates/oracle-rpc",
     "crates/oracle-process",

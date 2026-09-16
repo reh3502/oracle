@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,15 +163,21 @@ impl Config {
         self.state_dir.join("control.sock")
     }
     pub fn prepare_state_dir(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.state_dir)
-            .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-        let m = std::fs::symlink_metadata(&self.state_dir)
-            .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
-        if !m.is_dir() || m.file_type().is_symlink() {
-            return Err(Error::new(ErrorCode::InvalidInput));
+        #[cfg(windows)]
+        return oracle_local_ipc::create_private_directory(&self.state_dir)
+            .map_err(|e| Error::with_source(ErrorCode::Io, e));
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&self.state_dir)
+                .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+            let m = std::fs::symlink_metadata(&self.state_dir)
+                .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
+            if !m.is_dir() || m.file_type().is_symlink() {
+                return Err(Error::new(ErrorCode::InvalidInput));
+            }
+            std::fs::set_permissions(&self.state_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::with_source(ErrorCode::Io, e))
         }
-        std::fs::set_permissions(&self.state_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| Error::with_source(ErrorCode::Io, e))
     }
 }
 pub(crate) fn validate_env(name: &str) -> Result<()> {
@@ -212,10 +220,11 @@ pub fn initialize(path: &Path, postgres_env: Option<String>) -> Result<()> {
         discord: None,
         ai: None,
     };
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(path)
         .map_err(|e| Error::with_source(ErrorCode::Io, e))?;
     file.write_all(

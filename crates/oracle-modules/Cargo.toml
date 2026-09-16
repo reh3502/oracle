@@ -19,3 +19,6 @@ semver = "1"
 jsonschema = { version = "0.55.1", default-features = false }
 [dev-dependencies]
 oracle-storage = { path = "../oracle-storage" }
+
+[target.'cfg(windows)'.dependencies]
+oracle-local-ipc = { path = "../oracle-local-ipc" }

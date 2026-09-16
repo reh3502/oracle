@@ -3,10 +3,7 @@ use oracle_core::{Error, ErrorCode, GuildId, ModuleId, Result};
 use oracle_operations::ingress::OperationRequest;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -51,6 +48,7 @@ pub(crate) enum ModuleRequest {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
     PublishCommands,
+    Shutdown,
     Operation {
         guild: GuildId,
         request: OperationRequest,
@@ -99,7 +97,10 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(stream: R) -> Re
     }
     Ok(bytes)
 }
-pub(crate) async fn remote(mut stream: UnixStream, request: Request) -> Result<serde_json::Value> {
+pub(crate) async fn remote(
+    mut stream: oracle_local_ipc::Client,
+    request: Request,
+) -> Result<serde_json::Value> {
     let mut bytes =
         serde_json::to_vec(&request).map_err(|e| Error::with_source(ErrorCode::InvalidInput, e))?;
     bytes.push(b'\n');
@@ -124,7 +125,7 @@ pub(crate) async fn remote(mut stream: UnixStream, request: Request) -> Result<s
 
 /// Commands that require a running host never fall back to opening a deployment.
 pub(crate) async fn send(socket: &std::path::Path, request: Request) -> Result<serde_json::Value> {
-    let stream = UnixStream::connect(socket)
+    let stream = oracle_local_ipc::connect(socket)
         .await
         .map_err(|e| Error::with_source(ErrorCode::ModuleUnavailable, e))?;
     remote(stream, request).await
@@ -133,12 +134,16 @@ pub(crate) async fn send(socket: &std::path::Path, request: Request) -> Result<s
 /// Process one bounded request. The caller owns concurrency limits and cancellation.
 pub(crate) async fn serve_connection(
     host: &crate::host::Host,
-    mut stream: UnixStream,
+    mut stream: oracle_local_ipc::Connection,
 ) -> std::result::Result<(), oracle_core::tasks::TaskError> {
     use oracle_core::tasks::TaskError;
+    let mut shutdown = false;
     let result = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await {
         Ok(Ok(bytes)) => match serde_json::from_slice(&bytes) {
-            Ok(request) => host.handle(request).await,
+            Ok(request) => {
+                shutdown = matches!(request, Request::Shutdown);
+                host.handle(request).await
+            }
             Err(_) => Err(Error::new(ErrorCode::InvalidInput)),
         },
         _ => Err(Error::new(ErrorCode::InvalidInput)),
@@ -163,5 +168,9 @@ pub(crate) async fn serve_connection(
         .map_err(|_| TaskError)?;
         bytes.push(b'\n');
     }
-    stream.write_all(&bytes).await.map_err(|_| TaskError)
+    let result = stream.write_all(&bytes).await.map_err(|_| TaskError);
+    if shutdown {
+        host.shutdown.cancel();
+    }
+    result
 }

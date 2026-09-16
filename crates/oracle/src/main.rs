@@ -19,7 +19,6 @@ use oracle_core::*;
 use oracle_storage::{PgTools, Storage};
 use serde::Serialize;
 use server::serve;
-use tokio::net::UnixStream;
 
 fn value(data: impl Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(data).map_err(|e| Error::with_source(ErrorCode::InvalidInput, e))
@@ -70,6 +69,7 @@ async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
     match cli.command {
         Command::Serve => serve(config, tools).await,
+        Command::Stop => output(control::send(&config.socket(), Request::Shutdown).await?),
         Command::Agent(args) => output(control::send(&config.socket(), args.request()).await?),
         Command::Restore { backup } => {
             config.prepare_state_dir()?;
@@ -120,7 +120,7 @@ async fn run(cli: Cli) -> Result<()> {
                 },
                 _ => unreachable!(),
             };
-            match UnixStream::connect(config.socket()).await {
+            match oracle_local_ipc::connect(&config.socket()).await {
                 Ok(stream) => output(remote(stream, request).await?),
                 Err(e)
                     if matches!(

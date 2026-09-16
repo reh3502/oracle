@@ -6,9 +6,13 @@ use std::{
     collections::BTreeMap,
     fs,
     io::ErrorKind,
-    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Component, Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -28,8 +32,26 @@ fn io(_: std::io::Error) -> Error {
     Error::new(ErrorCode::Io)
 }
 fn overlap(a: &Path, b: &Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
+    #[cfg(windows)]
+    let (a, b) = (windows_path_key(a), windows_path_key(b));
+    a.starts_with(&b) || b.starts_with(&a)
 }
+#[cfg(windows)]
+fn windows_path_key(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().replace('/', "\\");
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_lowercase())
+}
+fn same_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows_path_key(a) == windows_path_key(b)
+    }
+    #[cfg(unix)]
+    {
+        a == b
+    }
+}
+#[cfg(unix)]
 fn normalized(path: &Path) -> bool {
     let Some(text) = path.to_str() else {
         return false;
@@ -41,6 +63,37 @@ fn normalized(path: &Path) -> bool {
         && path.components().all(|c|matches!(c, Component::RootDir | Component::Normal(_)))
         // Components erase interior `.` and duplicate separators; reject them too.
         && text.split('/').skip(1).all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+#[cfg(windows)]
+fn normalized(path: &Path) -> bool {
+    use std::path::Prefix;
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+    path.is_absolute()
+        && text.len() <= 4096
+        && !text.chars().any(char::is_control)
+        && path.components().count() <= 64
+        && matches!(path.components().next(), Some(Component::Prefix(p))
+            if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+        && path.components().all(|c| {
+            matches!(
+                c,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
+        && text.split(['/', '\\']).skip(1).all(|part| {
+            let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+            !part.is_empty()
+                && !part.ends_with(['.', ' '])
+                && !part.contains([':', '<', '>', '"', '|', '?', '*'])
+                && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                && !((stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && stem.len() == 4
+                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        })
 }
 
 /// A fixed HTTPS prefix accepts only a host and an unescaped, ordinary path,
@@ -89,7 +142,9 @@ pub fn validate_citation_prefix(prefix: &str) -> Result<()> {
 /// control files or other reserved roots; files need not exist yet. The caller
 /// supplies the trusted host-state owner rather than trusting module metadata.
 ///
-/// Ancestors must be owned by this user or root and cannot be group/world writable
+/// On Windows, reparse points are rejected and dedicated directories must have
+/// a private owner ACL; paths compare case-insensitively.
+/// On Unix, ancestors must be owned by this user or root and cannot be group/world writable
 /// except root-owned sticky directories (such as /tmp). The host and its native
 /// modules run as an operator-trusted user; this is not a sandbox against that user.
 pub fn prepare_runtime_settings(
@@ -125,7 +180,10 @@ pub fn prepare_runtime_settings(
         inspect_components(path, expected_uid, false, false)?;
         denied.push(path);
     }
+    #[cfg(unix)]
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     let mut directories = Vec::new();
     for setting in settings.values() {
         if let Some(prefix) = &setting.image_prefix {
@@ -137,7 +195,7 @@ pub fn prepare_runtime_settings(
         if let Some(path) = &setting.data_directory {
             if !normalized(path)
                 || path.components().count() < 3
-                || home.as_ref().is_some_and(|h| path == h)
+                || home.as_ref().is_some_and(|h| same_path(path, h))
                 || denied.iter().any(|denied| overlap(path, denied))
                 || directories
                     .iter()
@@ -158,12 +216,18 @@ pub fn prepare_runtime_settings(
             let mut cursor = PathBuf::new();
             for component in path.components() {
                 cursor.push(component.as_os_str());
+                #[cfg(windows)]
+                if matches!(component, Component::Prefix(_)) {
+                    continue;
+                }
                 match fs::symlink_metadata(&cursor) {
                     Ok(_) => {}
                     Err(e) if e.kind() == ErrorKind::NotFound => {
-                        let mut builder = fs::DirBuilder::new();
-                        builder.mode(0o700);
-                        match builder.create(&cursor) {
+                        #[cfg(unix)]
+                        let creation = fs::DirBuilder::new().mode(0o700).create(&cursor);
+                        #[cfg(windows)]
+                        let creation = oracle_local_ipc::create_private_directory(&cursor);
+                        match creation {
                             Ok(()) => created.push(cursor.clone()),
                             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
                             Err(e) => return Err(io(e)),
@@ -174,7 +238,7 @@ pub fn prepare_runtime_settings(
                 inspect_components(&cursor, expected_uid, false, true)?;
             }
             inspect_components(path, expected_uid, true, true)?;
-            if fs::canonicalize(path).map_err(io)? != *path {
+            if !same_path(&fs::canonicalize(path).map_err(io)?, path) {
                 return Err(invalid());
             }
         }
@@ -182,7 +246,7 @@ pub fn prepare_runtime_settings(
         // are not chmodded or otherwise changed by preparation.
         for path in &directories {
             inspect_components(path, expected_uid, true, true)?;
-            if fs::canonicalize(path).map_err(io)? != *path {
+            if !same_path(&fs::canonicalize(path).map_err(io)?, path) {
                 return Err(invalid());
             }
         }
@@ -202,15 +266,26 @@ fn inspect_components(
     dedicated: bool,
     trusted_ancestors: bool,
 ) -> Result<()> {
+    #[cfg(windows)]
+    let _ = (expected_uid, trusted_ancestors);
     let mut cursor = PathBuf::new();
     let mut missing = 0;
     for component in path.components() {
         cursor.push(component.as_os_str());
+        #[cfg(windows)]
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&cursor) {
             Ok(meta) => {
-                if meta.file_type().is_symlink() {
+                #[cfg(unix)]
+                let linked = meta.file_type().is_symlink();
+                #[cfg(windows)]
+                let linked = meta.file_attributes() & 0x400 != 0;
+                if linked {
                     return Err(invalid());
                 }
+                #[cfg(unix)]
                 if (cursor != path || dedicated)
                     && (!meta.is_dir()
                         || (trusted_ancestors
@@ -220,11 +295,24 @@ fn inspect_components(
                 {
                     return Err(invalid());
                 }
+                #[cfg(unix)]
                 if cursor == path
                     && dedicated
                     && (meta.uid() != expected_uid || meta.mode() & 0o7777 != 0o700)
                 {
                     return Err(invalid());
+                }
+                #[cfg(windows)]
+                {
+                    if (cursor != path || dedicated) && !meta.is_dir() {
+                        return Err(invalid());
+                    }
+                    if cursor == path
+                        && dedicated
+                        && !oracle_local_ipc::private_directory(&cursor).map_err(io)?
+                    {
+                        return Err(invalid());
+                    }
                 }
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -239,7 +327,7 @@ fn inspect_components(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -446,5 +534,60 @@ mod tests {
         prepare_runtime_settings(&settings, Path::new("/unused"), &[], 0).unwrap();
         settings.get_mut(&module).unwrap().image_prefix = Some("https://cdn.example.test/".into());
         assert!(prepare_runtime_settings(&settings, Path::new("/unused"), &[], 0).is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn paths_reject_aliases_and_compare_case_and_extended_prefixes() {
+        assert!(normalized(Path::new(r"C:\Users\Sister\Oracle\data")));
+        assert!(normalized(Path::new(r"\\?\C:\Users\Sister\Oracle\data")));
+        assert!(same_path(
+            Path::new(r"C:\Users\Sister\Oracle"),
+            Path::new(r"\\?\c:\users\sister\oracle")
+        ));
+        assert!(overlap(
+            Path::new(r"C:\Users\Sister\Oracle"),
+            Path::new(r"c:\users\SISTER\oracle\data")
+        ));
+        for path in [
+            r"C:\data\..\game",
+            r"C:\data\.\game",
+            r"C:\data\\game",
+            r"C:\data\game.",
+            r"C:\data\game ",
+            r"C:\data\game:stream",
+            r"C:\data\CON",
+            r"\\server\share\game",
+        ] {
+            assert!(!normalized(Path::new(path)), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn creates_private_directory_and_rejects_reserved_path_case_alias() {
+        let root = std::env::temp_dir().join(format!("oracle-runtime-{}", uuid::Uuid::new_v4()));
+        oracle_local_ipc::create_private_directory(&root).unwrap();
+        let path = root.join("data/game");
+        let id = serde_json::from_str("\"game.test\"").unwrap();
+        let settings = BTreeMap::from([(
+            id,
+            ModuleRuntimeSettings {
+                data_directory: Some(path.clone()),
+                ..ModuleRuntimeSettings::default()
+            },
+        )]);
+        let package = root.join("packages");
+        assert_eq!(
+            prepare_runtime_settings(&settings, &package, &[], 0).unwrap(),
+            settings
+        );
+        assert!(oracle_local_ipc::private_directory(&path).unwrap());
+        let reserved = PathBuf::from(path.to_string_lossy().to_uppercase());
+        assert!(prepare_runtime_settings(&settings, &package, &[reserved], 0).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

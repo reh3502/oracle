@@ -11,18 +11,19 @@ ALLOWED = {
     "oracle-contracts": set(),
     "oracle-task-scope": set(),
     "oracle-rpc": set(),
+    "oracle-local-ipc": set(),
     "oracle-core": {"oracle-contracts", "oracle-task-scope"},
     "oracle-process": {"oracle-rpc"},
     "oracle-module-sdk": {"oracle-contracts", "oracle-rpc", "oracle-task-scope"},
-    "oracle-modules": {"oracle-core", "oracle-contracts", "oracle-process", "oracle-rpc", "oracle-task-scope"},
+    "oracle-modules": {"oracle-local-ipc", "oracle-core", "oracle-contracts", "oracle-process", "oracle-rpc", "oracle-task-scope"},
     "oracle-operations": {"oracle-core", "oracle-contracts", "oracle-task-scope"},
     "oracle-storage": {"oracle-core", "oracle-contracts"},
     "oracle-discord": {"oracle-core", "oracle-contracts", "oracle-modules", "oracle-operations"},
-    "oracle": {"oracle-ai", "oracle-core", "oracle-contracts", "oracle-storage", "oracle-discord", "oracle-modules", "oracle-operations", "oracle-task-scope"},
+    "oracle": {"oracle-local-ipc", "oracle-ai", "oracle-core", "oracle-contracts", "oracle-storage", "oracle-discord", "oracle-modules", "oracle-operations", "oracle-task-scope"},
 }
 # These boundaries must also stay free of concrete third-party adapters.
 ADAPTERS = {"serenity", "sqlx", "rusqlite", "tokio-postgres", "postgres", "diesel"}
-PURE = {"oracle-ai", "oracle-contracts", "oracle-core", "oracle-module-sdk", "oracle-rpc", "oracle-task-scope", "oracle-process", "oracle-modules", "oracle-operations"}
+PURE = {"oracle-local-ipc", "oracle-ai", "oracle-contracts", "oracle-core", "oracle-module-sdk", "oracle-rpc", "oracle-task-scope", "oracle-process", "oracle-modules", "oracle-operations"}
 
 
 def dependencies(manifest, workspace):

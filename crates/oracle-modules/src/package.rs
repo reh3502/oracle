@@ -1,4 +1,4 @@
-//! Static, local installation of operator-trusted native ELF packages. Never executes code.
+//! Static, local installation of operator-trusted native executable packages. Never executes code.
 use oracle_core::{
     Error, ErrorCode, InstalledModule, ModuleAudience, ModuleCommandInput, ModuleCommandOptionType,
     ModuleManifest, ModuleOperation, ModulePackage, ModulePresentation, Result,
@@ -9,9 +9,48 @@ use std::{
     collections::BTreeSet,
     fs,
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+fn is_link(meta: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+fn directory_readonly(meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        meta.mode() & 0o222 == 0
+    }
+    // Windows directory READONLY is a shell hint, not an access restriction.
+    // Integrity is checked through the complete inventory and content hashes.
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        true
+    }
+}
+fn file_permissions_match(meta: &fs::Metadata, executable: bool) -> bool {
+    #[cfg(unix)]
+    {
+        meta.mode() & 0o7777 == if executable { 0o555 } else { 0o444 }
+    }
+    #[cfg(windows)]
+    {
+        let _ = executable;
+        meta.permissions().readonly()
+    }
+}
 
 pub const HOST_TARGET: &str = env!("ORACLE_TARGET");
 const MAX_PACKAGE: u64 = 512 * 1024;
@@ -924,6 +963,19 @@ pub fn validate_manifest(manifest: &ModuleManifest) -> Result<()> {
 }
 fn relative(value: &str) -> Result<PathBuf> {
     let path = Path::new(value);
+    #[cfg(windows)]
+    if value.split('/').any(|part| {
+        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+        part.ends_with(['.', ' '])
+            || part.contains([':', '<', '>', '"', '|', '?', '*'])
+            || part.chars().any(char::is_control)
+            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    }) {
+        return Err(err(ErrorCode::InvalidInput));
+    }
     if value.is_empty()
         || value.len() > 512
         || value.contains('\\')
@@ -982,7 +1034,11 @@ fn validate_package(package: &ModulePackage) -> Result<()> {
 }
 fn regular(path: &Path, limit: u64) -> Result<fs::Metadata> {
     let meta = fs::symlink_metadata(path).map_err(changed)?;
-    if !meta.is_file() || meta.nlink() != 1 {
+    #[cfg(unix)]
+    let one_link = meta.nlink() == 1;
+    #[cfg(windows)]
+    let one_link = oracle_local_ipc::single_link(path).map_err(changed)?;
+    if !meta.is_file() || is_link(&meta) || !one_link {
         return Err(err(ErrorCode::ArtifactChanged));
     }
     if meta.len() > limit {
@@ -1010,9 +1066,7 @@ fn inventory(root: &Path, package: &ModulePackage, readonly: bool) -> Result<()>
     let mut count = 0;
     while let Some((directory, relative_dir)) = pending.pop() {
         let metadata = fs::symlink_metadata(&directory).map_err(changed)?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || (readonly && metadata.mode() & 0o222 != 0)
+        if !metadata.is_dir() || is_link(&metadata) || (readonly && !directory_readonly(&metadata))
         {
             return Err(err(ErrorCode::ArtifactChanged));
         }
@@ -1023,10 +1077,16 @@ fn inventory(root: &Path, package: &ModulePackage, readonly: bool) -> Result<()>
             }
             let entry = entry.map_err(changed)?;
             let rel = relative_dir.join(entry.file_name());
-            let text = rel.to_str().ok_or_else(|| err(ErrorCode::InvalidInput))?;
+            let raw_text = rel.to_str().ok_or_else(|| err(ErrorCode::InvalidInput))?;
+            #[cfg(windows)]
+            let portable_text = raw_text.replace('\\', "/");
+            #[cfg(windows)]
+            let text = portable_text.as_str();
+            #[cfg(not(windows))]
+            let text = raw_text;
             relative(text)?;
             let meta = fs::symlink_metadata(entry.path()).map_err(changed)?;
-            if meta.file_type().is_symlink() {
+            if is_link(&meta) {
                 return Err(err(ErrorCode::ArtifactChanged));
             }
             if meta.is_dir() {
@@ -1052,14 +1112,7 @@ fn inventory(root: &Path, package: &ModulePackage, readonly: bool) -> Result<()>
             if total > MAX_TOTAL {
                 return Err(err(ErrorCode::QuotaExceeded));
             }
-            if readonly
-                && (meta.mode() & 0o7777
-                    != if text == package.entrypoint {
-                        0o555
-                    } else {
-                        0o444
-                    })
-            {
+            if readonly && !file_permissions_match(&meta, text == package.entrypoint) {
                 return Err(err(ErrorCode::ArtifactChanged));
             }
             if text != "package.json" {
@@ -1075,7 +1128,8 @@ fn inventory(root: &Path, package: &ModulePackage, readonly: bool) -> Result<()>
     }
     Ok(())
 }
-fn native_elf(header: &[u8]) -> bool {
+#[cfg(unix)]
+fn native_executable(header: &[u8]) -> bool {
     let machine = if HOST_TARGET.starts_with("x86_64-") {
         62u16
     } else if HOST_TARGET.starts_with("aarch64-") {
@@ -1091,6 +1145,30 @@ fn native_elf(header: &[u8]) -> bool {
         && matches!(u16::from_le_bytes([header[16], header[17]]), 2 | 3)
         && u16::from_le_bytes([header[18], header[19]]) == machine
         && u32::from_le_bytes([header[20], header[21], header[22], header[23]]) == 1
+}
+#[cfg(windows)]
+fn native_executable(header: &[u8]) -> bool {
+    if header.len() < 64 || &header[..2] != b"MZ" {
+        return false;
+    }
+    let offset = u32::from_le_bytes(header[60..64].try_into().unwrap()) as usize;
+    let Some(pe) = offset
+        .checked_add(26)
+        .and_then(|end| header.get(offset..end))
+    else {
+        return false;
+    };
+    let machine = if HOST_TARGET.starts_with("x86_64-") {
+        0x8664
+    } else if HOST_TARGET.starts_with("aarch64-") {
+        0xaa64
+    } else {
+        return false;
+    };
+    &pe[..4] == b"PE\0\0"
+        && u16::from_le_bytes([pe[4], pe[5]]) == machine
+        && u16::from_le_bytes([pe[22], pe[23]]) & 0x2002 == 0x0002
+        && u16::from_le_bytes([pe[24], pe[25]]) == 0x20b
 }
 fn checked_copy(source: &Path, target: Option<&Path>, expected: &str, entry: bool) -> Result<()> {
     regular(source, MAX_FILE)?;
@@ -1112,8 +1190,8 @@ fn checked_copy(source: &Path, target: Option<&Path>, expected: &str, entry: boo
         if total > MAX_FILE {
             return Err(err(ErrorCode::QuotaExceeded));
         }
-        if prefix.len() < 64 {
-            prefix.extend_from_slice(&buffer[..n.min(64 - prefix.len())]);
+        if prefix.len() < 65536 {
+            prefix.extend_from_slice(&buffer[..n.min(65536 - prefix.len())]);
         }
         hash.update(&buffer[..n]);
         if let Some(target) = &mut target {
@@ -1123,7 +1201,7 @@ fn checked_copy(source: &Path, target: Option<&Path>, expected: &str, entry: boo
     if format!("{:x}", hash.finalize()) != expected {
         return Err(err(ErrorCode::ArtifactChanged));
     }
-    if entry && !native_elf(&prefix) {
+    if entry && !native_executable(&prefix) {
         return Err(err(ErrorCode::Compatibility));
     }
     if let Some(target) = target {
@@ -1132,12 +1210,37 @@ fn checked_copy(source: &Path, target: Option<&Path>, expected: &str, entry: boo
     Ok(())
 }
 fn permissions(path: &Path, mode: u32) -> Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(io)
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(io)
+    }
+    #[cfg(windows)]
+    {
+        let metadata = fs::symlink_metadata(path).map_err(io)?;
+        if is_link(&metadata) {
+            return Err(err(ErrorCode::ArtifactChanged));
+        }
+        if metadata.is_dir() {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(mode & 0o222 == 0);
+        fs::set_permissions(path, permissions).map_err(io)
+    }
 }
 fn remove_tree(path: &Path) -> Result<()> {
     // Never follow links during cleanup, including a tampered staging directory.
     let meta = fs::symlink_metadata(path).map_err(io)?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
+    if is_link(&meta) {
+        #[cfg(windows)]
+        if meta.file_attributes() & 0x10 != 0 {
+            return fs::remove_dir(path).map_err(io);
+        }
+        return fs::remove_file(path).map_err(io);
+    }
+    if !meta.is_dir() {
+        #[cfg(windows)]
+        permissions(path, 0o600)?;
         return fs::remove_file(path).map_err(io);
     }
     permissions(path, 0o700)?;
@@ -1159,12 +1262,11 @@ pub struct ArtifactStore {
 }
 impl ArtifactStore {
     pub fn new(root: PathBuf) -> Result<Self> {
+        #[cfg(unix)]
         fs::create_dir_all(&root).map_err(io)?;
-        if fs::symlink_metadata(&root)
-            .map_err(io)?
-            .file_type()
-            .is_symlink()
-        {
+        #[cfg(windows)]
+        oracle_local_ipc::create_private_directory(&root).map_err(io)?;
+        if is_link(&fs::symlink_metadata(&root).map_err(io)?) {
             return Err(err(ErrorCode::InvalidInput));
         }
         Ok(Self {
@@ -1222,7 +1324,9 @@ impl ArtifactStore {
         }
         let metadata = stage.0.join("package.json");
         fs::write(&metadata, canonical(&installed.package)?).map_err(io)?;
-        fs::File::open(&metadata)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&metadata)
             .map_err(io)?
             .sync_all()
             .map_err(io)?;
@@ -1238,6 +1342,7 @@ impl ArtifactStore {
             }
             Err(error) => return Err(io(error)),
         }
+        #[cfg(unix)]
         fs::File::open(&self.root)
             .map_err(io)?
             .sync_all()
@@ -1275,7 +1380,7 @@ impl ArtifactStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1904,5 +2009,71 @@ mod tests {
             store.install(&temp.0.join("source"), true).unwrap(),
             installed
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn executable_fixture() -> Vec<u8> {
+        // The test harness includes debug information and can exceed MAX_FILE.
+        // cmd.exe is a real native executable present on supported Windows hosts.
+        let windows = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        fs::read(windows.join("System32/cmd.exe")).unwrap()
+    }
+
+    #[test]
+    fn installs_verifies_and_removes_nested_pe_package() {
+        let root =
+            Stage(std::env::temp_dir().join(format!("oracle-package-{}", uuid::Uuid::new_v4())));
+        oracle_local_ipc::create_private_directory(&root.0).unwrap();
+        let source = root.0.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        let bytes = executable_fixture();
+        assert!(native_executable(&bytes));
+        fs::write(source.join("bin/module.exe"), &bytes).unwrap();
+        let package: ModulePackage = serde_json::from_value(json!({
+            "manifest": {"manifest_version":1,"id":"test.module","version":"1.0.0","target":HOST_TARGET,
+                "protocol_major":1,"protocol_minor_min":0,"host_api":"^1.0.0","data_version":1,
+                "readable_data_versions":[1],"capabilities":["storage.own"],"required_intents":["guilds"],
+                "operations":[{"name":"echo@1","description":"Echo","input_schema":{"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false},"output_schema":{"type":"object"},"timeout_ms":1000}]},
+            "entrypoint":"bin/module.exe","files":{"bin/module.exe":format!("{:x}",Sha256::digest(&bytes))},
+            "source_revision":"fixture","toolchain":"test executable","license":"fixture"
+        })).unwrap();
+        fs::write(
+            source.join("package.json"),
+            serde_json::to_vec(&package).unwrap(),
+        )
+        .unwrap();
+        let store = ArtifactStore::new(root.0.join("store")).unwrap();
+        let installed = store.install(&source, true).unwrap();
+        let entry = store.verify(&installed).unwrap();
+        assert!(fs::metadata(&entry).unwrap().permissions().readonly());
+        assert_eq!(store.install(&source, true).unwrap(), installed);
+        store.remove(&installed).unwrap();
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn rejects_wrong_architecture_dll_and_short_pe_headers() {
+        let bytes = executable_fixture();
+        let offset = u32::from_le_bytes(bytes[60..64].try_into().unwrap()) as usize;
+        let mut wrong = bytes.clone();
+        wrong[offset + 4..offset + 6].copy_from_slice(&0x014cu16.to_le_bytes());
+        assert!(!native_executable(&wrong));
+        wrong = bytes.clone();
+        wrong[offset + 23] |= 0x20;
+        assert!(!native_executable(&wrong));
+        assert!(!native_executable(&bytes[..64]));
+        for path in [
+            "bin/module.exe:stream",
+            "bin/CON.exe",
+            "bin/name.",
+            "bin/name ",
+        ] {
+            assert!(relative(path).is_err());
+        }
     }
 }
