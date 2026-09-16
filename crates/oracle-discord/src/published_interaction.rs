@@ -105,9 +105,9 @@ impl DiscordBootstrap {
             }
         };
         responder.defer_ephemeral().await?;
-        if let Err(_error) = self.core.status(&actor, Some(&member.guild)).await {
+        if let Err(error) = self.core.status(&actor, Some(&member.guild)).await {
             responder
-                .complete("This command isn’t available to you here right now. Ask a server helper if you need a hand.")
+                .complete(&failure("server-status", &error))
                 .await?;
             return Ok(true);
         }
@@ -131,10 +131,8 @@ impl DiscordBootstrap {
         if member_route && let Some(reader) = &self.published_reader {
             member = match reader.refresh_member(&member).await {
                 Ok(member) => member,
-                Err(_error) => {
-                    responder
-                        .complete("This command isn’t available to you here right now. Ask a server helper if you need a hand.")
-                        .await?;
+                Err(error) => {
+                    responder.complete(&failure("member-check", &error)).await?;
                     return Ok(true);
                 }
             };
@@ -158,14 +156,12 @@ impl DiscordBootstrap {
                     .complete_published(&reply, &member, cancel.clone())
                     .await
                 {
-                    responder.complete("I couldn’t show that answer. Try the command again in a moment.").await?;
+                    responder
+                        .complete("I couldn’t show that answer. Try the command again in a moment.")
+                        .await?;
                 }
             }
-            Ok(Err(_error)) => {
-                responder
-                    .complete("This command isn’t available to you here right now. Ask a server helper if you need a hand.")
-                    .await?
-            }
+            Ok(Err(error)) => responder.complete(&failure("command", &error)).await?,
             Err(_) => {
                 cancel.cancel();
                 responder
@@ -174,5 +170,44 @@ impl DiscordBootstrap {
             }
         }
         Ok(true)
+    }
+}
+
+// Only allowlisted enum values are exposed. Provider bodies, tokens, and
+// arbitrary source-error messages must never enter a Discord reply.
+fn failure(stage: &str, error: &oracle_core::Error) -> String {
+    let diagnostic = error.diagnostic();
+    let mut code = format!("{stage}/{:?}", diagnostic.code);
+    if let Some(cause) = diagnostic.cause {
+        code.push_str(&format!("/{cause:?}"));
+    }
+    if let Some(detail) = diagnostic.detail {
+        code.push_str(&format!("/{detail:?}"));
+    }
+    format!(
+        "This command isn’t available to you here right now. Diagnostic: `{code}`. Ask a server helper if you need a hand."
+    )
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn command_diagnostics_identify_stage_without_exposing_source_text() {
+        let error = oracle_core::Error::with_source(
+            ErrorCode::Io,
+            std::io::Error::other("secret-provider-body"),
+        );
+        let message = failure("member-check", &error);
+        assert!(message.contains("member-check/Io"));
+        assert!(!message.contains("secret-provider-body"));
+        let message = failure(
+            "command",
+            &oracle_core::Error::with_detail(
+                ErrorCode::Io,
+                oracle_core::ErrorDetail::NetworkTimeout,
+            ),
+        );
+        assert!(message.contains("command/Io/NetworkTimeout"));
     }
 }
