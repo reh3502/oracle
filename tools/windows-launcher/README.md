@@ -39,10 +39,10 @@ Build the host and DW module for the same target, then stage a fresh package. Li
 python3 scripts/prepare-serenity.py
 rustup target add x86_64-pc-windows-gnu
 cargo build --locked --release -p oracle --target x86_64-pc-windows-gnu
-cargo build --locked --release --manifest-path modules/dandys-world/Cargo.toml --target x86_64-pc-windows-gnu --bin dw-module
+cargo build --locked --release --manifest-path archive/dandys-world/Cargo.toml --target x86_64-pc-windows-gnu --bin dw-module
 dotnet publish tools/windows-launcher/OracleLauncher.csproj -c Release -o target/windows-launcher
 python3 scripts/prepare-windows-python.py --output target/windows-python
-python3 scripts/package-windows.py --host target/x86_64-pc-windows-gnu/release/oracle.exe --module modules/dandys-world/target/x86_64-pc-windows-gnu/release/dw-module.exe --launcher 'target/windows-launcher/Start Oracle.exe' --python-runtime target/windows-python --catalog /absolute/validated/catalog-store --guild GUILD_ID --operator USER_ID --channel RUN_CHANNEL_ID --env-file /absolute/private/.env --output target/releases/Oracle-Windows --zip
+python3 scripts/package-windows.py --host target/x86_64-pc-windows-gnu/release/oracle.exe --module archive/dandys-world/target/x86_64-pc-windows-gnu/release/dw-module.exe --launcher 'target/windows-launcher/Start Oracle.exe' --python-runtime target/windows-python --catalog /absolute/validated/catalog-store --guild GUILD_ID --operator USER_ID --channel RUN_CHANNEL_ID --env-file /absolute/private/.env --output target/releases/Oracle-Windows --zip
 python3 scripts/verify-windows-package.py target/releases/Oracle-Windows --private
 ```
 

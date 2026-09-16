@@ -794,7 +794,7 @@ async fn qualify(postgres: bool) {
     };
     fs::write(package_dir.join(executable), &bytes).unwrap();
     let mut manifest: ModuleManifest =
-        serde_json::from_str(include_str!("../../../modules/dandys-world/manifest.json")).unwrap();
+        serde_json::from_str(include_str!("../../../archive/dandys-world/manifest.json")).unwrap();
     if cfg!(windows) {
         manifest.target = "x86_64-pc-windows-gnu".into();
     }

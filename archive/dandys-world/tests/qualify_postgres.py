@@ -60,7 +60,7 @@ def main():
             run("pg-create-" + database,
                 [binary / "createdb", "-h", socket, "-p", "55466", database])
         cargo = ["cargo", "test", "--locked", "--manifest-path",
-                 "modules/dandys-world/Cargo.toml"]
+                 "archive/dandys-world/Cargo.toml"]
         run("pg-store", cargo + ["--test", "run_storage", "--", "--ignored"],
             {"DW_TEST_POSTGRES_URL": url("runs"),
              "DW_TEST_POSTGRES_RESTORE_URL": url("restored")})

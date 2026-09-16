@@ -71,7 +71,7 @@ def stage(args):
     package = payload / 'module-package'
     package.mkdir(parents=True)
     shutil.copy2(args.module, package / 'dw-module.exe')
-    manifest = json.loads((ROOT / 'modules/dandys-world/manifest.json').read_text())
+    manifest = json.loads((ROOT / 'archive/dandys-world/manifest.json').read_text())
     manifest['target'] = 'x86_64-pc-windows-gnu'
     files = {'dw-module.exe': hashlib.sha256(args.module.read_bytes()).hexdigest()}
     # Any runtime DLL needed by the module must travel in its hashed package too.
@@ -86,7 +86,7 @@ def stage(args):
         worker = payload / 'refresh-worker'
         worker.mkdir()
         for name in ('refresh_worker.py', 'refresh_source.py', 'normalize.py', 'wikitext.py', 'wiki_source.py', 'media_source.py', 'source_reviews.json', 'ATTRIBUTION.md'):
-            shutil.copy2(ROOT / 'modules/dandys-world/importer' / name, worker / name)
+            shutil.copy2(ROOT / 'archive/dandys-world/importer' / name, worker / name)
     catalog = payload / 'catalog'
     catalog.mkdir()
     (catalog / 'active').write_bytes(active)

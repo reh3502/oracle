@@ -90,7 +90,7 @@ fn package(
     let bytes = fs::read(binary).expect("DW_MODULE_BINARY must name a built DW executable");
     fs::write(directory.join("module"), &bytes).unwrap();
     let mut manifest: ModuleManifest =
-        serde_json::from_str(include_str!("../../../modules/dandys-world/manifest.json")).unwrap();
+        serde_json::from_str(include_str!("../../../archive/dandys-world/manifest.json")).unwrap();
     mutate(&mut manifest);
     let package = ModulePackage {
         manifest,

@@ -570,7 +570,7 @@ mod shared_intent_tests {
     #[test]
     fn terminal_projection_can_remove_every_public_control() {
         let manifest: oracle_core::ModuleManifest = serde_json::from_str(include_str!(
-            "../../../../modules/dandys-world/manifest.json"
+            "../../../../archive/dandys-world/manifest.json"
         ))
         .unwrap();
         crate::package::validate_manifest(&manifest).unwrap();

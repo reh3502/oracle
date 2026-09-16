@@ -464,7 +464,7 @@ mod run_resume_tests {
     }
     fn catalog() -> (ModuleCatalogEntry, CommandBinding) {
         let manifest: ModuleManifest =
-            serde_json::from_str(include_str!("../../../modules/dandys-world/manifest.json"))
+            serde_json::from_str(include_str!("../../../archive/dandys-world/manifest.json"))
                 .unwrap();
         let entry = ModuleCatalogEntry {
             module: manifest.id,

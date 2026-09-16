@@ -5,7 +5,7 @@ This separately built Oracle module answers game queries from an immutable, attr
 Build the SDK executable with:
 
 ```sh
-cargo build --locked --release --manifest-path modules/dandys-world/Cargo.toml --bin dw-module
+cargo build --locked --release --manifest-path archive/dandys-world/Cargo.toml --bin dw-module
 ```
 
 Package `target/release/dw-module` from this directory with `manifest.json` using Oracle's operator package workflow. The module ID is `community.dandys-world`. Its v3 manifest requires host API 1.5, protocol 1.2 and an operator-configured absolute runtime data directory. Wiki answers and new run publication require a validated catalog; existing runs and maintenance can continue when that catalog is unavailable. Never put credentials or unrelated files in that directory.
@@ -46,9 +46,9 @@ Configuration accepts optional `limits` fields: `drafts_per_owner` (default 1), 
 Verification:
 
 ```sh
-cargo test --locked --manifest-path modules/dandys-world/Cargo.toml
-cargo clippy --locked --manifest-path modules/dandys-world/Cargo.toml --all-targets -- -D warnings
-DW_TEST_CATALOG=/absolute/path/to/catalog.json cargo test --locked --manifest-path modules/dandys-world/Cargo.toml --bin dw-module optional_full_catalog_human_reply_qualification
+cargo test --locked --manifest-path archive/dandys-world/Cargo.toml
+cargo clippy --locked --manifest-path archive/dandys-world/Cargo.toml --all-targets -- -D warnings
+DW_TEST_CATALOG=/absolute/path/to/catalog.json cargo test --locked --manifest-path archive/dandys-world/Cargo.toml --bin dw-module optional_full_catalog_human_reply_qualification
 ```
 
 The last command checks human response bounds for every entity and distinct field in the supplied corpus. SDK lifecycle tests exercise real framed transport and disk snapshots, including missing data, snapshot adoption and rollback, pinned query readers, refresh denial persistence, activation fencing and callback absence. Native host tests exercise installation, migration, member policy, restart, and maintenance. Real Discord publication and interaction delivery require separate transport qualification.
@@ -62,13 +62,13 @@ The worker retains the store writer lock until its subprocess has exited and its
 Run the source/worker checks with the importer environment:
 
 ```sh
-python -m unittest discover -s modules/dandys-world/importer -p 'test_refresh_*.py'
+python -m unittest discover -s archive/dandys-world/importer -p 'test_refresh_*.py'
 ```
 
 Run the disposable PostgreSQL race and native backup/restore checks with installed PostgreSQL tools:
 
 ```sh
-python3 modules/dandys-world/tests/qualify_postgres.py --pg-bin /absolute/path/to/postgresql/bin --output target/dw-run-checks
+python3 archive/dandys-world/tests/qualify_postgres.py --pg-bin /absolute/path/to/postgresql/bin --output target/dw-run-checks
 ```
 
 Optional `--module-binary` and `--catalog` paths also exercise native host migration, process recovery, maintenance, and existing wiki routes. The runner creates and stops its own Unix-socket-only cluster. It never uses an existing database. Supply `--pg-share` when the PostgreSQL installation requires an explicit shared-data directory.

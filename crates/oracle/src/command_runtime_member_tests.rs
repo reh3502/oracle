@@ -90,7 +90,7 @@ fn synthetic_snapshot(directory: &Path) {
 }
 
 #[tokio::test]
-#[ignore = "requires ORACLE_DW_MODULE freshly built modules/dandys-world dw-module"]
+#[ignore = "requires ORACLE_DW_MODULE freshly built archive/dandys-world dw-module"]
 async fn typed_members_keep_operator_policy_citations_and_lifecycle_response_fences() {
     let scratch = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -145,7 +145,7 @@ async fn typed_members_keep_operator_policy_citations_and_lifecycle_response_fen
     let bytes = std::fs::read(binary).unwrap();
     std::fs::write(source.join("module"), &bytes).unwrap();
     let package = ModulePackage {
-        manifest: serde_json::from_str(include_str!("../../../modules/dandys-world/manifest.json"))
+        manifest: serde_json::from_str(include_str!("../../../archive/dandys-world/manifest.json"))
             .unwrap(),
         entrypoint: "module".into(),
         files: BTreeMap::from([("module".into(), format!("{:x}", Sha256::digest(bytes)))]),
