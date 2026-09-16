@@ -1,5 +1,7 @@
 """Apply a verified DW module upgrade through the running host; preserve saved runs."""
 import json
+import hashlib
+import re
 import os
 from pathlib import Path
 import shutil
@@ -17,7 +19,15 @@ def run(bundle, config, *arguments):
     except (OSError, subprocess.TimeoutExpired):
         raise RuntimeError('Could not contact the bot. Keep Start Oracle.exe running and retry.') from None
     if result.returncode:
-        raise RuntimeError('Bot control failed at ' + arguments[0] + '. Keep the bot running and send this step name.')
+        codes = {'InvalidInput', 'ModuleUnavailable', 'Compatibility', 'DependencyUnavailable',
+                 'DataVersionMismatch', 'SchemaInvalid', 'QuotaExceeded', 'TrustedCodeRequired',
+                 'ArtifactChanged', 'ForbiddenScope', 'ForbiddenPermission', 'Conflict', 'NotFound',
+                 'StorageUnavailable', 'MigrationMismatch', 'Backup', 'Integrity', 'AlreadyRunning',
+                 'Cancelled', 'UnknownOutcome', 'RecoveryRequired', 'Io'}
+        words = re.findall(r'[A-Za-z]+', result.stderr.decode('utf-8', errors='replace'))
+        code = next((word for word in words if word in codes), 'unavailable')
+        step = ' '.join(arguments[:2]) if arguments[0] == 'module' else arguments[0]
+        raise RuntimeError('Bot control failed at ' + step + ': ' + code + '. Send this exact message.')
     try:
         return json.loads(result.stdout)
     except ValueError:
@@ -33,6 +43,19 @@ def main():
     settings = json.loads(config.read_text(encoding='utf-8-sig'))
     if settings.get('ai') is not None:
         raise RuntimeError('Expected the AI-disabled sister deployment.')
+    print('Checking update files...', flush=True)
+    for name in ('package.json', 'dw-module.exe'):
+        path = package / name
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            raise RuntimeError('Missing dw-fix-package/' + name + '. Extract the entire fix ZIP into this bot folder, including dw-fix-package. If already extracted, check antivirus quarantine.') from None
+        except PermissionError:
+            raise RuntimeError('Windows blocked access to dw-fix-package/' + name + '. Send this message and the antivirus alert.') from None
+    metadata = json.loads((package / 'package.json').read_text(encoding='utf-8-sig'))
+    expected = metadata['files']['dw-module.exe']
+    if hashlib.sha256((package / 'dw-module.exe').read_bytes()).hexdigest() != expected:
+        raise RuntimeError('The update executable does not match package.json. Extract a fresh complete copy of the fix ZIP.')
     print('Checking the running bot...', flush=True)
     run(bundle, config, 'module', 'health')
     print('Installing the Windows run-ID fix...', flush=True)
