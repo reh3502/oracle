@@ -55,16 +55,11 @@ fn digest(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 fn options() -> OpenOptions {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    options
+    crate::snapshot::safe_options()
 }
 fn read(path: &Path, bound: usize) -> Result<Vec<u8>> {
     let file = options().read(true).open(path)?;
-    if !file.metadata()?.is_file() {
+    if !file.metadata()?.is_file() || crate::snapshot::is_reparse(&file.metadata()?) {
         return Err(Error::Invalid);
     }
     let mut bytes = vec![];
@@ -89,7 +84,7 @@ impl RefreshControl {
             .create(true)
             .truncate(false)
             .open(self.root.join("refresh.lock"))?;
-        if !lock.metadata()?.is_file() {
+        if !lock.metadata()?.is_file() || crate::snapshot::is_reparse(&lock.metadata()?) {
             return Err(Error::Invalid);
         }
         lock.try_lock().map_err(|_| Error::Busy)?;
@@ -130,7 +125,7 @@ impl RefreshControl {
         // The pointer is removed first: interruption can leave only a discardable
         // candidate, never a pointer to a candidate that has already been removed.
         fs::remove_file(self.root.join("refresh-pending.json"))?;
-        File::open(&self.root)?.sync_all()?;
+        crate::snapshot::sync_directory(&self.root)?;
         match fs::remove_file(self.candidate_path(&pending.candidate_digest)?) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),

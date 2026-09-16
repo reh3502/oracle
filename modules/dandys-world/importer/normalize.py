@@ -374,7 +374,7 @@ class Normalizer:
 
     def apply_reviews(self):
         path=Path(__file__).with_name('source_reviews.json')
-        for rule in json.loads(path.read_text()):
+        for rule in json.loads(path.read_text(encoding='utf-8')):
             rows=[self.corpus.by_title.get(title) for title in rule['revisions']]
             reviewed=all(row and row['source']['revision_id']==rule['revisions'][row['title']] for row in rows)
             for entity in self.entities.values():

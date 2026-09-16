@@ -162,8 +162,7 @@ fn same_snapshot_is_noop_and_unchanged_content_can_freshen_from_evidence() {
     );
 }
 #[test]
-fn writer_contention_and_symlinks_fail_without_publication() {
-    use std::os::unix::fs::symlink;
+fn writer_contention_fails_without_publication() {
     let temp = Temp::new();
     let store = Store::new(&temp.0).unwrap();
     let first = store.publish_bytes(&bytes(&data())).unwrap();
@@ -180,7 +179,26 @@ fn writer_contention_and_symlinks_fail_without_publication() {
         Err(Error::Busy)
     ));
     drop(lock);
+    assert_eq!(store.load().unwrap().id, first.id);
+}
+
+#[test]
+fn symlinks_fail_without_publication() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
+    let temp = Temp::new();
+    let store = Store::new(&temp.0).unwrap();
+    let first = store.publish_bytes(&bytes(&data())).unwrap();
+    let control = RefreshControl::new(&temp.0).unwrap();
     symlink("active", temp.0.join("refresh-pending.json")).unwrap();
+    assert!(
+        fs::symlink_metadata(temp.0.join("refresh-pending.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert!(control.submit(&bytes(&changed()), NOW).is_err());
     assert_eq!(store.load().unwrap().id, first.id);
 }

@@ -382,7 +382,7 @@ impl Heads {
 pub struct Store {
     root: PathBuf,
 }
-fn safe_options() -> OpenOptions {
+pub(crate) fn safe_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -391,12 +391,30 @@ fn safe_options() -> OpenOptions {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself, never its target. Metadata checks below
+        // reject all reparse points (including links and junctions).
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
     options
+}
+pub(crate) fn is_reparse(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 fn read_regular(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let file = safe_options().read(true).open(path)?;
     require(
-        file.metadata()?.is_file(),
+        file.metadata()?.is_file() && !is_reparse(&file.metadata()?),
         "store entry is not a regular file",
     )?;
     require(
@@ -429,9 +447,13 @@ fn check_root(root: &Path) -> Result<()> {
             "parent traversal in store root",
         )?;
         path.push(component);
+        // A drive prefix such as C: is not the absolute root until RootDir.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)?;
         require(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            metadata.is_dir() && !is_reparse(&metadata),
             "store root contains symlink/non-directory",
         )?;
     }
@@ -441,18 +463,23 @@ fn create_root(root: &Path) -> Result<()> {
     let mut path = PathBuf::new();
     for component in root.components() {
         path.push(component);
+        // A drive prefix such as C: is not the absolute root until RootDir.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&path) {
             Ok(meta) => require(
-                meta.is_dir() && !meta.file_type().is_symlink(),
+                meta.is_dir() && !is_reparse(&meta),
                 "store root contains symlink/non-directory",
             )?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 #[cfg(unix)]
-                use std::os::unix::fs::DirBuilderExt;
-                let mut builder = fs::DirBuilder::new();
-                #[cfg(unix)]
-                builder.mode(0o700);
-                builder.create(&path)?;
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new().mode(0o700).create(&path)?;
+                }
+                #[cfg(windows)]
+                oracle_local_ipc::create_private_directory(&path)?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -461,10 +488,7 @@ fn create_root(root: &Path) -> Result<()> {
 }
 fn regular_or_absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(meta) => require(
-            meta.is_file() && !meta.file_type().is_symlink(),
-            "unsafe store entry",
-        ),
+        Ok(meta) => require(meta.is_file() && !is_reparse(&meta), "unsafe store entry"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -472,8 +496,15 @@ fn regular_or_absent(path: &Path) -> Result<()> {
 fn is_missing(error: &Error) -> bool {
     matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all().map_err(Error::from)
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all().map_err(Error::from)
+    }
+    #[cfg(windows)]
+    {
+        oracle_local_ipc::durable_directory(path).map_err(Error::from)
+    }
 }
 fn candidate_name(name: &str) -> bool {
     name.strip_prefix(".candidate-")
@@ -518,7 +549,7 @@ impl Store {
             .truncate(false)
             .open(self.root.join(name))?;
         require(
-            file.metadata()?.is_file(),
+            file.metadata()?.is_file() && !is_reparse(&file.metadata()?),
             "store lock is not a regular file",
         )?;
         Ok(file)
@@ -736,7 +767,10 @@ impl Store {
     fn write_pointer(&self, name: &str, bytes: &[u8]) -> Result<()> {
         regular_or_absent(&self.root.join(name))?;
         let temporary = self.write_temp(bytes)?;
+        #[cfg(unix)]
         fs::rename(&temporary.0, self.root.join(name))?;
+        #[cfg(windows)]
+        oracle_local_ipc::atomic_replace(&temporary.0, &self.root.join(name))?;
         sync_directory(&self.root)
     }
     fn ensure_catalog(&self, id: &str, bytes: &[u8]) -> Result<()> {
@@ -751,7 +785,10 @@ impl Store {
                     "store disk budget exceeded",
                 )?;
                 let temporary = self.write_temp(bytes)?;
+                #[cfg(unix)]
                 fs::hard_link(&temporary.0, &destination)?;
+                #[cfg(windows)]
+                oracle_local_ipc::atomic_publish_new(&temporary.0, &destination)?;
                 sync_directory(&self.root)?;
             }
             Err(error) => return Err(error),
@@ -772,7 +809,7 @@ impl Store {
             {
                 let metadata = fs::symlink_metadata(entry.path())?;
                 require(
-                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    metadata.is_file() && !is_reparse(&metadata),
                     "unsafe managed store entry",
                 )?;
                 entries.push((entry.path(), name, metadata.len()));
@@ -789,7 +826,6 @@ impl Store {
         let mut directories = vec![(self.root.clone(), 0usize)];
         let mut entries = 0usize;
         let mut bytes = 0u64;
-        #[cfg(unix)]
         let mut inodes = HashSet::new();
         while let Some((directory, depth)) = directories.pop() {
             require(depth <= 32, "store directory depth limit exceeded")?;
@@ -799,10 +835,7 @@ impl Store {
                 entries += 1;
                 require(entries <= 50_000, "store tree entry limit exceeded")?;
                 let metadata = fs::symlink_metadata(entry.path())?;
-                require(
-                    !metadata.file_type().is_symlink(),
-                    "symlink in store quota tree",
-                )?;
+                require(!is_reparse(&metadata), "symlink in store quota tree")?;
                 if metadata.is_dir() {
                     directories.push((entry.path(), depth + 1));
                 } else {
@@ -813,6 +846,10 @@ impl Store {
                         if !inodes.insert((metadata.dev(), metadata.ino())) {
                             continue;
                         }
+                    }
+                    #[cfg(windows)]
+                    if !inodes.insert(oracle_local_ipc::file_identity(&entry.path())?) {
+                        continue;
                     }
                     bytes = bytes
                         .checked_add(metadata.len())
@@ -967,10 +1004,7 @@ impl Store {
                 "unexpected backup entry",
             )?;
             let meta = fs::symlink_metadata(entry.path())?;
-            require(
-                meta.is_file() && !meta.file_type().is_symlink(),
-                "unsafe backup entry",
-            )?;
+            require(meta.is_file() && !is_reparse(&meta), "unsafe backup entry")?;
         }
         require(seen == expected, "incomplete backup")?;
         let mut catalogs = Vec::new();
@@ -1013,8 +1047,20 @@ impl Store {
         Ok(snapshot)
     }
     fn separate_path(&self, path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        let root = self.root.clone();
+        #[cfg(windows)]
+        let (root, path) = {
+            // Windows path comparisons must not permit overlap through case or
+            // the extended-length drive spelling returned by canonicalize.
+            let key = |p: &Path| {
+                let text = p.to_string_lossy().replace('/', "\\");
+                PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_lowercase())
+            };
+            (key(&self.root), key(path))
+        };
         require(
-            !path.starts_with(&self.root) && !self.root.starts_with(path),
+            !path.starts_with(&root) && !root.starts_with(path),
             "backup and store paths must not overlap",
         )
     }
@@ -1033,11 +1079,13 @@ fn new_backup_directory(parent: &Path) -> Result<TempDirectory> {
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
         #[cfg(unix)]
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        builder.mode(0o700);
-        match builder.create(&path) {
+        let creation = {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&path)
+        };
+        #[cfg(windows)]
+        let creation = oracle_local_ipc::create_private_directory_new(&path);
+        match creation {
             Ok(()) => return Ok(TempDirectory(path)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -1071,7 +1119,11 @@ fn rename_directory_new(source: &Path, destination: &Path) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        oracle_local_ipc::rename_directory_new(source, destination).map_err(Error::from)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (source, destination);
         Err(Error::Invalid(

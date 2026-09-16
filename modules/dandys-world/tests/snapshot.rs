@@ -159,10 +159,12 @@ fn writer_lock_blocks_then_recovers_without_deleting_lock() {
     drop(lock);
     store.publish_bytes(&bytes(&candidate())).unwrap();
 }
-#[cfg(unix)]
 #[test]
 fn refuses_symlink_store_entries_and_preserves_private_files() {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
     let root = Temp::new();
     let private = root.0.join("private");
     fs::write(&private, b"private contents").unwrap();
@@ -178,7 +180,10 @@ fn refuses_symlink_store_entries_and_preserves_private_files() {
     symlink(&private, directory.join("active")).unwrap();
     assert!(store.publish_bytes(&bytes(&candidate())).is_err());
     assert!(store.load().is_err());
+    #[cfg(unix)]
     symlink(&directory, root.0.join("linked")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&directory, root.0.join("linked")).unwrap();
     assert!(Store::new(root.0.join("linked")).is_err());
     assert_eq!(fs::read(&private).unwrap(), b"private contents");
 }

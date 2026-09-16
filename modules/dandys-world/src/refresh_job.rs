@@ -4,10 +4,11 @@
 use crate::snapshot::{MAX_SNAPSHOT_BYTES, Store};
 use oracle_module_sdk::CancellationToken;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -66,17 +67,37 @@ fn absolute(path: &Path) -> bool {
         && path
             .to_str()
             .is_some_and(|s| s.len() <= 4096 && !s.chars().any(char::is_control))
-        && path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+        && path.components().all(|c| {
+            matches!(
+                c,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
 }
 fn safe_open() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .mode(0o600);
-    options
+    crate::snapshot::safe_options()
 }
+fn single_link(file: &File) -> bool {
+    #[cfg(unix)]
+    {
+        file.metadata().is_ok_and(|m| m.nlink() == 1)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: open file handle and writable information buffer remain live.
+        unsafe {
+            GetFileInformationByHandle(file.as_raw_handle(), &mut info) != 0
+                && info.nNumberOfLinks == 1
+        }
+    }
+}
+
+#[cfg(unix)]
 fn check_file(path: &Path, uid: u32, python: bool) -> Result<()> {
     if !absolute(path) {
         return Err(RefreshJobFailure::InvalidSettings);
@@ -90,7 +111,7 @@ fn check_file(path: &Path, uid: u32, python: bool) -> Result<()> {
     }
     .map_err(|_| RefreshJobFailure::InvalidSettings)?;
     if !meta.is_file()
-        || (!python && meta.file_type().is_symlink())
+        || (!python && crate::snapshot::is_reparse(&meta))
         || !matches!(meta.uid(),owner if owner==uid||owner==0)
         || meta.mode() & 0o022 != 0
         || (python && (meta.mode() & 0o111 == 0 || meta.mode() & 0o6000 != 0))
@@ -99,12 +120,23 @@ fn check_file(path: &Path, uid: u32, python: bool) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(windows)]
+fn check_file(path: &Path, _uid: u32, _python: bool) -> Result<()> {
+    if !absolute(path) || !oracle_local_ipc::private_file(path).unwrap_or(false) {
+        return Err(RefreshJobFailure::InvalidSettings);
+    }
+    directory(path.parent().ok_or(RefreshJobFailure::InvalidSettings)?)
+        .map_err(|_| RefreshJobFailure::InvalidSettings)
+}
 fn directory(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for part in path.components() {
         current.push(part);
+        if matches!(part, Component::Prefix(_)) {
+            continue;
+        }
         let meta = fs::symlink_metadata(&current).map_err(|_| RefreshJobFailure::Storage)?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
+        if !meta.is_dir() || crate::snapshot::is_reparse(&meta) {
             return Err(RefreshJobFailure::Storage);
         }
     }
@@ -138,7 +170,7 @@ fn disk_bytes(root: &Path, cancel: &CancellationToken, deadline: Instant) -> Res
             let entry = entry.map_err(|_| RefreshJobFailure::Storage)?;
             let meta =
                 fs::symlink_metadata(entry.path()).map_err(|_| RefreshJobFailure::Storage)?;
-            if meta.file_type().is_symlink() {
+            if crate::snapshot::is_reparse(&meta) {
                 return Err(RefreshJobFailure::Storage);
             }
             if meta.is_dir() {
@@ -168,7 +200,11 @@ impl Work {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
+            #[cfg(unix)]
+            let created = fs::DirBuilder::new().mode(0o700).create(&path);
+            #[cfg(windows)]
+            let created = oracle_local_ipc::create_private_directory_new(&path);
+            match created {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
                 Err(_) => return Err(RefreshJobFailure::Storage),
@@ -201,10 +237,13 @@ fn remove_owned_tree(path: &Path, depth: usize, count: &mut usize) -> std::io::R
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    if meta.is_dir() && !meta.file_type().is_symlink() {
+    if meta.is_dir() && !crate::snapshot::is_reparse(&meta) {
         for entry in fs::read_dir(path)? {
             remove_owned_tree(&entry?.path(), depth + 1, count)?;
         }
+        fs::remove_dir(path)
+    } else if meta.is_dir() {
+        // Windows junctions are directories; unlink the junction itself.
         fs::remove_dir(path)
     } else {
         fs::remove_file(path)
@@ -227,7 +266,8 @@ fn read_output(
         .metadata()
         .map_err(|_| RefreshJobFailure::InvalidOutput)?;
     if !metadata.is_file()
-        || metadata.nlink() != 1
+        || crate::snapshot::is_reparse(&metadata)
+        || !single_link(&file)
         || metadata.len() == 0
         || metadata.len() > max as u64
     {
@@ -300,9 +340,17 @@ fn prepare(
         return Err(RefreshJobFailure::InvalidSettings);
     }
     Store::new(&root).map_err(|_| RefreshJobFailure::Storage)?;
+    #[cfg(unix)]
     let uid = fs::metadata(&root)
         .map_err(|_| RefreshJobFailure::Storage)?
         .uid();
+    #[cfg(windows)]
+    let uid = {
+        if !oracle_local_ipc::private_directory(&root).unwrap_or(false) {
+            return Err(RefreshJobFailure::Storage);
+        }
+        0
+    };
     check_file(python, uid, true)?;
     check_file(worker, uid, false)?;
     if settings
@@ -321,7 +369,8 @@ fn prepare(
         .map_err(|_| RefreshJobFailure::Storage)?;
     if !writer
         .metadata()
-        .is_ok_and(|m| m.is_file() && m.nlink() == 1)
+        .is_ok_and(|m| m.is_file() && !crate::snapshot::is_reparse(&m))
+        || !single_link(&writer)
     {
         return Err(RefreshJobFailure::Storage);
     }
@@ -421,6 +470,14 @@ async fn run_inner(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command.env("PYTHONUTF8", "1");
+    }
     #[cfg(target_os = "linux")]
     {
         let parent = std::process::id() as libc::pid_t;
@@ -510,7 +567,7 @@ async fn run_inner(
     .unwrap_or(Failed(RefreshJobFailure::Cleanup))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod deadline_tests {
     use super::*;
     fn admission_fixture() -> (PathBuf, PathBuf, RefreshJobSettings, File) {

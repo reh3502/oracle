@@ -9,7 +9,6 @@ import contextlib
 import json
 import os
 from pathlib import Path
-import resource
 import stat
 import sys
 import threading
@@ -26,7 +25,14 @@ MAX_SECONDS = 900
 RESULT_RESERVE = 512
 
 
+_windows_job = None
+
+
 def apply_limits():
+    if os.name == 'nt':
+        _apply_windows_limits()
+        return
+    import resource
     for kind, desired in ((resource.RLIMIT_AS, MAX_MEMORY),
                           (resource.RLIMIT_CPU, MAX_SECONDS),
                           (resource.RLIMIT_FSIZE, MAX_FILE)):
@@ -34,6 +40,63 @@ def apply_limits():
         hard = desired if hard == resource.RLIM_INFINITY else min(hard, desired)
         soft = hard if soft == resource.RLIM_INFINITY else min(soft, hard)
         resource.setrlimit(kind, (soft, hard))
+
+
+def _apply_windows_limits():
+    """The worker owns a nested job before parsing/network acquisition starts.
+
+    It is intentionally limited to one process. Cancellation only needs to kill
+    and join this Python child; the module's outer job covers abrupt parent death.
+    File quotas remain enforced before writes in the acquisition and serializer.
+    """
+    import ctypes
+    from ctypes import wintypes
+    global _windows_job
+
+    class Basic(ctypes.Structure):
+        _fields_ = [('process_time', ctypes.c_longlong), ('job_time', ctypes.c_longlong),
+                    ('flags', wintypes.DWORD), ('min_working_set', ctypes.c_size_t),
+                    ('max_working_set', ctypes.c_size_t), ('active_processes', wintypes.DWORD),
+                    ('affinity', ctypes.c_size_t), ('priority', wintypes.DWORD),
+                    ('scheduling', wintypes.DWORD)]
+
+    class Io(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in
+                    ('read_ops', 'write_ops', 'other_ops', 'read_bytes', 'write_bytes', 'other_bytes')]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [('basic', Basic), ('io', Io), ('process_memory', ctypes.c_size_t),
+                    ('job_memory', ctypes.c_size_t), ('peak_process_memory', ctypes.c_size_t),
+                    ('peak_job_memory', ctypes.c_size_t)]
+
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel.SetInformationJobObject.restype = wintypes.BOOL
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    job = kernel.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = Extended()
+    limits.basic.process_time = MAX_SECONDS * 10_000_000
+    limits.basic.active_processes = 1
+    # PROCESS_TIME | ACTIVE_PROCESS | PROCESS_MEMORY | KILL_ON_JOB_CLOSE
+    limits.basic.flags = 0x2 | 0x8 | 0x100 | 0x2000
+    limits.process_memory = MAX_MEMORY
+    if not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        error = ctypes.get_last_error()
+        kernel.CloseHandle(job)
+        raise ctypes.WinError(error)
+    if not kernel.AssignProcessToJobObject(job, kernel.GetCurrentProcess()):
+        error = ctypes.get_last_error()
+        kernel.CloseHandle(job)
+        raise ctypes.WinError(error)
+    # Keep open until process exit. Closing this job while running kills us.
+    _windows_job = job
 
 
 @contextlib.contextmanager
@@ -60,7 +123,9 @@ def regular_bytes(directory):
     total = 0
     for path in directory.rglob('*'):
         metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+        if (stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, 'st_file_attributes', 0) & 0x400
+                or not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode))):
             raise SourceError('Unexpected source output entry')
         if stat.S_ISREG(metadata.st_mode):
             total += metadata.st_size

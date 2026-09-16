@@ -254,6 +254,7 @@ dependencies = [
  "libc",
  "oracle-contracts",
  "oracle-core",
+ "oracle-local-ipc",
  "oracle-module-sdk",
  "oracle-rpc",
  "oracle-storage",
@@ -262,6 +263,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -823,6 +825,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "oracle-local-ipc"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

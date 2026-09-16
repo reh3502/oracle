@@ -33,8 +33,14 @@ fn io(_: std::io::Error) -> Error {
 }
 fn overlap(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
-    let (a, b) = (windows_path_key(a), windows_path_key(b));
-    a.starts_with(&b) || b.starts_with(&a)
+    {
+        let (a, b) = (windows_path_key(a), windows_path_key(b));
+        a.starts_with(&b) || b.starts_with(&a)
+    }
+    #[cfg(unix)]
+    {
+        a.starts_with(b) || b.starts_with(a)
+    }
 }
 #[cfg(windows)]
 fn windows_path_key(path: &Path) -> PathBuf {

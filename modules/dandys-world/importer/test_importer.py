@@ -18,7 +18,7 @@ FIXTURES = Path(__file__).resolve().parents[3] / 'prototypes/dw-source/fixtures/
 
 def corpus(extra=(), include_fixtures=True):
     rows = []
-    for item in json.loads(FIXTURES.read_text()) if include_fixtures else []:
+    for item in json.loads(FIXTURES.read_text(encoding='utf-8')) if include_fixtures else []:
         raw = item['wikitext']
         assert sha(raw) == item['excerpt_sha256'], 'Attributed fixture changed'
         source = {'id': f"page:{item['pageid']}", 'page_id': item['pageid'],

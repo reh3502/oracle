@@ -367,6 +367,9 @@ fn raw_staging_counts_toward_quota_and_cleanup_preserves_unrelated_files() {
     assert!(raw.join("second-name.bin").exists());
     let orphan = fs::File::create(root.path.join("store/.candidate-1000-1")).unwrap();
     orphan.set_len(MAX_STORE_BYTES).unwrap();
+    // Windows releases a deleted file's directory entry only after all open
+    // handles close. Real abandoned staging has no live writer handle.
+    drop(orphan);
     let report = store.cleanup().unwrap();
     assert_eq!(report.removed_files, 1);
     assert!(report.total_bytes < MAX_STORE_BYTES);

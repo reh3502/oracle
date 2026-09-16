@@ -251,3 +251,39 @@ pub fn durable_directory(path: &Path) -> io::Result<()> {
         ))
     }
 }
+
+/// Publish a flushed immutable file at a previously absent same-volume path.
+pub fn atomic_publish_new(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source must be a real file",
+        ));
+    }
+    move_path(source, destination, MOVEFILE_WRITE_THROUGH)
+}
+
+/// Stable same-volume file identity for quota accounting and hard-link deduplication.
+/// Directories and reparse points are rejected without following the final component.
+pub fn file_identity(path: &Path) -> io::Result<(u32, u64)> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file owns a live handle; info is a correctly sized output buffer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a real file",
+        ));
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    ))
+}

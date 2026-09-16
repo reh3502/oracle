@@ -264,7 +264,14 @@ impl DwModule {
 #[async_trait]
 impl Module for DwModule {
     fn manifest(&self) -> ModuleManifest {
-        serde_json::from_str(include_str!("../manifest.json")).expect("compiled DW manifest")
+        let manifest: ModuleManifest =
+            serde_json::from_str(include_str!("../manifest.json")).expect("compiled DW manifest");
+        #[cfg(all(windows, target_env = "gnu", target_arch = "x86_64"))]
+        let manifest = ModuleManifest {
+            target: "x86_64-pc-windows-gnu".into(),
+            ..manifest
+        };
+        manifest
     }
     async fn initialize_with_runtime(
         &self,
@@ -583,6 +590,28 @@ async fn main() {
     }
 }
 
-#[cfg(test)]
+// These integration fixtures use Unix permissions and /usr/bin/python3.
+#[cfg(all(test, unix))]
 #[path = "../tests/module/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+mod platform_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn negotiated_manifest_matches_platform_package() {
+        let actual = serde_json::to_value(DwModule::default().manifest()).unwrap();
+        let mut expected: Value = serde_json::from_str(include_str!("../manifest.json")).unwrap();
+        expected["target"] = json!(
+            if cfg!(all(windows, target_env = "gnu", target_arch = "x86_64")) {
+                "x86_64-pc-windows-gnu"
+            } else {
+                "x86_64-unknown-linux-gnu"
+            }
+        );
+        // Deserialize the same package manifest so defaulted fields compare too.
+        let expected: ModuleManifest = serde_json::from_value(expected).unwrap();
+        assert_eq!(actual, serde_json::to_value(expected).unwrap());
+    }
+}

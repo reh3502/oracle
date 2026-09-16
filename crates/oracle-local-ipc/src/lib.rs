@@ -147,8 +147,9 @@ mod filesystem;
 mod security;
 #[cfg(windows)]
 pub use filesystem::{
-    atomic_replace, create_private_directory, create_private_directory_new, create_private_file,
-    durable_directory, private_directory, private_file, rename_directory_new, single_link,
+    atomic_publish_new, atomic_replace, create_private_directory, create_private_directory_new,
+    create_private_file, durable_directory, file_identity, private_directory, private_file,
+    rename_directory_new, single_link,
 };
 
 #[cfg(test)]
@@ -262,8 +263,24 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"new");
         assert!(!source.exists());
         assert!(private_file(&destination).unwrap());
-        std::fs::hard_link(&destination, directory.join("alias")).unwrap();
+        let alias = directory.join("alias");
+        std::fs::hard_link(&destination, &alias).unwrap();
+        assert_eq!(
+            file_identity(&destination).unwrap(),
+            file_identity(&alias).unwrap()
+        );
         assert!(!private_file(&destination).unwrap());
+        let immutable = directory.join("immutable");
+        drop(create_private_file(&source).unwrap());
+        assert_ne!(
+            file_identity(&source).unwrap(),
+            file_identity(&destination).unwrap()
+        );
+        atomic_publish_new(&source, &immutable).unwrap();
+        assert!(!source.exists());
+        drop(create_private_file(&source).unwrap());
+        assert!(atomic_publish_new(&source, &immutable).is_err());
+        assert!(source.is_file());
         let staging = directory.join("staging");
         let published = directory.join("directory");
         create_private_directory_new(&staging).unwrap();
