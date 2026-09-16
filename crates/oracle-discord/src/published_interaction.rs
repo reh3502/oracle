@@ -121,9 +121,13 @@ impl DiscordBootstrap {
         .await
         {
             Ok(Ok(value)) => value,
-            _ => {
+            Ok(Err(error)) => {
+                responder.complete(&failure("route-check", &error)).await?;
+                return Ok(true);
+            }
+            Err(_) => {
                 responder
-                    .complete("This command is unavailable. Please try again.")
+                    .complete("Command lookup timed out. Diagnostic: `route-check/Timeout`. Please try again.")
                     .await?;
                 return Ok(true);
             }
