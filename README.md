@@ -4,7 +4,7 @@ Oracle is a Rust Discord bot framework under development. It provides scoped hum
 
 ## Build and initialize
 
-Linux and Rust 1.95 or newer are required. Prepare the pinned, locally editable Serenity checkout before invoking Cargo:
+Development requires Rust 1.95 or newer. The host supports Linux and Windows x64. For a portable Windows DW bot with a desktop Start/Stop window, see the [Windows launcher](tools/windows-launcher/README.md). Prepare the pinned, locally editable Serenity checkout before invoking Cargo:
 
 ```sh
 python3 scripts/prepare-serenity.py
@@ -15,7 +15,7 @@ mkdir -p deployment
 ./target/debug/oracle --config deployment/oracle.json serve
 ```
 
-`init` creates a private JSON config and database and refuses to overwrite an existing config. SQLite defaults to `state/oracle.sqlite` relative to the config directory. The state directory and control socket are private to the host OS user. `serve` holds deployment ownership, recovers unfinished operations, and emits a JSON `ready` event. SIGINT/SIGTERM stops admission, cancels and joins tracked tasks, and closes the host. Use an OS service manager for unattended operation.
+`init` creates a private JSON config and database and refuses to overwrite an existing config. SQLite defaults to `state/oracle.sqlite` relative to the config directory. The state directory and control socket are private to the host OS user. `serve` holds deployment ownership, recovers unfinished operations, and emits a JSON `ready` event. `oracle --config CONFIG stop` stops admission, cancels and joins tracked tasks, and closes the host. Linux also handles SIGINT/SIGTERM; Windows handles console interrupt/close events. Use an OS service manager for unattended operation.
 
 For PostgreSQL, create a dedicated empty database and supply its connection URL through an environment variable:
 
@@ -53,7 +53,7 @@ Set the referenced bot token in the host environment. Oracle does not automatica
 
 The running host reconciles `/oracle` and explicitly declared commands from active modules. `/oracle` includes status, pause/resume, structure operations, and module configuration. `publish-commands` requests an immediate reconciliation through the running host. The exact earlier status/control definition is upgraded in place; unrelated or changed definitions are conflicts. Unchanged commands keep their IDs. Discord controls require both the configured operator allowlist and Manage Server/Administrator permission. Replies are ephemeral; commands cannot select another guild or obtain credentials. Discord's default command permission is Manage Server.
 
-Local control authenticates through the OS user's private Unix socket and can operate while the host is running. Module management, structure/configuration operations, and command publication require a running host. Basic status, control, recovery inspection, and backup can acquire exclusive deployment ownership when the host is stopped. Keep one config/state directory per deployment; restart to apply config changes. The local OS operator is trusted to administer all configured guilds.
+Local control authenticates through the OS user's private Unix socket on Linux or an owner-restricted named pipe on Windows and can operate while the host is running. Module management, structure/configuration operations, and command publication require a running host. Basic status, control, recovery inspection, and backup can acquire exclusive deployment ownership when the host is stopped. Keep one config/state directory per deployment; restart to apply config changes. The local OS operator is trusted to administer all configured guilds.
 
 An effect is recorded as `sent` before reaching its adapter. Cancellation, transport ambiguity and restart retain recovery state; an uncertain effect is never automatically resent. Recovery inspection is bounded. Structure plans retain partial outcomes and logical resource reservations; uncertain creates cannot be repeated blindly.
 
