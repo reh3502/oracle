@@ -1,6 +1,11 @@
-//! Linux supervision for trusted modules. Policy and negotiation validation belong to the host.
+//! Process supervision for trusted modules on Linux and Windows. Policy and negotiation validation belong to the host.
 //! Call `shutdown` before stopping the Tokio executor; Drop can only request cleanup.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#[cfg_attr(windows, allow(unsafe_code))]
+#[cfg(windows)]
+mod windows;
+#[cfg(target_os = "linux")]
 use nix::{
     errno::Errno,
     sys::{
@@ -17,15 +22,16 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::Read,
-    os::fd::AsRawFd,
     path::Path,
-    process::{ExitStatus, Stdio},
+    process::Stdio,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{os::fd::AsRawFd, process::ExitStatus};
 use thiserror::Error;
 use tokio::{
     io::AsyncReadExt,
@@ -35,11 +41,14 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows::supervise;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("process I/O failed")]
     Io(#[from] std::io::Error),
+    #[cfg(target_os = "linux")]
     #[error("Linux process setup failed")]
     Linux(#[from] Errno),
     #[error("module RPC failed")]
@@ -97,6 +106,7 @@ pub struct ProcessRuntime {
 }
 impl ProcessRuntime {
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "linux")]
         set_child_subreaper(true)?;
         Ok(Self {
             inner: Arc::new(RuntimeInner {
@@ -113,8 +123,9 @@ impl ProcessRuntime {
     pub fn loaded_count(&self) -> usize {
         self.inner.state.lock().unwrap().instances.len()
     }
-    /// Verify the open executable and execute through its inherited descriptor to prevent
-    /// a path replacement between digest verification and exec. Installed bytes must be immutable.
+    /// Verify the open executable. Linux executes through its descriptor; Windows holds
+    /// a non-write/non-delete-shared handle through creation to prevent replacement.
+    /// Installed bytes must be immutable.
     pub async fn spawn(
         &self,
         path: impl AsRef<Path>,
@@ -122,7 +133,11 @@ impl ProcessRuntime {
         hello: Value,
         handler: Arc<dyn RpcHandler>,
     ) -> Result<ModuleProcess> {
+        let path = path.as_ref();
+        #[cfg(target_os = "linux")]
         let mut executable = std::fs::File::open(path)?;
+        #[cfg(windows)]
+        let (path, mut executable) = windows::open_executable(path)?;
         let mut hash = Sha256::new();
         // Keep the bounded hashing buffer off nested async orchestration stacks.
         let mut buffer = vec![0u8; 64 * 1024];
@@ -147,6 +162,7 @@ impl ProcessRuntime {
                 .next_generation
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
                 .map_err(|_| RuntimeError::Unavailable)?;
+            #[cfg(target_os = "linux")]
             let mut child = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
                 .env_clear()
                 .stdin(Stdio::piped())
@@ -155,6 +171,8 @@ impl ProcessRuntime {
                 .process_group(0)
                 .kill_on_drop(true)
                 .spawn()?;
+            #[cfg(windows)]
+            let (mut child, job) = windows::spawn(&path)?;
             let pid = child.id().expect("new child PID");
             let peer = RpcPeer::new(
                 child.stdout.take().unwrap(),
@@ -177,6 +195,8 @@ impl ProcessRuntime {
             state.supervisors.retain(|task| !task.is_finished());
             state.supervisors.push(tokio::spawn(supervise(
                 child,
+                #[cfg(windows)]
+                job,
                 stderr,
                 instance.clone(),
                 Arc::downgrade(&self.inner),
@@ -347,6 +367,7 @@ async fn wait_report(instance: &Instance, duration: Option<Duration>) -> Result<
         None => wait.await,
     }
 }
+#[cfg(target_os = "linux")]
 fn signal_group(pid: u32, signal: Signal) -> std::result::Result<(), Errno> {
     match killpg(Pid::from_raw(pid as i32), signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
@@ -354,6 +375,7 @@ fn signal_group(pid: u32, signal: Signal) -> std::result::Result<(), Errno> {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn observe_exit(pid: u32) -> std::result::Result<WaitStatus, Errno> {
     loop {
         match waitid(
@@ -368,6 +390,7 @@ async fn observe_exit(pid: u32) -> std::result::Result<WaitStatus, Errno> {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn supervise(
     mut child: Child,
     mut stderr: tokio::process::ChildStderr,
@@ -474,7 +497,7 @@ async fn supervise(
     instance.stopped.send_replace(Some(report));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use oracle_rpc::RpcHandler;

@@ -1,10 +1,11 @@
-//! Offline Linux process-runtime qualification fixture; not a module SDK example.
+//! Offline Linux/Windows process-runtime qualification fixture; not a module SDK example.
 use oracle_process::ProcessRuntime;
 use oracle_rpc::{RpcError, RpcHandler, RpcPeer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::{
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,10 +32,10 @@ impl RpcHandler for Guest {
             }
             "echo" | "shutdown" => Ok(params),
             "descendant" => {
-                // The supervisor, acting as subreaper, owns this intentionally orphaned child.
+                // The process group or Windows job owns this intentionally orphaned child.
                 #[allow(clippy::zombie_processes)]
-                let child = std::process::Command::new("/bin/sleep")
-                    .arg("300")
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--sleep")
                     .spawn()
                     .map_err(|_| RpcError::Remote("fixture spawn failed".into()))?;
                 Ok(json!(child.id()))
@@ -44,6 +45,11 @@ impl RpcHandler for Guest {
         }
     }
 }
+#[cfg(windows)]
+fn resources(_pid: u32) -> Value {
+    Value::Null
+}
+#[cfg(target_os = "linux")]
 fn resources(pid: u32) -> Value {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let rss = status
@@ -63,6 +69,10 @@ fn resources(pid: u32) -> Value {
 #[tokio::main(worker_threads = 2)]
 async fn main() {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--sleep") {
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        return;
+    }
     if args.len() == 1 {
         let peer = RpcPeer::new(tokio::io::stdin(), tokio::io::stdout(), Arc::new(Guest));
         peer.wait_closed().await;
@@ -137,8 +147,12 @@ async fn main() {
                 assert_eq!(report.exit_code, Some(23));
             }
             assert!(report.descendants_reaped >= 1);
-            assert!(!Path::new(&format!("/proc/{}", process.pid())).exists());
-            assert!(!Path::new(&format!("/proc/{descendant}")).exists());
+            assert!(descendant > 0);
+            #[cfg(target_os = "linux")]
+            {
+                assert!(!Path::new(&format!("/proc/{}", process.pid())).exists());
+                assert!(!Path::new(&format!("/proc/{descendant}")).exists());
+            }
             assert_eq!(runtime.loaded_count(), 0);
             let stop_ms = stop_start.elapsed().as_secs_f64() * 1000.0;
             drop(process);
